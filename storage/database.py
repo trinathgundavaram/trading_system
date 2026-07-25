@@ -1,0 +1,3285 @@
+"""PostgreSQL persistence layer for the active (free, MCP-SDK-driven) pipeline.
+Tables: signals, trades, positions, cycles, daily_stats.
+
+2026-07-21 (SQLite -> Postgres migration): this file used to be a SQLite
+single-file store, and the hours-long "OS-level file-open stall" hangs that
+caused (see prod_readiness_plan.md - a live py-spy dump once caught every
+worker thread simultaneously stuck inside a bare sqlite3.connect() with zero
+exceptions raised, for 14+ minutes) is exactly why this moved to a real
+client-server database with a proper connection pool. _get_pool() below
+hands out an already-open TCP connection in microseconds instead of doing a
+filesystem open() syscall on every single call - the entire class of "the OS
+silently stalls a file open" failure this file used to carry ~150 lines of
+hard-won workaround code for (_open_with_timeout, the old _conn()'s retry
+ladder) simply cannot happen against a connection pool, so none of that is
+needed anymore.
+
+Everything BELOW the connection layer (all ~120 public methods) is
+UNCHANGED from the SQLite version on purpose: _PGConnWrapper/_PGCursorWrapper
+below mimic sqlite3.Connection's .execute()/.executemany()/.executescript()/
+.row_factory interface closely enough that the business-logic methods making
+up the bulk of this file never needed to be touched line-by-line - only the
+connection plumbing, the schema DDL (AUTOINCREMENT -> SERIAL, a couple of
+idempotent-migration simplifications Postgres makes unnecessary), and the 3
+call sites that read cursor.lastrowid (Postgres has no such attribute - those
+3 INSERTs now use RETURNING id instead, handled transparently by the wrapper)."""
+import logging
+import os
+import sqlite3   # kept ONLY for the sqlite3.Row sentinel object used as a
+                  # marker below (conn.row_factory = sqlite3.Row, ~47 call
+                  # sites elsewhere in this file) - there is no
+                  # sqlite3.connect() anywhere in this file anymore, zero
+                  # functional dependency on the sqlite3 module beyond that
+                  # one marker value, which costs nothing (stdlib, no I/O).
+import threading
+import time
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+
+logger = logging.getLogger(__name__)
+
+# Postgres connection settings - override via .env (see .env.template).
+# Defaults match a fresh local `brew install postgresql` with default
+# trust-auth (no password) and a `trading_platform` database created once
+# via migrate_to_postgres.py (or `createdb trading_platform`).
+PG_HOST = os.getenv("POSTGRES_HOST", "localhost")
+PG_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+PG_DB = os.getenv("POSTGRES_DB", "trading_platform")
+PG_USER = os.getenv("POSTGRES_USER") or os.getenv("USER") or "postgres"
+PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+
+# Legacy SQLite path - no longer opened by anything in this file. Kept as a
+# constant only because migrate_to_postgres.py uses it as the default
+# migration SOURCE, and nothing else in the app referenced db.path directly
+# (verified via repo-wide grep before this migration).
+DB_PATH = Path(__file__).resolve().parent.parent / "output" / "trading.db"
+
+_POOL_LOCK = threading.Lock()
+_POOL = None  # process-wide pool, shared by every Database() instance in
+              # this process (scheduler.py, server.py, main.py, confirm_fill.py
+              # etc. each construct their own Database(), same as before -
+              # this pool lives at module scope so they still share one small
+              # set of real connections instead of each opening their own).
+
+
+def _get_pool():
+    global _POOL
+    if _POOL is not None:
+        return _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = psycopg2.pool.ThreadedConnectionPool(
+                minconn=2, maxconn=20,
+                host=PG_HOST, port=PG_PORT, dbname=PG_DB,
+                user=PG_USER, password=PG_PASSWORD,
+                connect_timeout=10,
+            )
+            logger.info(f"storage.database: Postgres pool ready "
+                        f"(host={PG_HOST}:{PG_PORT} db={PG_DB} user={PG_USER}, "
+                        f"pool size 2-20)")
+    return _POOL
+
+
+class _PGCursorWrapper:
+    """Thin wrapper so code written against sqlite3's cursor interface
+    (cur.fetchone()/.fetchall()/.lastrowid) doesn't need to change."""
+    __slots__ = ("_cur", "_returned_id", "_fetched_return")
+
+    def __init__(self, cur):
+        self._cur = cur
+        self._returned_id = None
+        self._fetched_return = False
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def __iter__(self):
+        return iter(self._cur)
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    @property
+    def lastrowid(self):
+        """Postgres has no native lastrowid - the 3 call sites that need one
+        now execute INSERT ... RETURNING id (see save_signal/add_pattern/
+        log_rejected_signal), so the id is just the returned row's 'id'
+        value. Cached so repeated access after the cursor's already been
+        consumed doesn't raise. None of those 3 call sites set row_factory
+        (so this normally sees a plain tuple), but handled defensively for
+        dict-style rows too (RealDictRow) in case that ever changes -
+        row[0] would raise KeyError on a dict row, not just return the
+        wrong thing, so this isn't just belt-and-suspenders."""
+        if not self._fetched_return:
+            self._fetched_return = True
+            try:
+                row = self._cur.fetchone()
+                if row is None:
+                    self._returned_id = None
+                elif isinstance(row, dict):
+                    self._returned_id = row.get("id")
+                else:
+                    self._returned_id = row[0]
+            except psycopg2.ProgrammingError:
+                self._returned_id = None  # statement had no result set
+        return self._returned_id
+
+
+class _PGConnWrapper:
+    """sqlite3.Connection-compatible facade over one pooled psycopg2
+    connection (2026-07-21 Postgres migration - see module docstring). Lets
+    every business-logic method elsewhere in this file - conn.execute(...),
+    conn.row_factory = sqlite3.Row, conn.executemany(...),
+    conn.executescript(...) - keep working completely unchanged. Translates
+    sqlite's `?` placeholders to psycopg2's `%s` (verified via repo grep:
+    this file never uses a literal '?' inside SQL text, only as a
+    placeholder, so a blind replace is safe)."""
+    __slots__ = ("_pg_conn", "row_factory")
+
+    def __init__(self, pg_conn):
+        self._pg_conn = pg_conn
+        self.row_factory = None  # sqlite3-compatible default: plain tuples
+
+    def _cursor(self):
+        # RealDictCursor (not DictCursor): verified via repo-wide scan that
+        # every one of the ~47 `row_factory = sqlite3.Row` call sites in this
+        # file immediately converts via dict(row)/row["col"] - never
+        # positional row[0] - so RealDictCursor's rows (genuine dict
+        # subclass, unlike DictCursor's list-like DictRow) are the exact
+        # match, not just a close-enough one.
+        cursor_factory = psycopg2.extras.RealDictCursor if self.row_factory else None
+        return self._pg_conn.cursor(cursor_factory=cursor_factory)
+
+    @staticmethod
+    def _xlate(sql: str) -> str:
+        return sql.replace("?", "%s")
+
+    @staticmethod
+    def _native(v):
+        """2026-07-21 (found during a real cutover): numpy scalars
+        (np.float64/np.int64/np.bool_, produced throughout the scoring/
+        position-management code via pandas-ta) are subclasses of the
+        matching Python builtin, so old psycopg2 happily accepted them - but
+        as of numpy 2.0, repr(np.float64(x)) changed from just the number to
+        "np.float64(x)", and psycopg2's float adapter uses repr() internally
+        for round-trip precision. The result: a numpy scalar param gets
+        inlined into the SQL text as the literal (invalid) text
+        "np.float64(0.85)" instead of the number 0.85, which Postgres then
+        parses as a schema-qualified function call and rejects with
+        'schema "np" does not exist'. Rather than hunt down and fix every
+        numpy-producing call site (score_result, indicators, pandas-ta
+        outputs, etc.), coerce defensively here: any object exposing
+        numpy's scalar .item() method (and isn't a str/bytes, which also
+        happen to define other dunder methods but never .item()) is
+        converted to its native Python equivalent before reaching
+        psycopg2."""
+        if hasattr(v, "item") and not isinstance(v, (str, bytes, bytearray)):
+            try:
+                return v.item()
+            except (ValueError, AttributeError):
+                return v
+        return v
+
+    def _native_params(self, params):
+        if isinstance(params, dict):
+            return {k: self._native(v) for k, v in params.items()}
+        return tuple(self._native(v) for v in params)
+
+    def execute(self, sql, params=()):
+        cur = self._cursor()
+        cur.execute(self._xlate(sql), self._native_params(params))
+        return _PGCursorWrapper(cur)
+
+    def executemany(self, sql, seq_of_params):
+        cur = self._cursor()
+        cur.executemany(self._xlate(sql), [self._native_params(p) for p in seq_of_params])
+        return _PGCursorWrapper(cur)
+
+    def executescript(self, sql):
+        # psycopg2 runs multi-statement ;-separated SQL in one execute()
+        # call natively - no separate "executescript" concept needed.
+        cur = self._cursor()
+        cur.execute(sql)
+        return _PGCursorWrapper(cur)
+
+    def commit(self):
+        self._pg_conn.commit()
+
+    def rollback(self):
+        self._pg_conn.rollback()
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS signals (
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    signal TEXT,
+    confidence REAL,
+    price REAL,
+    buy_score REAL,
+    buy_pct REAL,
+    sell_triggered_rule TEXT,
+    sell_reason TEXT,
+    data_quality TEXT
+);
+
+CREATE TABLE IF NOT EXISTS trades (
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    side TEXT NOT NULL,
+    amount REAL,
+    shares REAL,
+    fill_price REAL,
+    order_id TEXT,
+    status TEXT
+);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id SERIAL PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    entry_price REAL,
+    entry_time TEXT,
+    shares REAL,
+    dollar_amount REAL,
+    trail_high REAL,
+    status TEXT DEFAULT 'open'
+);
+
+CREATE TABLE IF NOT EXISTS cycles (
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    cycle_num INTEGER,
+    ticker_count INTEGER,
+    blocked INTEGER DEFAULT 0,
+    reason TEXT,
+    duration REAL
+);
+
+CREATE TABLE IF NOT EXISTS daily_stats (
+    date TEXT PRIMARY KEY,
+    cycles_run INTEGER DEFAULT 0,
+    signals_generated INTEGER DEFAULT 0,
+    trades_placed INTEGER DEFAULT 0,
+    winning_trades INTEGER DEFAULT 0,
+    realized_pnl REAL DEFAULT 0,
+    max_drawdown REAL DEFAULT 0,
+    kill_switch_triggered INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS logs (
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    level TEXT,
+    message TEXT
+);
+
+-- ============ Learning / Analytics backend (v8.3) ============
+
+-- Immutable indicator/rule snapshot captured at the moment of a confirmed real
+-- fill (confirm_fill.py's cmd_buy/cmd_sell call save_trade_snapshot()) -
+-- linked from trades.snapshot_id (see _migrate_trade_snapshot_column). This
+-- table existed since early in the build but nothing called it until
+-- confirm_fill.py was wired to use it - see README.
+CREATE TABLE IF NOT EXISTS trade_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    signal_id TEXT,
+    created_at TEXT NOT NULL,
+    data TEXT NOT NULL              -- full immutable JSON blob - NEVER UPDATE after INSERT
+);
+
+CREATE TABLE IF NOT EXISTS pattern_database (
+    id SERIAL PRIMARY KEY,
+    trade_id TEXT,
+    ticker TEXT NOT NULL,
+    mode TEXT NOT NULL,              -- SWING | DAY
+    recorded_at TEXT NOT NULL,
+    features TEXT NOT NULL,          -- JSON dict of the 25 features (raw, pre-encoding)
+    outcome_pct REAL,                -- NULL until the trade closes
+    hold_hours REAL,
+    exit_reason TEXT,
+    is_closed INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bayesian_weekly_tracker (
+    week_start TEXT PRIMARY KEY,
+    total_weight_change_pct REAL DEFAULT 0,
+    pending_changes TEXT,             -- JSON of changes blocked by the weekly cap
+    cap_hit_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bayesian_monthly_tracker (
+    month_start TEXT PRIMARY KEY,
+    total_weight_change_pct REAL DEFAULT 0,
+    cap_hit_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bayesian_weight_history (
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    rule_name TEXT NOT NULL,
+    bucket TEXT,
+    old_weight REAL,
+    new_weight REAL,
+    change_pct REAL,
+    occurrences INTEGER,
+    win_rate_when_fired REAL,
+    overall_win_rate REAL,
+    applied INTEGER DEFAULT 1,       -- 0 if blocked by a cap/gate
+    block_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS champion_challenger (
+    id TEXT PRIMARY KEY,
+    challenger_start TEXT,
+    challenger_config TEXT,          -- JSON of challenger rule weights
+    champion_trades INTEGER DEFAULT 0,
+    challenger_trades INTEGER DEFAULT 0,
+    champion_wins INTEGER DEFAULT 0,
+    challenger_wins INTEGER DEFAULT 0,
+    champion_pnl_pct REAL DEFAULT 0,
+    challenger_pnl_pct REAL DEFAULT 0,
+    status TEXT DEFAULT 'running',   -- running | promoted | discarded
+    statistical_significance REAL,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS override_analytics (
+    id TEXT PRIMARY KEY,
+    signal_id TEXT,
+    override_type TEXT,              -- approve | deny | size | stop | exit
+    system_recommendation TEXT,      -- JSON
+    user_action TEXT,                -- JSON
+    outcome_pct REAL,
+    system_would_have_pct REAL,
+    override_improved INTEGER,
+    recorded_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rejected_signals (
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    reject_stage TEXT,               -- which of the 10 framework steps rejected it
+    reject_reason TEXT,
+    score_at_rejection REAL,
+    price_at_rejection REAL,
+    simulated_outcome_pct REAL,      -- filled in later by opportunity_cost.py
+    simulated_at TEXT
+);
+
+-- ============ Position Management (Phase 3) ============
+
+CREATE TABLE IF NOT EXISTS re_entry_cooldowns (
+    ticker TEXT PRIMARY KEY,
+    exit_time TEXT,
+    cooldown_until TEXT,
+    exit_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mae_mfe_data (
+    id TEXT PRIMARY KEY,
+    trade_id TEXT,
+    ticker TEXT,
+    setup_type TEXT,
+    regime TEXT,
+    mae_pct REAL,
+    mfe_pct REAL,
+    outcome_pct REAL,
+    hold_hours REAL,
+    recorded_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS monitoring_alerts (
+    id TEXT PRIMARY KEY,
+    alert_type TEXT,
+    severity TEXT,                   -- LOW | MEDIUM | HIGH | CRITICAL
+    message TEXT,
+    triggered_at TEXT,
+    acknowledged_at TEXT,
+    resolved_at TEXT,
+    resolution TEXT
+);
+
+-- ============ Ticker info cache (company names, validation) ============
+-- Populated two ways: (1) opportunistically every scan cycle - scheduler.py
+-- already fetches yfinance info for every watchlist ticker via
+-- engine/ticker_analyzer.py, which now also captures company_name, so this
+-- costs zero extra MCP calls for tickers already being scanned; (2) a live
+-- yfinance_get_ticker_info call when validating a NEW ticker before adding it
+-- to the watchlist (server.py's /api/ticker/validate), for a ticker that
+-- hasn't been scanned yet. Company names essentially never change, so no TTL
+-- eviction - a stale name is not a real-world problem here.
+CREATE TABLE IF NOT EXISTS ticker_info_cache (
+    ticker TEXT PRIMARY KEY,
+    company_name TEXT,
+    last_price REAL,
+    valid INTEGER DEFAULT 1,
+    updated_at TEXT
+);
+
+-- ============ Portfolio risk manager support ============
+-- Records the dollar amount / sector / theme / beta the Portfolio Risk
+-- Manager (engine/portfolio_risk.py) attributed to each open position at
+-- evaluation time, purely for the UI/journal to show WHY a size was reduced
+-- or a candidate was flagged - the live check itself is always recomputed
+-- fresh from ticker_info_cache + the open positions table, this table is
+-- history only, never read back into a live decision.
+CREATE TABLE IF NOT EXISTS portfolio_risk_log (
+    id SERIAL PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    sector TEXT,
+    themes TEXT,                 -- JSON list
+    sector_exposure_pct REAL,
+    theme_exposure_pct REAL,
+    portfolio_beta REAL,
+    max_pairwise_correlation REAL,
+    high_vol_position_count INTEGER,
+    size_multiplier REAL,
+    blocked INTEGER DEFAULT 0,
+    reasons TEXT                 -- JSON list
+);
+
+-- ============ Weight-change provenance ("git commit for trading logic") ============
+-- Every time learning/bayesian_updater.py's apply_bucket_weight_to_config()
+-- is called - whether it succeeds, is blocked by the shadow-validation gate,
+-- or is force-applied bypassing that gate - this permanently records the
+-- FULL context behind the decision, not just old_weight->new_weight
+-- (bayesian_weight_history already has that). Six months from now, "why did
+-- we change TREND from 21% to 23%?" is answerable from this table alone,
+-- without relying on memory or reconstructing state from scattered logs.
+CREATE TABLE IF NOT EXISTS weight_change_log (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    old_weight REAL,
+    new_weight REAL,
+    strategy_version TEXT,        -- JSON - learning/model_versioning.py snapshot at decision time
+    config_hash TEXT,             -- sha256[:16] of config.yaml at decision time
+    feature_ranking TEXT,         -- JSON - analytics/feature_importance.py snapshot at decision time
+    walk_forward_report TEXT,     -- JSON - latest learning_runs row at decision time
+    champion_challenge_id TEXT,   -- FK-ish to champion_challenger.id, NULL if none (e.g. force-applied)
+    trade_count INTEGER,          -- closed trades supporting this decision
+    decision TEXT,                -- accepted | rejected | forced
+    decision_reason TEXT
+);
+
+-- ============ Full decision-context snapshots (execution replay) ============
+-- Extends the `signals` table (see _migrate_decision_context_columns) with
+-- everything computed about a candidate this cycle beyond the bucket
+-- breakdown already stored - threshold math, EV lookup, execution quality,
+-- suggested position size, portfolio risk, and the regime/asset-class this
+-- decision was made under. This is what makes "why did the system buy NVDA
+-- on 2026-07-14?" answerable from stored data instead of needing to
+-- re-derive it live - see analytics/decision_replay.py.
+
+-- ============ Latest regime snapshot (cross-process) ============
+-- engine/regime_engine.py's current_state() is a module-level singleton -
+-- it's only ever populated in whichever process calls calculate()
+-- (scheduler.py, once per cycle). server.py runs as a SEPARATE process and
+-- would see current_state() as permanently None even after scheduler.py has
+-- been calculating a real regime for hours, since Python globals aren't
+-- shared across processes. This single-row table is how server.py reads the
+-- real latest regime instead.
+CREATE TABLE IF NOT EXISTS latest_regime (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    updated_at TEXT,
+    dominant_regime TEXT,
+    bull_pct REAL,
+    bear_pct REAL,
+    choppy_pct REAL,
+    transition_probability REAL,
+    crisis_active INTEGER,
+    confidence_gap REAL,
+    confidence_level TEXT,
+    confidence_score REAL,
+    regime_version TEXT
+);
+
+-- ============ News headlines (per-ticker, real data, persisted) ============
+-- 2026-07-14: engine/ticker_analyzer.py has been fetching and sentiment-
+-- scoring real yfinance headlines every cycle (feeds the SENTIMENT_MACRO
+-- bucket's news_multiplier) since long before this table existed - they
+-- were computed and thrown away, never persisted or shown anywhere. This is
+-- what the News tab reads from. UNIQUE(ticker, headline) dedupes the same
+-- real story reappearing across many consecutive cycles into one row.
+CREATE TABLE IF NOT EXISTS news_items (
+    id SERIAL PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    company_name TEXT,
+    headline TEXT NOT NULL,
+    sentiment_score REAL,
+    sentiment_label TEXT,
+    first_seen_at TEXT,
+    last_seen_at TEXT,
+    UNIQUE(ticker, headline)
+);
+CREATE INDEX IF NOT EXISTS idx_news_items_last_seen ON news_items(last_seen_at);
+
+-- ============ Cross-process cycle-running status ============
+-- scheduler.py (the scan loop, cron-triggered) and server.py (the UI's
+-- process, triggering MANUAL runs via /api/cycle/run_now) are SEPARATE
+-- processes - server.py's in-memory _manual_cycle_lock only knows about
+-- runs IT triggered, not scheduler.py's own scheduled cycles. This
+-- single-row table is how the UI finds out ANY cycle - scheduled or
+-- manual - is currently in progress, the same cross-process pattern
+-- latest_regime/ui_events already use elsewhere in this file.
+CREATE TABLE IF NOT EXISTS cycle_status (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    is_running INTEGER DEFAULT 0,
+    started_at TEXT,
+    triggered_by TEXT,
+    finished_at TEXT,
+    next_run_at TEXT,
+    stage TEXT,
+    tickers_total INTEGER,
+    tickers_done INTEGER
+);
+
+-- ============ Real-time UI push (Phase: real-time push + notifications) ============
+-- scheduler.py and server.py run as SEPARATE processes (see server.py's
+-- broadcast() docstring) so scheduler.py can't call server.py's in-memory
+-- broadcast() directly. This table is the cross-process outbox: scheduler.py
+-- INSERTs an event after anything the UI should know about immediately
+-- (cycle complete, high-conviction buy signal, urgent Loop B exit); server.py
+-- polls for new rows (see server.py's _event_poll_loop) and pushes them over
+-- the already-open /ws connections.
+CREATE TABLE IF NOT EXISTS ui_events (
+    id SERIAL PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,        -- cycle_complete | buy_signal | urgent_exit
+    payload TEXT NOT NULL            -- JSON
+);
+
+-- ============ Learning-loop automation (scheduler-triggered) ============
+-- Records each time scheduler.py auto-runs learning/walk_forward.py +
+-- champion/challenger evaluation, so the UI's Learning tab has something to
+-- show without anyone needing to run these in a Python shell manually.
+-- Nothing here is ever auto-APPLIED (see learning/walk_forward.py's own
+-- docstring) - this table stores proposals for human review, not decisions.
+CREATE TABLE IF NOT EXISTS learning_runs (
+    id SERIAL PRIMARY KEY,
+    run_at TEXT NOT NULL,
+    trigger_reason TEXT,
+    mode TEXT,
+    n_patterns INTEGER,
+    proposals TEXT,                  -- JSON: run_walk_forward() output (attribution + stability per rule)
+    challenges_evaluated TEXT        -- JSON list: any running champion/challenger evaluate() results
+);
+
+-- ============ Historical replay / backtest runs (2026-07-23) ============
+-- engine/backtest_engine.py's Stage 1 market-data-only replay (see that
+-- module's docstring) - runs rules/hard_vetoes.py + rules/swing_buy_rules.py
+-- unmodified against historical bars instead of a separately-maintained
+-- "backtest strategy". Triggered weekly by engine/backtest_loop.py (same
+-- background-thread pattern as learning_runs above) or on-demand via the
+-- Learning tab's "Run Backtest Now" button (server.py's POST
+-- /api/backtest/run). status lets the UI show "running" while a multi-ticker/
+-- multi-month replay is still in progress, and stops a second run from
+-- starting concurrently (get_running_backtest_run()).
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id SERIAL PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL,             -- running | completed | failed
+    triggered_by TEXT,                -- 'weekly_auto' | 'manual'
+    tickers TEXT,                     -- JSON list
+    start_date TEXT,
+    end_date TEXT,
+    n_scored INTEGER,
+    veto_counts TEXT,                 -- JSON
+    summary TEXT,                     -- JSON: engine/backtest_engine.py's summarize() output
+    trades TEXT,                      -- JSON: full per-trade list
+    config TEXT,                      -- JSON: risk_level/thresholds/mode used for this run
+    error TEXT,
+    output_dir TEXT                   -- where results.json/summary.md were written
+);
+
+-- ============ Screener candidate persistence/aging ============
+-- engine/screener.py: tracks a candidate's history ACROSS scan cycles, not
+-- just within one. A ticker appearing for the 3rd straight cycle with a
+-- rising discovery score is meaningfully different evidence than a one-off
+-- appearance (deployment-review finding: "that persistence is valuable").
+-- One row per (ticker, mode) - reset only when a ticker stops appearing for
+-- longer than engine/screener.py's staleness window (see _load_history()).
+CREATE TABLE IF NOT EXISTS screener_candidates (
+    ticker TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    times_seen INTEGER NOT NULL DEFAULT 1,
+    last_score REAL,
+    best_score REAL,
+    PRIMARY KEY (ticker, mode)
+);
+
+-- ============ Missed Opportunity Report ============
+-- "Sometimes your biggest gains come from studying the trades you didn't
+-- take." One row per signals-table HOLD row that was actually SCORED (not
+-- hard-vetoed - those have no bucket data), caching the simulated forward
+-- price outcome so analytics/missed_opportunity.py doesn't re-hit yfinance
+-- every report call. signal_id is the PK (1:1 with a signals row) rather
+-- than a separate autoincrement id, since re-evaluating the SAME signal
+-- should overwrite, not duplicate.
+CREATE TABLE IF NOT EXISTS missed_opportunity_outcomes (
+    signal_id INTEGER PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    hold_days INTEGER,
+    entry_price REAL,
+    would_have_returned_pct REAL,   -- return at the hold_days bar (comparable to a real simulated close)
+    peak_return_pct REAL,           -- best return reached ANY time in the window - the "you left this on the table" number
+    peak_at_days INTEGER,
+    trough_return_pct REAL,
+    trough_at_days INTEGER,
+    still_pending INTEGER DEFAULT 0 -- not enough calendar time has passed yet to fill hold_days of forward bars
+);
+
+-- ============ Regret Analysis ============
+-- Every closed pattern_database trade -> was the exit too early/too
+-- conservative relative to what the ticker did afterward? pattern_id is the
+-- PK (1:1 with a pattern_database row).
+CREATE TABLE IF NOT EXISTS regret_analysis (
+    pattern_id INTEGER PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    entry_price REAL,
+    exit_price REAL,
+    exit_reason TEXT,
+    forward_window_days INTEGER,
+    highest_afterwards REAL,
+    lowest_afterwards REAL,
+    regret_pts REAL,                -- max(0, highest_afterwards - exit_price)
+    regret_pct REAL,                -- regret_pts / entry_price * 100
+    downside_avoided_pts REAL,      -- max(0, exit_price - lowest_afterwards) - a GOOD-exit signal, not regret
+    downside_avoided_pct REAL,
+    classification TEXT,
+    still_maturing INTEGER DEFAULT 0
+);
+
+-- ============ Threshold regret analysis (2026-07-23) ============
+-- "Collect every signal that looks like this - high-quality stock score but
+-- rejected because of dynamic threshold adjustments - and analyze their
+-- subsequent returns" (OXY review, Trinath). One row per periodic run of
+-- analytics/missed_opportunity.py's evaluate_threshold_regret() (triggered
+-- weekly by engine/learning_loop.py's maybe_run_threshold_regret(), same
+-- background-thread pattern as learning_runs/backtest_runs above) - stores
+-- the full bucketed snapshot (by adjustment-size bucket AND the
+-- breadth-double-counting isolation) so the UI can show how the picture
+-- develops as more HOLD signals mature, not just the latest read. Nothing
+-- here is ever auto-applied - same posture as learning_runs.
+CREATE TABLE IF NOT EXISTS threshold_regret_runs (
+    id SERIAL PRIMARY KEY,
+    run_at TEXT NOT NULL,
+    trigger_reason TEXT,
+    n_signals INTEGER,
+    n_evaluated INTEGER,
+    n_still_pending INTEGER,
+    report TEXT                      -- JSON: full evaluate_threshold_regret() return dict
+);
+"""
+
+
+class Database:
+    def __init__(self, path: Path = None):
+        # 2026-07-20 (production incident, Trinath caught it from a stray
+        # "TEST" trade in the UI): this used to be `path: Path = DB_PATH` -
+        # a mutable-default-style gotcha where the default is bound to
+        # module-level DB_PATH's value ONCE, at class-definition/import
+        # time. Reassigning `database.DB_PATH = <scratch path>` afterward
+        # (e.g. an isolated test) does NOT change that already-bound
+        # default - Database() with no explicit path still silently opened
+        # the REAL output/trading.db. That's exactly what happened running
+        # a supposedly-isolated integration test for the entry_signal_score
+        # seeding fix: it wrote a real TEST buy+sell into production,
+        # including a real (if small) hit to paper_account's realized P&L,
+        # which has since been cleaned up. Evaluating module DB_PATH here,
+        # inside the function body, re-reads the current value on every
+        # call instead of freezing it at import time - `database.DB_PATH =
+        # X; Database()` now actually does what it looks like it does.
+        path = Path(path) if path is not None else Path(DB_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = str(path)
+        # 2026-07-17 (round 3 of hang forensics): this used to be acquired
+        # around EVERY `_conn()` call (`with self._lock, self._conn() as
+        # conn:`, ~65 call sites) - which meant one slow/stalled DB open (see
+        # _open_with_timeout's docstring - up to ~60s across its 4 retries
+        # when the OS-level stall is persistent, which live logs show it can
+        # be) blocked EVERY OTHER thread's DB access in the whole process,
+        # not just the caller doing the slow open. scheduler.py holds one
+        # singleton Database() shared by every ticker worker + the
+        # price-watch thread, so this single-process lock is exactly why a
+        # py-spy dump caught ALL of them wedged on the same line at once -
+        # they were queued behind each other, not independently stuck.
+        # Removed from every call site: each _conn() call already opens its
+        # OWN fresh connection (nothing here shares one connection across
+        # threads), so SQLite's own file-level locking + the existing
+        # timeout=30/retry-with-backoff loop already in _conn() is what
+        # actually protects concurrent access - this Python lock never
+        # protected cross-PROCESS access anyway (server.py makes a fresh
+        # Database() per request with its own unshared Lock()), so dropping
+        # it here doesn't remove any safety this app could actually rely on,
+        # it only removes serialization that was making one slow open freeze
+        # unrelated threads. Left defined (unused internally) since
+        # robinhood_sync.py still references db._lock directly.
+        self._lock = threading.Lock()
+        self.init_db()
+
+    def init_db(self):
+        with self._conn() as conn:
+            conn.executescript(SCHEMA)
+            self._migrate_version_columns(conn)
+            self._migrate_position_columns(conn)
+            self._migrate_signal_detail_columns(conn)
+            self._migrate_trade_snapshot_column(conn)
+            self._migrate_cycle_trigger_column(conn)
+            self._migrate_exit_engine_columns(conn)
+            self._migrate_ticker_info_risk_columns(conn)
+            self._migrate_decision_context_columns(conn)
+            self._migrate_ticker_health_columns(conn)
+            self._migrate_screener_outcome_columns(conn)
+            self._add_column_if_missing(conn, "cycle_status", "next_run_at", "TEXT")
+            self._migrate_market_mood_columns(conn)
+            self._add_column_if_missing(conn, "cycle_status", "stage", "TEXT")
+            self._add_column_if_missing(conn, "cycle_status", "tickers_total", "INTEGER")
+            self._add_column_if_missing(conn, "cycle_status", "tickers_done", "INTEGER")
+            self._add_column_if_missing(conn, "cycle_status", "cancel_requested", "INTEGER DEFAULT 0")
+            # 2026-07-22 (hard-kill fix, Trinath: "any hang has to be auto
+            # killed... cancel run should be able to do all this as well"):
+            # pid is the CHILD PROCESS running the actual cycle body (see
+            # engine/cycle_supervisor.py) - a cross-process handle so ANY
+            # process (server.py's /api/cycle/cancel included) can signal it
+            # directly, same pattern as everything else in this table.
+            # kill_reason records WHY a cycle ended abnormally
+            # ("timeout_15min" / "user_cancel") so it's visible in the UI/DB
+            # instead of looking like a normal finish.
+            self._add_column_if_missing(conn, "cycle_status", "pid", "INTEGER")
+            self._add_column_if_missing(conn, "cycle_status", "kill_reason", "TEXT")
+            self._migrate_paper_trading(conn)
+            self._migrate_rotation_log(conn)
+
+    def _migrate_rotation_log(self, conn):
+        """Portfolio Rotation Engine (engine/rotation.py, 2026-07-17): one row
+        per executed rotation (weakest holding closed to make room for a
+        top-tier new candidate at max_positions). Durable on purpose - the
+        weekly rotation budget (rotation.max_rotations_per_week) is counted
+        from this table, so a scheduler restart can't reset the budget the
+        way an in-memory counter (or the hourly-pruned ui_events table)
+        would. book: 'PAPER' | 'LIVE', counted separately."""
+        conn.execute("""CREATE TABLE IF NOT EXISTS rotation_log (
+            id SERIAL PRIMARY KEY,
+            executed_at TEXT NOT NULL,
+            book TEXT NOT NULL,
+            candidate_ticker TEXT NOT NULL,
+            candidate_score REAL,
+            victim_ticker TEXT NOT NULL,
+            victim_health REAL,
+            victim_days_held REAL,
+            reason TEXT
+        )""")
+
+    def _migrate_paper_trading(self, conn):
+        """WATCH-mode paper trading (2026-07-16, Akhil's ask): when
+        trading.watch_execute == WATCH the scheduler mimics every BUY signal
+        as a real trade - simulated positions live in the same `positions`
+        table (simulated=1) so sell_rules/Loop B manage them identically to
+        real ones, and a single-row `paper_account` tracks the purse (cash
+        out on buy, cash back on sell). `paper_trades` is the immutable
+        buy/sell ledger for the UI + P/L review. Real rows (confirm_fill.py)
+        have simulated=0/NULL - every book-sensitive query COALESCEs."""
+        self._add_column_if_missing(conn, "positions", "simulated", "INTEGER DEFAULT 0")
+        # Which trading mode (SWING/DAY/HYBRID) was active when this buy was
+        # made (2026-07-16, Akhil's ask) - so every trade can be attributed
+        # to the strategy category it was bought under. NULL on rows that
+        # predate this column; 'SEED' on positions cloned from the real book.
+        self._add_column_if_missing(conn, "positions", "trade_mode", "TEXT")
+        conn.execute("""CREATE TABLE IF NOT EXISTS paper_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            starting_cash REAL NOT NULL,
+            cash REAL NOT NULL,
+            realized_pnl REAL DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS paper_trades (
+            id SERIAL PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            price REAL,
+            shares REAL,
+            dollar_amount REAL,
+            reason TEXT,
+            pattern_id INTEGER,
+            pnl REAL,
+            pnl_pct REAL,
+            created_at TEXT
+        )""")
+        # (after CREATE, so a fresh DB has the table before ALTER runs)
+        self._add_column_if_missing(conn, "paper_trades", "trade_mode", "TEXT")
+        # One row per WATCH-mode scan cycle - the portfolio equity curve the
+        # UI's Portfolio tab plots ("change in portfolio over time").
+        conn.execute("""CREATE TABLE IF NOT EXISTS paper_equity_history (
+            id SERIAL PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            total_value REAL,
+            cash REAL,
+            invested_cost REAL,
+            market_value REAL,
+            unrealized_pnl REAL,
+            realized_pnl REAL,
+            n_open INTEGER
+        )""")
+
+    def _migrate_market_mood_columns(self, conn):
+        """News tab follow-up (2026-07-14) - latest_regime gains fear/greed +
+        VIX + macro-blackout fields so server.py can show current market
+        mood without a new table (see save_latest_regime()'s docstring)."""
+        new_cols = {
+            "fear_greed_score": "INTEGER", "fear_greed_rating": "TEXT",
+            "vix_level": "REAL", "hours_to_next_macro": "REAL",
+            "blackout_active": "INTEGER", "blackout_reason": "TEXT",
+        }
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "latest_regime", col, coltype)
+
+    def _add_column_if_missing(self, conn, table: str, col: str, coltype: str):
+        """2026-07-21 (Postgres migration): unlike SQLite, Postgres supports
+        ADD COLUMN IF NOT EXISTS natively and handles the same
+        multiple-processes-racing-to-migrate scenario the old SQLite version's
+        docstring describes (main.py/scheduler.py/server.py each construct
+        their own Database() at roughly the same time) atomically at the
+        database level - no PRAGMA table_info() probe or duplicate-column
+        exception handling needed anymore, the database itself makes this
+        both idempotent and race-safe."""
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {coltype}")
+
+    def _migrate_version_columns(self, conn):
+        """ALTER TABLE additions for the 6 model-version fields + VIX percentiles
+        (CREATE TABLE IF NOT EXISTS won't add columns to a signals table created
+        by an earlier build)."""
+        new_cols = {
+            "rule_engine_version": "TEXT", "weight_version": "TEXT", "regime_version": "TEXT",
+            "prompt_version": "TEXT", "threshold_version": "TEXT", "pattern_db_version": "TEXT",
+            "vix_percentile_1y": "REAL", "vix_percentile_3m": "REAL",
+        }
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "signals", col, coltype)
+
+    def _migrate_position_columns(self, conn):
+        """Links a position row back to the pattern_database entry that
+        produced it, so confirm_fill.py can close the pattern with the real
+        outcome instead of the time-based simulated one. Also adds every
+        Position Management Engine (Phase 3) field - all nullable, all
+        defaulted to 0/False/None until confirm_fill.py or position_management.py
+        populates them for a real, currently-open position."""
+        new_cols = {
+            "pattern_id": "INTEGER",
+            "stop_state": "TEXT",
+            "current_stop_price": "REAL",
+            "current_target_price": "REAL",
+            "max_adverse_excursion_pct": "REAL",
+            "max_favorable_excursion_pct": "REAL",
+            "high_watermark_price": "REAL",
+            "exit_stage_reached": "INTEGER",
+            "current_profit_r": "REAL",
+            "entry_signal_score": "REAL",
+            "entry_p_win": "REAL",
+            "entry_ev": "REAL",
+            "entry_regime": "TEXT",
+            "setup_type": "TEXT",
+            "entry_rs_percentile": "REAL",
+            "entry_ad_ratio": "REAL",
+            "risk_per_share": "REAL",
+            "position_health_score": "REAL",
+            "prev_cycle_pnl_pct": "REAL",
+            "days_held": "REAL",
+        }
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "positions", col, coltype)
+
+    def _migrate_exit_engine_columns(self, conn):
+        """Previous-cycle readings for the unified 6-bucket Exit Score engine
+        (rules/exit_scorer.py) - lets MOMENTUM_WEAKNESS/TREND_DETERIORATION
+        detect a real trend/momentum ROLLOVER (this cycle's reading vs last
+        cycle's) instead of only a static level. All nullable; a position's
+        first Loop B cycle after entry has no prior reading yet, so those
+        rules simply contribute 0 (neutral) until the second cycle."""
+        new_cols = {
+            "prev_cycle_adx": "REAL",
+            "prev_cycle_macd_hist": "REAL",
+            "prev_cycle_stoch_k": "REAL",
+        }
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "positions", col, coltype)
+
+    def _migrate_ticker_health_columns(self, conn):
+        """Data Provenance Circuit Breaker follow-up: tracks how many
+        CONSECUTIVE cycles in a row a ticker's data has tripped (or nearly
+        tripped) rules/hard_vetoes.py's veto #16 - see
+        db.record_ticker_data_health() and scheduler.py's _evaluate_ticker().
+        A single stale cycle is normal (network blip); several in a row
+        usually means something structural (wrong symbol, delisted, a data
+        source that just doesn't cover this name) worth a human's attention."""
+        new_cols = {
+            "consecutive_stale_cycles": "INTEGER DEFAULT 0",
+            "last_stale_at": "TEXT",
+            "last_healthy_at": "TEXT",
+        }
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "ticker_info_cache", col, coltype)
+
+    def _migrate_screener_outcome_columns(self, conn):
+        """Screener learning follow-up (2026-07-14): screener_candidates
+        previously only recorded DISCOVERY-time stats (times_seen/best_score,
+        from engine/screener.py's own ranking pass) - never what happened
+        once the REAL scoring engine (rules/swing_buy_rules.py, via
+        scheduler.py's _evaluate_ticker) actually looked at the candidate.
+        That meant a chronically-stale-data or never-qualifying ticker could
+        keep winning quota slots forever just for reappearing. These columns
+        close that loop - see db.record_screener_outcome() (write) and
+        engine/screener.py's _persistence_bonus()/get_low_quality_screener_tickers()
+        (read)."""
+        new_cols = {
+            "n_scored": "INTEGER DEFAULT 0",             # cycles this ticker was actually run through scoring
+            "n_qualified": "INTEGER DEFAULT 0",           # of those, how many came back BUY
+            "n_stale_data_blocked": "INTEGER DEFAULT 0",  # of those, how many hit veto #16 (STALE_DATA_CIRCUIT_BREAKER)
+            "sum_buy_pct": "REAL DEFAULT 0.0",            # running sum, /n_buy_pct_samples = avg_buy_pct
+            "n_buy_pct_samples": "INTEGER DEFAULT 0",     # only incremented when scoring actually produced a pct (not vetoed)
+        }
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "screener_candidates", col, coltype)
+
+    def _migrate_ticker_info_risk_columns(self, conn):
+        """sector/beta for the Portfolio Risk Manager (engine/portfolio_risk.py) -
+        populated the SAME opportunistic way company_name/last_price already
+        are (scheduler.py's per-cycle db.upsert_ticker_info call, zero extra
+        MCP calls since td.sector/td.beta are already fetched by
+        engine/ticker_analyzer.py for every watchlist ticker). Lets the
+        Portfolio Risk Manager look up an OPEN position's sector/beta without
+        re-fetching it - open positions are often off the current watchlist
+        (e.g. confirm_fill.py'd manually), so this cache is the only place
+        that data persists across cycles for those tickers."""
+        new_cols = {"sector": "TEXT", "beta": "REAL"}
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "ticker_info_cache", col, coltype)
+
+    def _migrate_decision_context_columns(self, conn):
+        """Everything computed about a scored candidate beyond the bucket
+        breakdown (_migrate_signal_detail_columns below) - threshold math,
+        EV lookup, execution quality, suggested position size, portfolio
+        risk, and the regime/asset-class snapshot - so a past signal's full
+        "why" is reconstructable from this table alone. See
+        analytics/decision_replay.py. All nullable - a vetoed/already-open
+        signal never computed most of these, and older rows predate this
+        migration entirely."""
+        new_cols = {
+            "threshold_breakdown": "TEXT",   # JSON - rules/dynamic_thresholds.py's calculate() result
+            "ev_result": "TEXT",             # JSON - engine/ev_engine.py's get_ev_for_signal() result
+            "execution_quality": "TEXT",     # JSON - rules/execution_quality.py's ExecutionQualityResult
+            "position_size": "TEXT",         # JSON - engine/position_sizing.py's PositionSizeResult
+            "portfolio_risk": "TEXT",        # JSON - engine/portfolio_risk.py's PortfolioRiskResult
+            "regime_snapshot": "TEXT",       # JSON - engine/regime_engine.py's RegimeState at decision time
+            "asset_class": "TEXT",           # "STOCK" | "ETF" - rules/swing_buy_rules.py's _detect_asset_class()
+            "probabilistic_decision": "TEXT",  # JSON - rules/probabilistic_decision.py's decide() result
+                                                # (2026-07-15) - the REAL basis for this signal's should_buy call
+                                                # whenever mode="probabilistic"; None for signals logged before
+                                                # this migration, or where the module wasn't reached (vetoed/
+                                                # already-open tickers never call score() at all).
+            "trade_mode": "TEXT",              # "DAY" | "SWING" | "HYBRID" (2026-07-22, EV mode-keying follow-up) -
+                                                # the resolved mode this signal was evaluated/scored under: for a
+                                                # BUY, scheduler.py's effective_mode (a HYBRID leg already
+                                                # classified DAY/SWING by _classify_hybrid_leg); for a HOLD/veto/
+                                                # already-open row (no classification ever runs), the account's
+                                                # raw configured trading_mode.upper() instead - still tells you
+                                                # what mode config was active. Without this column there was NO
+                                                # way to segment historical `signals` rows by DAY vs SWING vs
+                                                # HYBRID after the fact - every future calibration/analytics pass
+                                                # (bucket-weight re-tuning, HYBRID classification-threshold
+                                                # tuning) needs exactly this to compare cohorts. Nullable/None for
+                                                # every row logged before this migration.
+        }
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "signals", col, coltype)
+
+    def _migrate_signal_detail_columns(self, conn):
+        """The rule-by-rule/bucket-by-bucket breakdown behind a BUY/HOLD/SELL
+        decision was being computed every cycle (rules/swing_buy_rules.py's
+        SwingScoreResult, rules/hard_vetoes.py's VetoResult) but never
+        persisted past building output/trade_prompt.md - the signals table
+        only stored the final buy_pct number. These columns store the JSON
+        breakdown so the UI's Signals tab can show WHY a signal fired, not
+        just its final score, for any past signal - not just the current
+        cycle's trade_prompt.md file."""
+        new_cols = {
+            "rules_fired": "TEXT",    # JSON list of rule tags that scored points (BUY/HOLD path)
+            "rules_failed": "TEXT",   # JSON list of {name, detail} - unqualified buckets, or the single veto/already-open reason
+            "bucket_scores": "TEXT",  # JSON list of {name, weight, points, max_points, min_pct, qualified, rules_fired} - null if vetoed/already-open (never scored)
+        }
+        for col, coltype in new_cols.items():
+            self._add_column_if_missing(conn, "signals", col, coltype)
+
+    def _migrate_trade_snapshot_column(self, conn):
+        """Links a `trades` row (a confirmed real fill from confirm_fill.py) to
+        the indicator/rule snapshot captured at that moment, stored in the
+        already-existing-but-previously-unused `trade_snapshots` table (see
+        its schema comment - it was built early on but nothing ever called
+        save_trade_snapshot() until confirm_fill.py was wired to use it)."""
+        self._add_column_if_missing(conn, "trades", "snapshot_id", "TEXT")
+
+    def _migrate_cycle_trigger_column(self, conn):
+        """'scheduler' (the normal Mon-Fri 9:30-16:00 ET cron job) vs 'manual'
+        (server.py's /api/cycle/run_now, an on-demand override for testing or
+        catching up outside market hours) - so the UI/Journal can tell the two
+        apart instead of every cycle row looking like it came from the
+        automated loop."""
+        self._add_column_if_missing(conn, "cycles", "triggered_by", "TEXT DEFAULT 'scheduler'")
+
+    @contextmanager
+    def _conn(self):
+        """2026-07-21 (Postgres migration): hands out a pooled connection
+        wrapped to look like a sqlite3 connection to every caller below (see
+        module docstring / _PGConnWrapper). This IS the fix for the old
+        SQLite version's whole "OS-level file-open stall" problem class this
+        method used to carry a 4-attempt retry ladder for
+        (iCloud/Spotlight/AV interference on the .db file, see git history) -
+        pool.getconn() hands back an already-established TCP connection from
+        a small in-process pool, no filesystem open() syscall involved, so
+        that entire failure mode cannot happen here anymore. Auto-commits on
+        clean exit, rolls back on exception, always returns the connection
+        to the pool (not a real close - that's the performance win: the
+        actual TCP connection stays open and gets reused by the next call)."""
+        pool = _get_pool()
+        pg_conn = pool.getconn()
+        wrapper = _PGConnWrapper(pg_conn)
+        try:
+            yield wrapper
+            pg_conn.commit()
+        except Exception:
+            pg_conn.rollback()
+            raise
+        finally:
+            pool.putconn(pg_conn)
+
+    # ---------- logs ----------
+    def log(self, level: str, message: str):
+        with self._conn() as conn:
+            conn.execute("INSERT INTO logs (timestamp, level, message) VALUES (?, ?, ?)",
+                         (datetime.utcnow().isoformat(), level, message))
+
+    def recent_logs(self, limit: int = 20):
+        with self._conn() as conn:
+            cur = conn.execute("SELECT timestamp, level, message FROM logs ORDER BY id DESC LIMIT ?", (limit,))
+            return list(reversed(cur.fetchall()))
+
+    # ---------- real-time UI push (cross-process outbox) ----------
+    def log_ui_event(self, event_type: str, payload: dict):
+        """Called by scheduler.py; polled by server.py (a separate process -
+        see ui_events' schema comment). Prunes anything older than 1 hour on
+        every insert so this table doesn't grow forever - events are for live
+        push, not history (learning_runs/signals/trades are the durable
+        history tables). Cutoff is computed in Python (not SQLite's datetime())
+        so the string format matches exactly what was inserted (isoformat()
+        uses 'T' as the date/time separator; SQLite's datetime() uses a space -
+        mixing the two breaks lexicographic string comparison for same-day rows)."""
+        import json
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO ui_events (created_at, event_type, payload) VALUES (?,?,?)",
+                (datetime.utcnow().isoformat(), event_type, json.dumps(payload, default=str)),
+            )
+            conn.execute("DELETE FROM ui_events WHERE created_at < ?", (cutoff,))
+
+    def get_ui_events_since(self, last_id: int, limit: int = 100) -> list:
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT * FROM ui_events WHERE id > ? ORDER BY id ASC LIMIT ?", (last_id, limit)
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                r["payload"] = json.loads(r["payload"])
+            return rows
+
+    def get_latest_ui_event_id(self) -> int:
+        """Used by server.py on startup so it doesn't replay old events to a
+        freshly-connecting poller (starts watching from 'now' forward)."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT MAX(id) FROM ui_events").fetchone()
+            return row[0] or 0
+
+    # ---------- portfolio rotation (engine/rotation.py) ----------
+
+    def log_rotation(self, book: str, candidate_ticker: str, candidate_score,
+                     victim_ticker: str, victim_health, victim_days_held,
+                     reason: str = ""):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO rotation_log (executed_at, book, candidate_ticker,
+                   candidate_score, victim_ticker, victim_health,
+                   victim_days_held, reason) VALUES (?,?,?,?,?,?,?,?)""",
+                (datetime.utcnow().isoformat(), book, candidate_ticker,
+                 candidate_score, victim_ticker, victim_health,
+                 victim_days_held, reason),
+            )
+
+    def count_recent_rotations(self, days: int = 7, simulated: bool = True) -> int:
+        """Rotations executed in the last N days for one book - the weekly
+        rotation budget check. Cutoff computed in Python for the same
+        isoformat-vs-datetime() string-comparison reason as log_ui_event."""
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        book = "PAPER" if simulated else "LIVE"
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM rotation_log WHERE book = ? AND executed_at >= ?",
+                (book, cutoff),
+            ).fetchone()
+            return row[0] or 0
+
+    # ---------- latest regime snapshot (cross-process) ----------
+    def save_latest_regime(self, regime: dict, market_mood: dict = None):
+        """regime: vars(RegimeState) from engine/regime_engine.py - see
+        latest_regime's schema comment for why this exists (cross-process,
+        current_state() is a same-process-only singleton).
+
+        market_mood: OPTIONAL (2026-07-14, News tab follow-up) - fear/greed
+        score+rating, VIX level, and macro-blackout proximity are already
+        computed every cycle by engine/market_context.py's MarketContext.fetch()
+        (scheduler.py's `mkt`), but were never persisted anywhere - server.py
+        (a separate process) had no way to show "current market mood" at all.
+        Reuses the SAME cross-process singleton-row pattern as the regime
+        fields above rather than adding a whole new table, since this is
+        the same "one current snapshot, overwritten every cycle" shape.
+        None-safe: omitting it (or passing {}) leaves those columns
+        unchanged, so callers that don't have `mkt` in scope still work."""
+        market_mood = market_mood or {}
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO latest_regime
+                (id, updated_at, dominant_regime, bull_pct, bear_pct, choppy_pct,
+                 transition_probability, crisis_active, confidence_gap, confidence_level,
+                 confidence_score, regime_version, fear_greed_score, fear_greed_rating,
+                 vix_level, hours_to_next_macro, blackout_active, blackout_reason)
+                VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    updated_at=excluded.updated_at, dominant_regime=excluded.dominant_regime,
+                    bull_pct=excluded.bull_pct, bear_pct=excluded.bear_pct, choppy_pct=excluded.choppy_pct,
+                    transition_probability=excluded.transition_probability, crisis_active=excluded.crisis_active,
+                    confidence_gap=excluded.confidence_gap, confidence_level=excluded.confidence_level,
+                    confidence_score=excluded.confidence_score, regime_version=excluded.regime_version,
+                    fear_greed_score=excluded.fear_greed_score, fear_greed_rating=excluded.fear_greed_rating,
+                    vix_level=excluded.vix_level, hours_to_next_macro=excluded.hours_to_next_macro,
+                    blackout_active=excluded.blackout_active, blackout_reason=excluded.blackout_reason""",
+                (datetime.utcnow().isoformat(), regime.get("dominant_regime"),
+                 regime.get("bull_pct"), regime.get("bear_pct"), regime.get("choppy_pct"),
+                 regime.get("transition_probability"), int(bool(regime.get("crisis_active"))),
+                 regime.get("confidence_gap"), regime.get("confidence_level"),
+                 regime.get("confidence_score"), regime.get("regime_version"),
+                 market_mood.get("fear_greed_score"), market_mood.get("fear_greed_rating"),
+                 market_mood.get("vix_level"), market_mood.get("hours_to_next_macro"),
+                 int(bool(market_mood.get("blackout_active"))) if market_mood.get("blackout_active") is not None else None,
+                 market_mood.get("blackout_reason")),
+            )
+
+    def get_latest_regime(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM latest_regime WHERE id = 1").fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["crisis_active"] = bool(d["crisis_active"])
+            if d.get("blackout_active") is not None:
+                d["blackout_active"] = bool(d["blackout_active"])
+            return d
+
+    # ---------- news headlines (per-ticker, real yfinance data already
+    # fetched every cycle for the SENTIMENT_MACRO bucket's news_multiplier -
+    # 2026-07-14: previously scored and then thrown away, never persisted or
+    # shown anywhere) ----------
+    def record_news_items(self, ticker: str, company_name: str, headlines: list, sentiment_score: float):
+        """Upserts each headline. UNIQUE(ticker, headline) means re-fetching
+        the same headline on a later cycle (very common - yfinance's news
+        feed doesn't turn over every 15 minutes) just refreshes last_seen_at
+        instead of creating a duplicate row - the News tab shows each real
+        story once, not once per cycle it happened to still be in the feed."""
+        if not headlines:
+            return
+        now = datetime.utcnow().isoformat()
+        sentiment_label = (
+            "bullish" if sentiment_score >= 0.65 else
+            "bearish" if sentiment_score <= 0.35 else
+            "neutral"
+        )
+        with self._conn() as conn:
+            for headline in headlines:
+                if not headline:
+                    continue
+                conn.execute(
+                    """INSERT INTO news_items
+                    (ticker, company_name, headline, sentiment_score, sentiment_label,
+                     first_seen_at, last_seen_at)
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(ticker, headline) DO UPDATE SET
+                        last_seen_at=excluded.last_seen_at,
+                        sentiment_score=excluded.sentiment_score,
+                        sentiment_label=excluded.sentiment_label,
+                        company_name=COALESCE(excluded.company_name, news_items.company_name)""",
+                    (ticker, company_name or None, headline, sentiment_score, sentiment_label, now, now),
+                )
+
+    def get_recent_news(self, hours: int = 72, limit: int = 100, notable_only: bool = False):
+        """Most-recently-SEEN first (not first-seen) - a headline still
+        showing up in today's feed is more relevant than one that first
+        appeared 3 days ago and hasn't resurfaced since, even if the story
+        itself is older. notable_only restricts to bullish/bearish
+        (excludes neutral) - used by the News tab's "market-moving only"
+        filter."""
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        query = "SELECT * FROM news_items WHERE last_seen_at >= ?"
+        params = [cutoff]
+        if notable_only:
+            query += " AND sentiment_label != 'neutral'"
+        query += " ORDER BY last_seen_at DESC LIMIT ?"
+        params.append(limit)
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def prune_old_news(self, days: int = 7):
+        """Keeps news_items from growing forever - called once per cycle,
+        same convention as prune_stale_screener_candidates()."""
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM news_items WHERE last_seen_at < ?", (cutoff,))
+
+    # ---------- cross-process cycle-running status ----------
+    def set_cycle_running(self, triggered_by: str):
+        """Called at the very start of engine/cycle_supervisor.py's
+        run_supervised() (wrapped in try/finally so set_cycle_finished()
+        always runs even on an exception) - works for BOTH the
+        cron-triggered scheduler.py process and server.py's manual
+        /api/cycle/run_now, since both ultimately funnel through
+        scheduler.py's run_cycle() -> run_supervised(). triggered_by:
+        "scheduler" | "manual" (matches log_cycle's existing convention).
+        Clears pid/kill_reason from any PREVIOUS cycle so a fresh row never
+        shows a stale child pid or an old kill reason."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cycle_status (id, is_running, started_at, triggered_by, finished_at,
+                    stage, tickers_total, tickers_done, pid, kill_reason)
+                VALUES (1, 1, ?, ?, NULL, 'starting', NULL, NULL, NULL, NULL)
+                ON CONFLICT(id) DO UPDATE SET
+                    is_running=1, started_at=excluded.started_at, triggered_by=excluded.triggered_by,
+                    finished_at=NULL, stage='starting', tickers_total=NULL, tickers_done=NULL,
+                    pid=NULL, kill_reason=NULL""",
+                (now, triggered_by),
+            )
+
+    def set_cycle_pid(self, pid: int):
+        """Records the CHILD PROCESS pid actually running this cycle's body
+        (engine/cycle_supervisor.py's run_supervised(), right after Popen).
+        This is what makes /api/cycle/cancel a real, immediate, cross-process
+        hard kill instead of a cooperative flag: any process can read this
+        pid back out of the shared DB row and signal it directly."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cycle_status (id, pid) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET pid=excluded.pid""",
+                (pid,),
+            )
+
+    def set_cycle_finished(self):
+        """Normal end-of-cycle marker - deliberately does NOT touch
+        kill_reason (see mark_cycle_killed()): this is called unconditionally
+        in run_supervised()'s finally block even after a hard-kill already
+        recorded WHY, and a normal cycle's kill_reason was already cleared
+        fresh at set_cycle_running() time, so leaving it alone here can never
+        show a stale reason for a cycle that actually finished, nor erase a
+        real one for a cycle that didn't."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cycle_status (id, is_running, finished_at, pid) VALUES (1, 0, ?, NULL)
+                ON CONFLICT(id) DO UPDATE SET is_running=0, finished_at=excluded.finished_at, pid=NULL""",
+                (datetime.utcnow().isoformat(),),
+            )
+
+    def mark_cycle_killed(self, expected_pid: int, reason: str) -> bool:
+        """Hard-kill counterpart to set_cycle_finished() - called by
+        engine/cycle_supervisor.py right after force-killing a cycle's
+        process group, whether that's the 15-min auto-kill or an immediate
+        /api/cycle/cancel. Guarded by expected_pid: only updates the row if
+        the pid we just killed is STILL the one on record, so a kill that
+        resolves late (e.g. cancel racing the auto-kill's own cleanup, or a
+        brand-new cycle having already started in that same small window)
+        can never clobber a different, newer cycle's status. Returns False
+        (no-op) if the pid no longer matches - caller can treat that as
+        "already handled by something else." """
+        with self._conn() as conn:
+            row = conn.execute("SELECT pid FROM cycle_status WHERE id = 1").fetchone()
+            if not row or row[0] != expected_pid:
+                return False
+            conn.execute(
+                """UPDATE cycle_status SET is_running = 0, finished_at = ?, pid = NULL,
+                   kill_reason = ? WHERE id = 1""",
+                (datetime.utcnow().isoformat(), reason),
+            )
+            return True
+
+    # ---------- full-market universe (2026-07-15g, universe sweep) ----------
+    # Answers "will it look at ALL stocks, not just the movers?" - a
+    # persistent registry of every known US-equity symbol (Alpaca's free
+    # assets endpoint when configured: ~10k active equities; plus organic
+    # accumulation from every screener source and the ticker cache). The
+    # sweep source (engine/screener.py's _screen_universe_sweep) draws the
+    # least-recently-examined batch each cycle, so over days the ENTIRE
+    # eligible market rotates through the standard quality gate and scoring
+    # - not just whatever happened to be moving that day.
+    def _ensure_universe_table(self, conn):
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS universe (
+                symbol TEXT PRIMARY KEY,
+                first_seen_at TEXT NOT NULL,
+                last_swept_at TEXT,
+                source TEXT
+            )""")
+
+    def upsert_universe_symbols(self, symbols: list, source: str):
+        if not symbols:
+            return
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            self._ensure_universe_table(conn)
+            conn.executemany(
+                """INSERT INTO universe (symbol, first_seen_at, source)
+                VALUES (?, ?, ?) ON CONFLICT(symbol) DO NOTHING""",
+                [(s.upper(), now, source) for s in symbols if s])
+
+    def get_universe_sweep_batch(self, n: int) -> list:
+        """Least-recently-examined first; never-examined before everything."""
+        with self._conn() as conn:
+            self._ensure_universe_table(conn)
+            rows = conn.execute(
+                """SELECT symbol FROM universe
+                ORDER BY (last_swept_at IS NOT NULL) ASC,
+                         COALESCE(last_swept_at, '0') ASC
+                LIMIT ?""", (int(n),)).fetchall()
+            return [r[0] for r in rows]
+
+    def mark_universe_swept(self, symbols: list):
+        if not symbols:
+            return
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            self._ensure_universe_table(conn)
+            conn.executemany("UPDATE universe SET last_swept_at = ? WHERE symbol = ?",
+                             [(now, s.upper()) for s in symbols])
+
+    def universe_count(self) -> int:
+        with self._conn() as conn:
+            self._ensure_universe_table(conn)
+            return conn.execute("SELECT COUNT(*) FROM universe").fetchone()[0]
+
+    def get_known_tickers_for_universe_seed(self) -> list:
+        """Organic seed: every symbol this platform has ever cached info for."""
+        with self._conn() as conn:
+            try:
+                return [r[0] for r in conn.execute("SELECT ticker FROM ticker_info_cache")]
+            except Exception:
+                return []
+
+    # ---------- data-source health (2026-07-15) ----------
+    # Written by mcp_clients/base.py's SourceCircuitBreaker (finviz/maverick/
+    # scanner + the market-data providers) and engine/ticker_analyzer.py
+    # (yfinance) - read by server.py's /api/sources for the Monitor tab's
+    # "Data Sources" panel, so which MCP/API is healthy vs down is visible
+    # in the app instead of requiring log archaeology.
+    def upsert_source_health(self, name: str, success: bool, error: str = "",
+                              consecutive_failures: int = 0, breaker_open_until: float = 0.0):
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS source_health (
+                    name TEXT PRIMARY KEY,
+                    last_success_at TEXT,
+                    last_failure_at TEXT,
+                    last_error TEXT,
+                    consecutive_failures INTEGER DEFAULT 0,
+                    breaker_open_until REAL DEFAULT 0,
+                    updated_at TEXT
+                )""")
+            if success:
+                conn.execute(
+                    """INSERT INTO source_health (name, last_success_at, consecutive_failures,
+                        breaker_open_until, updated_at)
+                    VALUES (?, ?, 0, 0, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        last_success_at=excluded.last_success_at, consecutive_failures=0,
+                        breaker_open_until=0, updated_at=excluded.updated_at""",
+                    (name, now, now))
+            else:
+                conn.execute(
+                    """INSERT INTO source_health (name, last_failure_at, last_error,
+                        consecutive_failures, breaker_open_until, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        last_failure_at=excluded.last_failure_at, last_error=excluded.last_error,
+                        consecutive_failures=excluded.consecutive_failures,
+                        breaker_open_until=excluded.breaker_open_until,
+                        updated_at=excluded.updated_at""",
+                    (name, now, (error or "")[:300], consecutive_failures, breaker_open_until, now))
+
+    def get_source_health(self) -> list:
+        with self._conn() as conn:
+            try:
+                cur = conn.execute("SELECT * FROM source_health ORDER BY name")
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+            except Exception:
+                return []  # table not created yet (no source has reported)
+
+    # ---------- analyst estimate revision tracking (2026-07-16) ----------
+    # engine/rules_catalog.py's analyst_estimate_raised rule used to be a
+    # genuine PLACEHOLDER: no data source at all. FMP's free-tier
+    # /stable/analyst-estimates (mcp_clients/market_data.py's
+    # FMPProvider.get_consensus_eps) gives a real current consensus EPS, but
+    # only a SNAPSHOT - detecting a "raise" needs a point-in-time history to
+    # diff against, which is what this table is for: one row per ticker per
+    # day, so a later cycle can compare today's consensus against an
+    # older stored reading.
+    def check_and_record_estimate_snapshot(self, ticker: str, consensus_eps: float,
+                                            lookback_days: int = 30,
+                                            raise_threshold: float = 0.01) -> tuple:
+        """Records today's consensus_eps reading (idempotent - one row per
+        ticker per calendar day) and returns (raised, detail).
+
+        raised is None - genuinely unknown, NOT "not raised" - when there's
+        no snapshot old enough to compare against yet (first time this
+        ticker's been seen, or fewer than lookback_days of history exist).
+        This matters: engine/ticker_data_adapter.py treats None the same as
+        False (no credit), so a ticker can never earn analyst_estimate_raised
+        points off an absent baseline - only off a REAL, measured increase.
+        Expect every ticker to return None for its first ~30 days after this
+        was wired up; that's the table filling in, not a bug.
+
+        detail (2026-07-21, external review - "label it explicitly...
+        WARMING_UP... do not classify it as simply False. A genuine
+        no-revision observation and insufficient stored history are
+        analytically different. Also record: observed EPS estimate, prior
+        EPS estimate, percent change, source, snapshot age") is a dict,
+        always present, so callers/logging never have to re-derive "why is
+        this None":
+          status: "WARMING_UP" (no old-enough baseline yet) or "MEASURED"
+          score_effect: 0 for WARMING_UP - matches the None->no-credit
+              behavior in ticker_data_adapter.py; for MEASURED, the real
+              analyst_estimate_raised point value if raised else 0 (display
+              only - rules/swing_buy_rules.py stays the single source of
+              truth for the actual scoring value)
+          data_availability: "insufficient_history" or "ok"
+          observed_eps / prior_eps / pct_change: None while WARMING_UP
+          source: "fmp_stable_analyst_estimates"
+          snapshot_age_days: None while WARMING_UP, else the real gap in
+              days between today's reading and the compared snapshot
+          analyst_count_change: always None - FMP's free consensus_eps
+              snapshot doesn't carry an analyst count; genuinely not
+              sourced, not a bug (same "field is real or omitted, never
+              faked" convention as the rest of this codebase's PLACEHOLDER
+              fields). A 1% move from a thin consensus can't yet be told
+              apart from the same move on a broad one - future work, not
+              this pass.
+        """
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        with self._conn() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS estimate_snapshots (
+                    ticker TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    consensus_eps REAL,
+                    PRIMARY KEY (ticker, date)
+                )""")
+            conn.execute(
+                """INSERT INTO estimate_snapshots (ticker, date, consensus_eps)
+                VALUES (?, ?, ?)
+                ON CONFLICT(ticker, date) DO UPDATE SET consensus_eps=excluded.consensus_eps""",
+                (ticker, today, consensus_eps))
+            row = conn.execute(
+                """SELECT consensus_eps, date FROM estimate_snapshots
+                   WHERE ticker=? AND date<=? ORDER BY date DESC LIMIT 1""",
+                (ticker, cutoff)).fetchone()
+            _SOURCE = "fmp_stable_analyst_estimates"
+            if row is None or row[0] is None or row[0] <= 0:
+                return None, {
+                    "status": "WARMING_UP",
+                    "score_effect": 0,
+                    "data_availability": "insufficient_history",
+                    "observed_eps": consensus_eps,
+                    "prior_eps": None,
+                    "pct_change": None,
+                    "source": _SOURCE,
+                    "snapshot_age_days": None,
+                    "analyst_count_change": None,
+                }
+            prior_eps, prior_date = row[0], row[1]
+            pct_change = (consensus_eps - prior_eps) / abs(prior_eps)
+            raised = pct_change > raise_threshold
+            try:
+                age_days = (datetime.strptime(today, "%Y-%m-%d")
+                            - datetime.strptime(prior_date, "%Y-%m-%d")).days
+            except Exception:
+                age_days = None
+            return raised, {
+                "status": "MEASURED",
+                "score_effect": 6 if raised else 0,
+                "data_availability": "ok",
+                "observed_eps": consensus_eps,
+                "prior_eps": prior_eps,
+                "pct_change": round(pct_change * 100, 2),
+                "source": _SOURCE,
+                "snapshot_age_days": age_days,
+                "analyst_count_change": None,
+            }
+
+    # ---------- cooperative cycle cancellation (2026-07-15) ----------
+    # Trinath: "Is there a way to kill a running cycle" - there wasn't.
+    # server.py and scheduler.py are separate processes, so the cancel signal
+    # travels through this table (same pattern as ui_events/latest_regime):
+    # POST /api/cycle/cancel sets the flag; scheduler.py checks it between
+    # ticker completions and aborts the remaining work. Running MCP calls
+    # can't be force-killed mid-flight, but nothing new is started, so the
+    # cycle winds down within roughly one ticker's duration.
+    def request_cycle_cancel(self):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cycle_status (id, cancel_requested) VALUES (1, 1)
+                ON CONFLICT(id) DO UPDATE SET cancel_requested=1""")
+
+    def clear_cycle_cancel(self):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cycle_status (id, cancel_requested) VALUES (1, 0)
+                ON CONFLICT(id) DO UPDATE SET cancel_requested=0""")
+
+    def is_cycle_cancel_requested(self) -> bool:
+        with self._conn() as conn:
+            row = conn.execute("SELECT cancel_requested FROM cycle_status WHERE id=1").fetchone()
+            return bool(row and row[0])
+
+    def set_cycle_stage(self, stage: str, tickers_total: int = None, tickers_done: int = None):
+        """Progress-bar follow-up (2026-07-14): Trinath asked for a real 0-100%
+        progress indicator instead of just an elapsed-time counter. A single
+        percentage can't be computed from elapsed time alone (cycle length
+        varies a lot with watchlist size/screener activity/MCP latency), so
+        instead this tracks which named STAGE of _run_cycle_impl() is
+        currently running (market_context -> screener -> ticker_analysis ->
+        finalizing) - the UI maps each stage to an approximate cumulative %
+        band (see ui/index.html's STAGE_BANDS) and, for ticker_analysis
+        specifically, uses the REAL tickers_done/tickers_total fraction
+        within that band since that's the one stage with a genuine, easily
+        counted unit of work. tickers_total/tickers_done are only meaningful
+        during the ticker_analysis stage - left NULL/unset otherwise.
+        Called from a single scheduler.py process per cycle, but still
+        lock-guarded like every other write here for consistency."""
+        with self._conn() as conn:
+            if tickers_total is not None:
+                conn.execute(
+                    """INSERT INTO cycle_status (id, stage, tickers_total, tickers_done)
+                    VALUES (1, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        stage=excluded.stage, tickers_total=excluded.tickers_total,
+                        tickers_done=excluded.tickers_done""",
+                    (stage, tickers_total, tickers_done if tickers_done is not None else 0),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO cycle_status (id, stage) VALUES (1, ?)
+                    ON CONFLICT(id) DO UPDATE SET stage=excluded.stage""",
+                    (stage,),
+                )
+
+    def increment_cycle_tickers_done(self):
+        """Called once per completed ticker inside scheduler.py's per-ticker
+        ThreadPoolExecutor loop (from the main thread as each future
+        resolves via as_completed(), not from the worker threads themselves -
+        so this is never called concurrently and doesn't strictly need the
+        lock for correctness, but takes it anyway for consistency with every
+        other write in this class). A plain UPDATE ... SET tickers_done =
+        tickers_done + 1 rather than read-modify-write from Python, so it's
+        atomic even if that assumption ever changes."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE cycle_status SET tickers_done = COALESCE(tickers_done, 0) + 1 WHERE id = 1"
+            )
+
+    def get_cycle_status(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM cycle_status WHERE id = 1").fetchone()
+            if not row:
+                return {"is_running": False, "started_at": None, "triggered_by": None,
+                         "finished_at": None, "next_run_at": None, "stage": None,
+                         "tickers_total": None, "tickers_done": None,
+                         "pid": None, "kill_reason": None}
+            d = dict(row)
+            d["is_running"] = bool(d["is_running"])
+            return d
+
+    def set_next_cycle_time(self, next_run_at_iso: str):
+        """2026-07-14: Trinath asked why the UI never shows when the next scan
+        cycle will fire - server.py is a separate process from scheduler.py's
+        own APScheduler instance, so it has no way to introspect that
+        scheduler's internal job state directly; this is the same
+        cross-process-bridge-via-DB pattern cycle_status/latest_regime/
+        ui_events already use for the same reason. scheduler.py calls this
+        from an APScheduler event listener (see start()) every time the
+        cron job's next_run_time is (re)computed - once right when the
+        scheduler starts, and again after every firing - so this value is
+        always the SAME thing APScheduler itself believes is next, not a
+        separately-reimplemented cron calculation that could drift out of
+        sync with the real trigger config."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cycle_status (id, next_run_at) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET next_run_at=excluded.next_run_at""",
+                (next_run_at_iso,),
+            )
+
+    def clear_stale_cycle(self, max_age_minutes: int = 20) -> bool:
+        """Self-healing watchdog (2026-07-14, after a real cycle got stuck
+        showing "running" for 23+ minutes with the process silently hung -
+        see mcp_clients/base.py's call_tool() docstring for the root cause
+        that fix addresses). is_running=1 can only ever be cleared by
+        set_cycle_finished()/mark_cycle_killed() - if the WHOLE PROCESS
+        hangs or gets killed before either of those run, this row stays
+        stuck at is_running=1 forever, which is misleading in the UI AND can
+        block a genuinely-new cycle from being understood as "not actually
+        running" by anything that checks this flag.
+
+        2026-07-22: engine/cycle_supervisor.py's hard 15-min process-group
+        kill (see its module docstring) should make this row getting stuck
+        far rarer than before - that supervisor now GUARANTEES
+        set_cycle_finished()/mark_cycle_killed() runs within a bounded time
+        for every cycle, scheduled or manual. This stays in place as a
+        defense-in-depth fallback (e.g. the whole scheduler.py process itself
+        being killed between spawning the child and its own finally block
+        running) rather than the primary fix it used to be.
+
+        Called at the very start of run_supervised(), BEFORE
+        set_cycle_running() - if the current row claims a cycle has been
+        running for longer than max_age_minutes (config:
+        trading.hard_kill_minutes, default 15), force-clears it before
+        proceeding. Returns True if it actually cleared something (so the
+        caller can log it - a cleared stale cycle is worth knowing about,
+        not something to silently paper over)."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT is_running, started_at FROM cycle_status WHERE id = 1").fetchone()
+            if not row or not row[0] or not row[1]:
+                return False
+            try:
+                started = datetime.fromisoformat(row[1])
+            except (ValueError, TypeError):
+                return False
+            age_minutes = (datetime.utcnow() - started).total_seconds() / 60
+            if age_minutes < max_age_minutes:
+                return False
+            conn.execute(
+                "UPDATE cycle_status SET is_running = 0, finished_at = ? WHERE id = 1",
+                (datetime.utcnow().isoformat(),),
+            )
+            return True
+
+    # ---------- ticker info cache (company names, validation) ----------
+    def upsert_ticker_info(self, ticker: str, company_name: str = None, last_price: float = None,
+                            valid: bool = True, sector: str = None, beta: float = None):
+        """Called both opportunistically (every scan cycle, for whatever's
+        already been fetched) and explicitly (ticker validation on add) - see
+        ticker_info_cache's schema comment. Only overwrites company_name/
+        sector/beta when a non-empty/non-None value is given, so an
+        opportunistic scheduler.py call missing one field (e.g. yfinance had
+        no longName for this ticker) doesn't blank out a value a previous
+        call already found."""
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT company_name, sector, beta FROM ticker_info_cache WHERE ticker = ?", (ticker,)
+            ).fetchone()
+            name = company_name or (existing[0] if existing else None)
+            sec = sector or (existing[1] if existing else None)
+            bta = beta if beta is not None else (existing[2] if existing else None)
+            conn.execute(
+                """INSERT INTO ticker_info_cache (ticker, company_name, last_price, valid, updated_at, sector, beta)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    company_name=excluded.company_name, last_price=excluded.last_price,
+                    valid=excluded.valid, updated_at=excluded.updated_at,
+                    sector=excluded.sector, beta=excluded.beta""",
+                (ticker, name, last_price, int(bool(valid)), datetime.utcnow().isoformat(), sec, bta),
+            )
+
+    def get_ticker_info(self, ticker: str):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM ticker_info_cache WHERE ticker = ?", (ticker,)).fetchone()
+            return dict(row) if row else None
+
+    def get_ticker_info_bulk(self, tickers: list) -> dict:
+        """{ticker: {company_name, sector, beta, last_price, ...}} for a batch
+        of tickers in one query - used by engine/portfolio_risk.py to look up
+        every open position's sector/beta without N separate round-trips."""
+        if not tickers:
+            return {}
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in tickers)
+            cur = conn.execute(
+                f"SELECT * FROM ticker_info_cache WHERE ticker IN ({placeholders})", tickers
+            )
+            return {row["ticker"]: dict(row) for row in cur.fetchall()}
+
+    # ---------- ticker data health (Data Provenance Circuit Breaker) ----------
+    def record_ticker_data_health(self, ticker: str, is_stale_cycle: bool) -> int:
+        """Called once per analyzed ticker per cycle (scheduler.py's
+        _evaluate_ticker) - tracks CONSECUTIVE cycles this ticker's data has
+        tripped (or nearly tripped) rules/hard_vetoes.py's veto #16
+        (STALE_DATA_CIRCUIT_BREAKER), independent of whether that veto
+        actually fired this cycle (an earlier veto, or already-open status,
+        can short-circuit before veto #16 is even evaluated - but the
+        underlying data quality is the same either way, so this is computed
+        directly from stale_indicators/breadth_stale, not from the veto
+        result). Resets to 0 on any clean cycle. Returns the NEW consecutive
+        count so the caller can decide whether to alert (see
+        data_quality.consecutive_stale_alert_cycles)."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT consecutive_stale_cycles FROM ticker_info_cache WHERE ticker = ?", (ticker,)
+            ).fetchone()
+            current = (row[0] if row else 0) or 0
+            new_count = (current + 1) if is_stale_cycle else 0
+            if row:
+                if is_stale_cycle:
+                    conn.execute(
+                        "UPDATE ticker_info_cache SET consecutive_stale_cycles = ?, last_stale_at = ? WHERE ticker = ?",
+                        (new_count, now, ticker),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE ticker_info_cache SET consecutive_stale_cycles = 0, last_healthy_at = ? WHERE ticker = ?",
+                        (now, ticker),
+                    )
+            else:
+                # Shouldn't normally happen - upsert_ticker_info() is called earlier
+                # in the same cycle - but insert defensively rather than lose the signal.
+                conn.execute(
+                    """INSERT INTO ticker_info_cache (ticker, valid, updated_at, consecutive_stale_cycles,
+                       last_stale_at, last_healthy_at) VALUES (?,1,?,?,?,?)""",
+                    (ticker, now, new_count, now if is_stale_cycle else None, None if is_stale_cycle else now),
+                )
+            return new_count
+
+    def get_unhealthy_tickers(self, min_consecutive: int = 1, max_age_minutes: int = None) -> list:
+        """Every ticker currently on a stale-data streak of at least
+        min_consecutive cycles - used by server.py's /api/ticker/health for
+        the Control tab's watchlist-chip warning badge (called with
+        max_age_minutes=None there - show every currently-unhealthy ticker,
+        no matter how old the streak, for genuine visibility).
+
+        max_age_minutes (2026-07-14 fix - "screener catch-22"): engine/
+        screener.py's _pre_filter() ALSO calls this to exclude unhealthy
+        candidates from being re-selected - but a candidate that's excluded
+        never gets re-evaluated by scheduler.py's per-ticker loop, which is
+        the ONLY thing that can reset consecutive_stale_cycles back to 0 (via
+        record_ticker_data_health() on a clean cycle). Without a recency
+        cutoff, a ticker that went stale once (e.g. during a thin pre-market
+        window) would be locked out of the screener FOREVER - it can never
+        get the clean cycle it needs to prove it's recovered, since it's
+        never looked at again. Confirmed happening in production: 11+
+        tickers stuck at exactly consecutive_stale_cycles=3 with a
+        last_stale_at from early in the session, hours before being checked.
+        Passing max_age_minutes restricts the exclusion to streaks that went
+        stale RECENTLY (last_stale_at within the window) - once the cooldown
+        elapses with no fresh (re-staling) evaluation, the ticker quietly
+        drops out of this query and gets one more shot at the screener. If
+        it's still bad, the next stale evaluation just refreshes
+        last_stale_at and the cooldown restarts - self-healing either way."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            if max_age_minutes is not None:
+                cutoff = (datetime.utcnow() - timedelta(minutes=max_age_minutes)).isoformat()
+                cur = conn.execute(
+                    """SELECT ticker, consecutive_stale_cycles, last_stale_at, last_healthy_at
+                       FROM ticker_info_cache WHERE consecutive_stale_cycles >= ? AND last_stale_at >= ?
+                       ORDER BY consecutive_stale_cycles DESC""",
+                    (min_consecutive, cutoff),
+                )
+            else:
+                cur = conn.execute(
+                    """SELECT ticker, consecutive_stale_cycles, last_stale_at, last_healthy_at
+                       FROM ticker_info_cache WHERE consecutive_stale_cycles >= ?
+                       ORDER BY consecutive_stale_cycles DESC""",
+                    (min_consecutive,),
+                )
+            return [dict(r) for r in cur.fetchall()]
+
+    # ---------- portfolio risk manager ----------
+    def log_portfolio_risk(self, ticker: str, sector: str, themes: list, sector_exposure_pct: float,
+                            theme_exposure_pct: float, portfolio_beta: float, max_pairwise_correlation: float,
+                            high_vol_position_count: int, size_multiplier: float, blocked: bool, reasons: list):
+        import json
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO portfolio_risk_log
+                (timestamp, ticker, sector, themes, sector_exposure_pct, theme_exposure_pct, portfolio_beta,
+                 max_pairwise_correlation, high_vol_position_count, size_multiplier, blocked, reasons)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (datetime.utcnow().isoformat(), ticker, sector, json.dumps(themes or []),
+                 sector_exposure_pct, theme_exposure_pct, portfolio_beta, max_pairwise_correlation,
+                 high_vol_position_count, size_multiplier, int(bool(blocked)), json.dumps(reasons or [])),
+            )
+
+    def get_recent_portfolio_risk_log(self, limit: int = 50) -> list:
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM portfolio_risk_log ORDER BY id DESC LIMIT ?", (limit,))
+            rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                r["themes"] = json.loads(r["themes"]) if r.get("themes") else []
+                r["reasons"] = json.loads(r["reasons"]) if r.get("reasons") else []
+            return rows
+
+    # ---------- screener candidate persistence/aging (engine/screener.py) ----------
+    def upsert_screener_candidate(self, ticker: str, mode: str, score: float,
+                                   source: str = None, decomposition: dict = None):
+        """Called once per ticker per screener run (engine/screener.py's
+        run_screener). Bumps times_seen/last_score every call; best_score only
+        ever increases. first_seen_at is set once and never overwritten.
+
+        source/decomposition (2026-07-15f, review round 5): which discovery
+        source surfaced the candidate this cycle, and the Discovery Score's
+        component breakdown (rs_20d/50d/100d, trend_aligned, persistence) -
+        so future outcome analysis can attribute good/bad picks to specific
+        sources and components instead of one opaque number."""
+        import json
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            self._add_column_if_missing(conn, "screener_candidates", "last_source", "TEXT")
+            self._add_column_if_missing(conn, "screener_candidates", "last_decomposition", "TEXT")
+            conn.execute(
+                """INSERT INTO screener_candidates (ticker, mode, first_seen_at, last_seen_at,
+                    times_seen, last_score, best_score, last_source, last_decomposition)
+                VALUES (?,?,?,?,1,?,?,?,?)
+                ON CONFLICT(ticker, mode) DO UPDATE SET
+                    last_seen_at=excluded.last_seen_at,
+                    times_seen=screener_candidates.times_seen + 1,
+                    last_score=excluded.last_score,
+                    best_score=GREATEST(screener_candidates.best_score, excluded.best_score),
+                    last_source=excluded.last_source,
+                    last_decomposition=excluded.last_decomposition""",
+                (ticker, mode, now, now, score, score, source,
+                 json.dumps(decomposition) if decomposition else None),
+            )
+
+    def get_screener_history(self, ticker: str, mode: str):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM screener_candidates WHERE ticker = ? AND mode = ?", (ticker, mode)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_most_discovered_tickers(self, mode: str = "swing", limit: int = 60,
+                                     min_scored: int = 1) -> list:
+        """Returns up to `limit` tickers from screener_candidates, ordered by
+        times_seen DESCENDING - i.e. the names the LIVE discovery sources
+        (rs_gainers/volume_surge/sector_leaders/etc. - config.yaml's
+        screener.sources) have organically surfaced most often.
+
+        Used by engine/backtest_loop.py's resolve_backtest_tickers() to build
+        an automatic backtest ticker universe (2026-07-24, zero-trades
+        follow-up: "pick tickers automatically instead of a hand-curated
+        list"). Deliberately ordered/filtered by DISCOVERY FREQUENCY, never
+        by score/qualify-rate - a backtest universe selected because those
+        tickers already cleared 50%+ historically would trivially "clear
+        50%+" again over that same window (the exact look-ahead/selection
+        bias this method exists to avoid; see that function's docstring).
+        times_seen only reflects that the live system found a ticker worth
+        re-scanning often, which is knowable without knowing how it later
+        scored - so this is a legitimate universe, not a curated winner list.
+        min_scored (default 1) drops pure one-off appearances (discovered
+        once, never actually scored) that add noise without adding history.
+        """
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT ticker FROM screener_candidates "
+                "WHERE mode = ? AND n_scored >= ? "
+                "ORDER BY times_seen DESC LIMIT ?",
+                (mode, min_scored, limit),
+            )
+            return [r["ticker"] for r in cur.fetchall()]
+
+    def prune_stale_screener_candidates(self, mode: str, stale_after_days: int = 5):
+        """Drops rows a ticker hasn't appeared in for a while, so a stock that
+        was hot once in March doesn't keep getting a persistence bonus in
+        June. Called at the start of each run_screener() call. This also
+        resets that ticker's outcome-tracking stats (n_scored/n_qualified/
+        n_stale_data_blocked below) if it's re-discovered later - "innocent
+        until proven guilty again" rather than a permanent blocklist entry."""
+        cutoff = (datetime.utcnow() - timedelta(days=stale_after_days)).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM screener_candidates WHERE mode = ? AND last_seen_at < ?", (mode, cutoff)
+            )
+
+    def record_screener_outcome(self, ticker: str, mode: str, qualified: bool,
+                                 stale_data_blocked: bool, buy_pct: float = None):
+        """Called once per cycle a SCREENER-sourced ticker is actually run
+        through scoring (scheduler.py's _evaluate_ticker, only when the
+        ticker came from engine/screener.py's candidate list, not the manual
+        watchlist). This is the missing feedback loop: without it, the
+        screener only ever knew "how often did this ticker get discovered"
+        (times_seen/best_score), never "was it actually any good" - see
+        engine/screener.py's _persistence_bonus() and
+        get_low_quality_screener_tickers() for how this gets used."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT n_scored, n_qualified, n_stale_data_blocked, sum_buy_pct, n_buy_pct_samples "
+                "FROM screener_candidates WHERE ticker = ? AND mode = ?", (ticker, mode),
+            ).fetchone()
+            if row is None:
+                # Being scored without a discovery-time row (shouldn't normally
+                # happen - discovery always runs first and upserts one) - insert
+                # defensively rather than silently lose this outcome.
+                conn.execute(
+                    """INSERT INTO screener_candidates
+                       (ticker, mode, first_seen_at, last_seen_at, times_seen, last_score, best_score)
+                       VALUES (?,?,?,?,0,0,0)""",
+                    (ticker, mode, now, now),
+                )
+                n_scored, n_qualified, n_stale, sum_pct, n_pct = 0, 0, 0, 0.0, 0
+            else:
+                n_scored, n_qualified, n_stale, sum_pct, n_pct = row
+
+            n_scored = (n_scored or 0) + 1
+            n_qualified = (n_qualified or 0) + (1 if qualified else 0)
+            n_stale = (n_stale or 0) + (1 if stale_data_blocked else 0)
+            sum_pct = sum_pct or 0.0
+            n_pct = n_pct or 0
+            if buy_pct is not None:
+                sum_pct += buy_pct
+                n_pct += 1
+
+            conn.execute(
+                """UPDATE screener_candidates SET n_scored = ?, n_qualified = ?, n_stale_data_blocked = ?,
+                   sum_buy_pct = ?, n_buy_pct_samples = ? WHERE ticker = ? AND mode = ?""",
+                (n_scored, n_qualified, n_stale, sum_pct, n_pct, ticker, mode),
+            )
+
+    def get_low_quality_screener_tickers(self, mode: str, min_track_record: int = 5,
+                                          max_qualify_rate: float = 0.05,
+                                          min_stale_block_rate: float = 0.5) -> list:
+        """Screener candidates with enough scored history (>= min_track_record
+        cycles) that have PROVEN to be low quality - either they almost never
+        qualify as a real BUY, or they're chronically blocked by stale/
+        fallback data (rules/hard_vetoes.py's veto #16), even outside an
+        active streak (see get_unhealthy_tickers() for the CURRENT-streak
+        version). Used by engine/screener.py's _pre_filter() to stop
+        re-surfacing a ticker the system has already learned isn't worth
+        another look, until prune_stale_screener_candidates() resets it
+        (i.e. it stops being discovered for a while, then comes back fresh)."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT * FROM screener_candidates WHERE mode = ? AND n_scored >= ?",
+                (mode, min_track_record),
+            )
+            out = []
+            for r in cur.fetchall():
+                d = dict(r)
+                n_scored = d["n_scored"] or 1
+                qualify_rate = (d["n_qualified"] or 0) / n_scored
+                stale_rate = (d["n_stale_data_blocked"] or 0) / n_scored
+                if qualify_rate <= max_qualify_rate or stale_rate >= min_stale_block_rate:
+                    d["qualify_rate"] = round(qualify_rate, 3)
+                    d["stale_block_rate"] = round(stale_rate, 3)
+                    out.append(d)
+            return out
+
+    def get_all_ticker_names(self) -> dict:
+        """{ticker: company_name} for every cached ticker with a known name -
+        used by the UI to power hover tooltips without a live call per ticker."""
+        with self._conn() as conn:
+            cur = conn.execute("SELECT ticker, company_name FROM ticker_info_cache WHERE company_name IS NOT NULL AND company_name != ''")
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+    # ---------- signals ----------
+    @staticmethod
+    def _decision_context_json(obj):
+        """Serializes any of the decision-context objects (dataclass instance,
+        plain dict, or None) to a JSON string for the signals table's TEXT
+        columns - see _migrate_decision_context_columns. Dataclasses
+        (PositionSizeResult, PortfolioRiskResult, ExecutionQualityResult,
+        RegimeState) are converted via dataclasses.asdict(); dicts
+        (threshold_result from rules/dynamic_thresholds.py, ev_result from
+        engine/ev_engine.py) are passed through as-is."""
+        import dataclasses
+        import json
+        if obj is None:
+            return None
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            obj = dataclasses.asdict(obj)
+        return json.dumps(obj, default=str)
+
+    def log_signal(self, ticker: str, td, buy_result, sell_result=None, score_result=None,
+                    threshold_result=None, ev_result=None, execution_quality=None,
+                    position_size=None, portfolio_risk=None, regime=None, asset_class=None,
+                    probabilistic_decision=None, trade_mode=None) -> int:
+        """score_result: rules/swing_buy_rules.py's SwingScoreResult, when the
+        ticker was actually scored this cycle (i.e. not vetoed, not already
+        an open position) - gives the full 6-bucket breakdown. When it's None
+        (vetoed / already-open / legacy buy_rules.py path), rules_failed still
+        carries the single reason from BuyResultCompat (see
+        rules/swing_buy_rules.py's from_veto()/already_open()).
+
+        threshold_result/ev_result/execution_quality/position_size/
+        portfolio_risk/regime/asset_class: the rest of a scored cycle's
+        decision context (see _migrate_decision_context_columns) - all
+        optional/None for vetoed or already-open tickers where these were
+        never computed. Persisting these is what makes
+        analytics/decision_replay.py's replay_signal() possible without
+        re-deriving anything live.
+
+        trade_mode: OPTIONAL "DAY"/"SWING"/"HYBRID" (2026-07-22, EV mode-keying
+        follow-up) - see _migrate_decision_context_columns' trade_mode comment
+        for why this exists and what the caller should pass."""
+        import json
+
+        if sell_result is not None and sell_result.should_sell:
+            signal_label = "SELL"
+        elif buy_result is not None and buy_result.should_buy:
+            signal_label = "BUY"
+        else:
+            signal_label = "HOLD"
+
+        rules_fired = [r.name for r in (getattr(buy_result, "rules_passed", None) or [])]
+        rules_failed = [{"name": r.name, "detail": r.detail}
+                         for r in (getattr(buy_result, "rules_failed", None) or [])]
+        bucket_scores = None
+        if score_result is not None:
+            bucket_scores = [
+                {
+                    "name": b.name, "weight": b.weight, "points": b.points, "max_points": b.max_points,
+                    "min_pct": b.min_pct, "qualified": b.qualified, "rules_fired": b.rules_fired,
+                    # qual_mult/checklist/contribution_pct - added so the UI/journal can show
+                    # the same rich raw/normalized/weight breakdown as a live cycle's
+                    # trade_prompt.md, not just a flattened points/max number, for any
+                    # PAST signal too (see rules/swing_buy_rules.py's DIAGNOSTICS NOTE).
+                    "qual_mult": getattr(b, "qual_mult", 1.0),
+                    "checklist": getattr(b, "checklist", []),
+                    "contribution_pct": round(
+                        (b.points / b.max_points) * b.weight * getattr(b, "qual_mult", 1.0) * 100
+                        if b.max_points else 0.0, 2,
+                    ),
+                }
+                for b in score_result.buckets
+            ]
+
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO signals
+                (timestamp, ticker, signal, confidence, price, buy_score, buy_pct,
+                 sell_triggered_rule, sell_reason, data_quality, rules_fired, rules_failed, bucket_scores,
+                 threshold_breakdown, ev_result, execution_quality, position_size, portfolio_risk,
+                 regime_snapshot, asset_class, probabilistic_decision, trade_mode)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                RETURNING id""",
+                (
+                    datetime.utcnow().isoformat(), ticker, signal_label,
+                    getattr(buy_result, "pct_score", None) if buy_result else None,
+                    getattr(td, "price", None),
+                    getattr(buy_result, "score", None) if buy_result else None,
+                    getattr(buy_result, "pct_score", None) if buy_result else None,
+                    getattr(sell_result, "triggered_rule", None) if sell_result else None,
+                    getattr(sell_result, "reason", None) if sell_result else None,
+                    getattr(td, "data_quality", None),
+                    json.dumps(rules_fired),
+                    json.dumps(rules_failed),
+                    json.dumps(bucket_scores) if bucket_scores is not None else None,
+                    self._decision_context_json(threshold_result),
+                    self._decision_context_json(ev_result),
+                    self._decision_context_json(execution_quality),
+                    self._decision_context_json(position_size),
+                    self._decision_context_json(portfolio_risk),
+                    self._decision_context_json(regime),
+                    asset_class,
+                    self._decision_context_json(probabilistic_decision),
+                    trade_mode,
+                ),
+            )
+            today = date.today().isoformat()
+            conn.execute(
+                """INSERT INTO daily_stats (date, signals_generated) VALUES (?, 1)
+                   ON CONFLICT(date) DO UPDATE SET signals_generated = daily_stats.signals_generated + 1""",
+                (today,),
+            )
+            return cur.lastrowid
+
+    @staticmethod
+    def _parse_signal_json(row: dict) -> dict:
+        import json
+        for col, default in (("rules_fired", []), ("rules_failed", []), ("bucket_scores", None),
+                              ("threshold_breakdown", None), ("ev_result", None), ("execution_quality", None),
+                              ("position_size", None), ("portfolio_risk", None), ("regime_snapshot", None),
+                              ("probabilistic_decision", None)):
+            raw = row.get(col)
+            row[col] = json.loads(raw) if raw else default
+        return row
+
+    def get_recent_signals(self, limit: int = 50):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
+            return [self._parse_signal_json(dict(r)) for r in cur.fetchall()]
+
+    def latest_signal(self, ticker: str):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM signals WHERE ticker = ? ORDER BY id DESC LIMIT 1", (ticker,))
+            row = cur.fetchone()
+            return self._parse_signal_json(dict(row)) if row else None
+
+    def get_signal_by_id(self, signal_id: int):
+        """Looks up a single signals row by its own id - used by
+        analytics/decision_replay.py when a caller already knows the exact
+        signal (e.g. from a UI link) rather than searching by ticker/date."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
+            return self._parse_signal_json(dict(row)) if row else None
+
+    def find_signal(self, ticker: str, date: str = None):
+        """analytics/decision_replay.py's main lookup path: 'reconstruct what
+        happened for TICKER on DATE'. date is a YYYY-MM-DD string matched
+        against the timestamp's date portion; when omitted, returns the most
+        recent signal for that ticker (same as latest_signal). When multiple
+        signals exist for the ticker on that date (multiple scan cycles),
+        returns the last one of the day - the final decision made."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            if date:
+                cur = conn.execute(
+                    "SELECT * FROM signals WHERE ticker = ? AND substr(timestamp, 1, 10) = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (ticker, date),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT * FROM signals WHERE ticker = ? ORDER BY id DESC LIMIT 1", (ticker,)
+                )
+            row = cur.fetchone()
+            return self._parse_signal_json(dict(row)) if row else None
+
+    # ---------- weight-change provenance ("git commit for trading logic") ----------
+    def log_weight_change_provenance(self, id: str, bucket: str, mode: str, old_weight: float,
+                                      new_weight: float, strategy_version=None, config_hash: str = None,
+                                      feature_ranking=None, walk_forward_report=None,
+                                      champion_challenge_id: str = None, trade_count: int = None,
+                                      decision: str = "", decision_reason: str = ""):
+        """Called from learning/bayesian_updater.py's apply_bucket_weight_to_config()
+        on every attempted weight change - accepted (shadow-validated or
+        force-applied) AND rejected (blocked by ShadowValidationRequired) -
+        so the rejection itself is on record too, not just successful
+        changes. id: caller-generated (e.g. f"{bucket}-{mode}-{timestamp}")
+        so it's stable/referenceable before the row exists."""
+        import json
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO weight_change_log
+                (id, created_at, bucket, mode, old_weight, new_weight, strategy_version, config_hash,
+                 feature_ranking, walk_forward_report, champion_challenge_id, trade_count, decision,
+                 decision_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    decision=excluded.decision, decision_reason=excluded.decision_reason""",
+                (id, datetime.utcnow().isoformat(), bucket, mode, old_weight, new_weight,
+                 json.dumps(strategy_version) if strategy_version is not None else None,
+                 config_hash,
+                 json.dumps(feature_ranking) if feature_ranking is not None else None,
+                 json.dumps(walk_forward_report) if walk_forward_report is not None else None,
+                 champion_challenge_id, trade_count, decision, decision_reason),
+            )
+
+    @staticmethod
+    def _parse_weight_change_row(row: dict) -> dict:
+        import json
+        for col in ("strategy_version", "feature_ranking", "walk_forward_report"):
+            raw = row.get(col)
+            row[col] = json.loads(raw) if raw else None
+        return row
+
+    def get_weight_change_provenance(self, id: str):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM weight_change_log WHERE id = ?", (id,)).fetchone()
+            return self._parse_weight_change_row(dict(row)) if row else None
+
+    def get_weight_change_history(self, bucket: str = None, mode: str = None, limit: int = 50):
+        """Answers 'why did we change TREND from 21% to 23%' six months from
+        now - full provenance trail, optionally filtered to one bucket and/or
+        mode, newest first."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            clauses, params = [], []
+            if bucket:
+                clauses.append("bucket = ?")
+                params.append(bucket)
+            if mode:
+                clauses.append("mode = ?")
+                params.append(mode)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(limit)
+            cur = conn.execute(
+                f"SELECT * FROM weight_change_log {where} ORDER BY created_at DESC LIMIT ?", params
+            )
+            return [self._parse_weight_change_row(dict(r)) for r in cur.fetchall()]
+
+    # ---------- cycles ----------
+    def log_cycle(self, cycle_num: int, ticker_count: int, blocked: bool = False,
+                  reason: str = "", duration: float = None, triggered_by: str = "scheduler"):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cycles (timestamp, cycle_num, ticker_count, blocked, reason, duration, triggered_by)
+                VALUES (?,?,?,?,?,?,?)""",
+                (datetime.utcnow().isoformat(), cycle_num, ticker_count, int(blocked), reason, duration, triggered_by),
+            )
+            today = date.today().isoformat()
+            conn.execute(
+                """INSERT INTO daily_stats (date, cycles_run) VALUES (?, 1)
+                   ON CONFLICT(date) DO UPDATE SET cycles_run = daily_stats.cycles_run + 1""",
+                (today,),
+            )
+
+    def get_last_cycle(self):
+        """Most recent cycles-table row, used by server.py's /api/status to
+        show 'last scanned at HH:MM' / 'N cycles today' in the UI."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM cycles ORDER BY id DESC LIMIT 1").fetchone()
+            return dict(row) if row else None
+
+    def increment_cycle(self) -> int:
+        today = date.today().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO daily_stats (date, cycles_run) VALUES (?, 1)
+                   ON CONFLICT(date) DO UPDATE SET cycles_run = daily_stats.cycles_run + 1""",
+                (today,),
+            )
+            row = conn.execute("SELECT cycles_run FROM daily_stats WHERE date = ?", (today,)).fetchone()
+            return row[0] if row else 1
+
+    # ---------- trades ----------
+    def log_trade(self, ticker: str, side: str, amount: float, shares: float = None,
+                  fill_price: float = None, order_id: str = None, status: str = "unknown",
+                  snapshot_id: str = None):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO trades (timestamp, ticker, side, amount, shares, fill_price, order_id, status, snapshot_id)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (datetime.utcnow().isoformat(), ticker, side, round(amount, 2) if amount else amount,
+                 shares, fill_price, order_id, status, snapshot_id),
+            )
+            today = date.today().isoformat()
+            conn.execute(
+                """INSERT INTO daily_stats (date, trades_placed) VALUES (?, 1)
+                   ON CONFLICT(date) DO UPDATE SET trades_placed = daily_stats.trades_placed + 1""",
+                (today,),
+            )
+
+    def get_recent_trades(self, limit: int = 20):
+        """Includes the parsed snapshot inline (not just snapshot_id) so the
+        UI's Journal tab can render the indicator/rule detail without a
+        second round-trip per row - these are small JSON blobs, not worth a
+        separate fetch-on-expand endpoint."""
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
+            rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                r["snapshot"] = None
+                if r.get("snapshot_id"):
+                    snap = self.get_trade_snapshot(r["snapshot_id"])
+                    if snap and snap.get("data"):
+                        try:
+                            r["snapshot"] = json.loads(snap["data"])
+                        except (ValueError, TypeError):
+                            r["snapshot"] = None
+            return rows
+
+    # ---------- positions ----------
+    # `simulated` filter convention (paper trading, 2026-07-16): None = both
+    # books (back-compat - callers that existed before paper trading see the
+    # union), False = real book only (confirm_fill.py-managed), True =
+    # simulated/WATCH-mode book only. COALESCE(simulated, 0) because rows
+    # created before the migration have NULL.
+    def get_open_position(self, ticker: str, simulated: bool = None):
+        q = "SELECT * FROM positions WHERE ticker = ? AND status = 'open'"
+        if simulated is not None:
+            q += f" AND COALESCE(simulated, 0) = {1 if simulated else 0}"
+        q += " ORDER BY id DESC LIMIT 1"
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(q, (ticker,)).fetchone()
+            return dict(row) if row else None
+
+    def open_position(self, ticker: str, entry_price: float, shares: float, dollar_amount: float,
+                       pattern_id: int = None, simulated: bool = False, entry_time: str = None,
+                       trade_mode: str = None):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO positions
+                (ticker, entry_price, entry_time, shares, dollar_amount, trail_high, status, pattern_id, simulated, trade_mode)
+                VALUES (?,?,?,?,?,?, 'open', ?, ?, ?)""",
+                (ticker, entry_price, entry_time or datetime.utcnow().isoformat(), shares,
+                 dollar_amount, entry_price, pattern_id, 1 if simulated else 0,
+                 trade_mode.upper() if trade_mode else None),
+            )
+
+    def close_position(self, ticker: str, exit_price: float, simulated: bool = False) -> dict:
+        """Returns the closed position's details (entry_price, entry_time, shares,
+        pattern_id, pnl, pnl_pct) so the caller (confirm_fill.py or
+        engine/paper_trader.py) can close the linked pattern_database entry with
+        the real outcome. Returns {} if there was no open position for this
+        ticker in the requested book. Defaults to the REAL book so
+        confirm_fill.py's behavior is unchanged - a real sell must never close
+        the simulated clone of the same ticker (and vice versa). Simulated
+        closes stay OUT of daily_stats: that table feeds the risk engine's
+        max_daily_loss guard and reports REAL money only."""
+        sim_flag = 1 if simulated else 0
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM positions WHERE ticker = ? AND status = 'open' "
+                "AND COALESCE(simulated, 0) = ? ORDER BY id DESC LIMIT 1",
+                (ticker, sim_flag),
+            ).fetchone()
+            if not row:
+                return {}
+            row = dict(row)
+            conn.execute(
+                "UPDATE positions SET status = 'closed' WHERE ticker = ? AND status = 'open' "
+                "AND COALESCE(simulated, 0) = ?", (ticker, sim_flag)
+            )
+            entry_price, shares = row["entry_price"], row["shares"]
+            pnl = (exit_price - entry_price) * shares if entry_price and shares else 0.0
+            pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price else 0.0
+            if not simulated:
+                today = date.today().isoformat()
+                conn.execute(
+                    """INSERT INTO daily_stats (date, realized_pnl, winning_trades) VALUES (?, ?, ?)
+                       ON CONFLICT(date) DO UPDATE SET
+                         realized_pnl = daily_stats.realized_pnl + excluded.realized_pnl,
+                         winning_trades = daily_stats.winning_trades + excluded.winning_trades""",
+                    (today, pnl, 1 if pnl > 0 else 0),
+                )
+            return {
+                "ticker": ticker, "entry_price": entry_price, "entry_time": row["entry_time"],
+                "shares": shares, "pattern_id": row.get("pattern_id"),
+                "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct,
+                "trade_mode": row.get("trade_mode"),
+            }
+
+    def update_trail_high(self, ticker: str, new_high: float):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE positions SET trail_high = GREATEST(COALESCE(trail_high, 0), ?) WHERE ticker = ? AND status = 'open'",
+                (new_high, ticker),
+            )
+
+    def get_all_positions(self, simulated: bool = None):
+        """simulated: None = both books (back-compat), False = real only,
+        True = simulated (paper) only."""
+        q = "SELECT * FROM positions WHERE status = 'open'"
+        if simulated is not None:
+            q += f" AND COALESCE(simulated, 0) = {1 if simulated else 0}"
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(q)
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_open_position_by_pattern(self, pattern_id: int, simulated: bool = True):
+        """Used by scheduler._close_due_patterns() to skip the time-based
+        simulated close for any pattern whose outcome will instead come from
+        a rule-driven paper-trade exit (the whole point of WATCH mode)."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM positions WHERE pattern_id = ? AND status = 'open' "
+                "AND COALESCE(simulated, 0) = ? LIMIT 1",
+                (pattern_id, 1 if simulated else 0),
+            ).fetchone()
+            return dict(row) if row else None
+
+    # ---------- paper trading (WATCH-mode purse + trade ledger) ----------
+    def get_paper_account(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM paper_account WHERE id = 1").fetchone()
+            return dict(row) if row else None
+
+    def init_paper_account(self, starting_cash: float):
+        """Idempotent - keeps the existing purse if one is already seeded, so
+        every WATCH-mode cycle can call this without resetting the account."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO paper_account (id, starting_cash, cash, realized_pnl, created_at, updated_at)
+                   VALUES (1, ?, ?, 0, ?, ?) ON CONFLICT(id) DO NOTHING""",
+                (starting_cash, starting_cash, now, now),
+            )
+        return self.get_paper_account()
+
+    def adjust_paper_cash(self, delta: float, realized_pnl_delta: float = 0.0):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE paper_account SET cash = cash + ?, realized_pnl = realized_pnl + ?, updated_at = ? WHERE id = 1",
+                (delta, realized_pnl_delta, datetime.utcnow().isoformat()),
+            )
+
+    def reset_paper_account(self):
+        """Wipes the purse, ledger, and every simulated position (open or
+        closed) - a clean slate for the next WATCH session. Real book untouched."""
+        with self._conn() as conn:
+            conn.execute("DELETE FROM paper_account")
+            conn.execute("DELETE FROM paper_trades")
+            conn.execute("DELETE FROM positions WHERE COALESCE(simulated, 0) = 1")
+
+    def remove_seed_positions(self) -> dict:
+        """Undoes robinhood_sync.py's seed-paper command: deletes every
+        trade_mode='SEED' row it cloned into the simulated book (real
+        Robinhood holdings mirrored in for display), credits their cost
+        basis back to paper_account.cash so the purse stays consistent, and
+        removes the matching 'seeded_from_robinhood' ledger lines from
+        paper_trades so the Journal doesn't show orphaned buys.
+
+        Why this exists (2026-07-23, Trinath's ask): SEED positions are
+        informational clones of a real account, not something the WATCH-mode
+        engine is actually managing - but engine/paper_trader.py's
+        max_positions/max_day_positions caps used to count ALL simulated
+        open positions, SEED included, so a mirrored real portfolio could
+        silently eat most or all of the 10-position budget and starve out
+        genuine new WATCH signals. paper_trader.py now excludes trade_mode=
+        'SEED' from those counts going forward regardless of whether this
+        has been run; this method is for cleaning up SEED rows already
+        sitting in the DB from a previous seed-paper run."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM positions WHERE COALESCE(simulated, 0) = 1 "
+                "AND status = 'open' AND UPPER(COALESCE(trade_mode, '')) = 'SEED'"
+            ).fetchall()
+            rows = [dict(r) for r in rows]
+            if not rows:
+                return {"removed": 0, "cash_credited": 0.0}
+            total_cost = sum((r.get("dollar_amount") or 0) for r in rows)
+            tickers = [r["ticker"] for r in rows]
+            conn.execute(
+                "DELETE FROM positions WHERE COALESCE(simulated, 0) = 1 "
+                "AND status = 'open' AND UPPER(COALESCE(trade_mode, '')) = 'SEED'"
+            )
+            conn.execute(
+                "DELETE FROM paper_trades WHERE reason = 'seeded_from_robinhood'"
+            )
+            if total_cost:
+                conn.execute(
+                    "UPDATE paper_account SET cash = cash + ?, updated_at = ? WHERE id = 1",
+                    (total_cost, datetime.utcnow().isoformat()),
+                )
+        return {"removed": len(rows), "cash_credited": round(total_cost, 2), "tickers": tickers}
+
+    def remove_synced_positions(self) -> dict:
+        """Real-book counterpart to remove_seed_positions(): deletes every
+        trade_mode='SYNC' row engine/account_sync.py auto-imported from a
+        Robinhood account (config.yaml account.auto_sync, once per cycle
+        while enabled). Real money/actual Robinhood holdings are completely
+        unaffected - account_sync.py is read-only against the brokerage, and
+        so is this: it only removes the LOCAL tracking row, so the platform
+        stops counting/health-scoring/stop-managing a position it never
+        actually decided to enter itself.
+
+        Why this exists (2026-07-23, Trinath's ask, same rationale as
+        remove_seed_positions(): a SYNC row counted toward
+        trading.max_positions in engine/live_trader.py exactly like a real
+        self-initiated position, so an account holding several unrelated
+        names could crowd out the real-book trading budget. live_trader.py
+        now excludes trade_mode='SYNC' from that count going forward; this
+        cleans up rows already imported from a prior sync. Doesn't disable
+        account.auto_sync itself - flip that off in config.yaml/Control tab
+        separately if you don't want this to happen again."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM positions WHERE COALESCE(simulated, 0) = 0 "
+                "AND status = 'open' AND UPPER(COALESCE(trade_mode, '')) = 'SYNC'"
+            ).fetchall()
+            rows = [dict(r) for r in rows]
+            if not rows:
+                return {"removed": 0, "tickers": []}
+            tickers = [r["ticker"] for r in rows]
+            conn.execute(
+                "DELETE FROM positions WHERE COALESCE(simulated, 0) = 0 "
+                "AND status = 'open' AND UPPER(COALESCE(trade_mode, '')) = 'SYNC'"
+            )
+        return {"removed": len(rows), "tickers": tickers}
+
+    def log_paper_trade(self, ticker: str, side: str, price: float, shares: float,
+                         dollar_amount: float, reason: str = None, pattern_id: int = None,
+                         pnl: float = None, pnl_pct: float = None, trade_mode: str = None):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO paper_trades
+                (ticker, side, price, shares, dollar_amount, reason, pattern_id, pnl, pnl_pct, created_at, trade_mode)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (ticker, side, price, shares, dollar_amount, reason, pattern_id,
+                 pnl, pnl_pct, datetime.utcnow().isoformat(),
+                 trade_mode.upper() if trade_mode else None),
+            )
+
+    def get_paper_trades(self, limit: int = 100):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM paper_trades ORDER BY id DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def record_paper_equity(self, snap: dict):
+        """One equity-curve point per WATCH cycle, from paper_trader.snapshot()."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO paper_equity_history
+                (timestamp, total_value, cash, invested_cost, market_value,
+                 unrealized_pnl, realized_pnl, n_open)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (datetime.utcnow().isoformat(), snap.get("total_value"), snap.get("cash"),
+                 snap.get("invested_cost"), snap.get("market_value"),
+                 snap.get("unrealized_pnl"), snap.get("realized_pnl"), snap.get("n_open")),
+            )
+
+    def get_paper_equity_history(self, limit: int = 500):
+        """Oldest-first (chart-ready) equity curve points."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT * FROM paper_equity_history ORDER BY id DESC LIMIT ?", (limit,))
+            return [dict(r) for r in reversed(cur.fetchall())]
+
+    def get_position(self, position_id):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM positions WHERE id = ?", (position_id,)).fetchone()
+            return dict(row) if row else None
+
+    def update_position(self, position_id, updates: dict):
+        if not updates:
+            return
+        with self._conn() as conn:
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(f"UPDATE positions SET {set_clause} WHERE id = ?",
+                         (*updates.values(), position_id))
+
+    def update_position_by_ticker(self, ticker: str, updates: dict):
+        if not updates:
+            return
+        with self._conn() as conn:
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(
+                f"UPDATE positions SET {set_clause} WHERE ticker = ? AND status = 'open'",
+                (*updates.values(), ticker),
+            )
+
+    # ---------- MAE/MFE learning ----------
+    def query_mae_winners(self, setup_type: str, regime: str) -> list:
+        """MAE values (as %) for historically winning trades of this setup_type/regime,
+        used to flag when a live position's drawdown looks anomalous vs. past winners."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                """SELECT mae_pct FROM mae_mfe_data
+                   WHERE setup_type = ? AND regime = ? AND outcome_pct > 0""",
+                (setup_type, regime),
+            )
+            return [row[0] for row in cur.fetchall() if row[0] is not None]
+
+    def get_recent_mae_mfe(self, limit: int = 500) -> list:
+        """Every recorded mae_mfe_data row (real closed trades only - see
+        engine/mae_mfe_engine.py's record_completed(), called from
+        confirm_fill.py's sell path) - used by analytics/trade_attribution.py
+        to join a closed trade's MAE/MFE behavior against its
+        pattern_database entry features for win/loss-reason classification."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM mae_mfe_data ORDER BY recorded_at DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def insert_mae_mfe(self, data: dict):
+        import uuid
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO mae_mfe_data
+                (id, trade_id, ticker, setup_type, regime, mae_pct, mfe_pct, outcome_pct, hold_hours, recorded_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (str(uuid.uuid4()), data.get("trade_id"), data.get("ticker"), data.get("setup_type"),
+                 data.get("regime"), data.get("mae_pct"), data.get("mfe_pct"), data.get("outcome_pct"),
+                 data.get("hold_hours"), datetime.utcnow().isoformat()),
+            )
+
+    # ---------- re-entry cooldown ----------
+    def ticker_in_cooldown(self, ticker: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT cooldown_until FROM re_entry_cooldowns WHERE ticker = ?", (ticker,)
+            ).fetchone()
+            if not row or not row[0]:
+                return False
+            return datetime.utcnow().isoformat() < row[0]
+
+    def set_re_entry_cooldown(self, ticker: str, hours: float, exit_reason: str = ""):
+        from datetime import timedelta
+        now = datetime.utcnow()
+        cooldown_until = (now + timedelta(hours=hours)).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO re_entry_cooldowns (ticker, exit_time, cooldown_until, exit_reason)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(ticker) DO UPDATE SET
+                     exit_time = excluded.exit_time,
+                     cooldown_until = excluded.cooldown_until,
+                     exit_reason = excluded.exit_reason""",
+                (ticker, now.isoformat(), cooldown_until, exit_reason),
+            )
+
+    # ---------- misc lookups used by confirm_fill.py / hard_vetoes.py ----------
+    def get_recent_signal(self, ticker: str):
+        """Singular convenience wrapper around latest_signal() - same data,
+        name matches what confirm_fill.py's Phase 4 wiring expects."""
+        return self.latest_signal(ticker)
+
+    def get_latest_health_score(self):
+        """Average position_health_score across open positions, or None if
+        there are no open positions or none have been scored yet. NOTE: this
+        is NOT the full 11-metric Strategy Health Score from the original
+        spec (win rate trend, drift detection, etc.) - that system was never
+        built. This is a much smaller thing: the average of
+        engine/position_health.py's per-position score, which IS built
+        (Phase 3). server.py's UI header badge reads this."""
+        positions = self.get_all_positions()
+        scores = [p["position_health_score"] for p in positions if p.get("position_health_score") is not None]
+        if not scores:
+            return None
+        return sum(scores) / len(scores)
+
+    def get_portfolio_heat(self) -> dict:
+        """Approximate portfolio heat = sum of open positions' dollar risk
+        (entry - stop, if a stop is set) as a % of total dollars deployed.
+        NOTE: this is NOT normalized against real account equity - no
+        Robinhood account-balance data source is wired into Python (by
+        design, see README). Treat current_heat_pct as directional, not exact."""
+        positions = self.get_all_positions()
+        total_deployed = sum(p.get("dollar_amount") or 0 for p in positions)
+        total_risk = 0.0
+        for p in positions:
+            entry = p.get("entry_price") or 0
+            stop = p.get("current_stop_price")
+            shares = p.get("shares") or 0
+            if entry and stop and shares:
+                total_risk += max(0.0, (entry - stop)) * shares
+        current_heat_pct = (total_risk / total_deployed * 100) if total_deployed else 0.0
+        return {"current_heat_pct": round(current_heat_pct, 2), "max_heat_pct": 7.0}
+
+    def get_closed_trade_for_ticker(self, ticker: str, simulated: bool = None):
+        """Most recently closed position for this ticker, shaped for
+        mae_mfe_engine.record_completed() - entry/exit + MAE/MFE fields.
+
+        simulated param added 2026-07-17 (wiring paper-trade closes into
+        MAE/MFE recording, same as confirm_fill.py's real-trade path already
+        does): without it, a ticker with BOTH a closed real position and a
+        closed paper position could return whichever has the higher row id,
+        not necessarily the book the caller just closed. Defaults to None
+        (either book) so confirm_fill.py's existing call site - which has
+        only ever dealt with the real book - keeps its exact prior behavior;
+        engine/paper_trader.py passes simulated=True explicitly."""
+        q = "SELECT * FROM positions WHERE ticker = ? AND status = 'closed'"
+        params = [ticker]
+        if simulated is not None:
+            q += " AND COALESCE(simulated, 0) = ?"
+            params.append(1 if simulated else 0)
+        q += " ORDER BY id DESC LIMIT 1"
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(q, params).fetchone()
+            return dict(row) if row else None
+
+    # ---------- daily stats ----------
+    def get_daily_stats(self) -> dict:
+        today = date.today().isoformat()
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM daily_stats WHERE date = ?", (today,))
+            row = cur.fetchone()
+            return dict(row) if row else {
+                "date": today, "cycles_run": 0, "signals_generated": 0, "trades_placed": 0,
+                "winning_trades": 0, "realized_pnl": 0.0, "max_drawdown": 0.0, "kill_switch_triggered": 0,
+            }
+
+    def paper_realized_pnl_today(self) -> float:
+        """Sum of today's PAPER sell P/L, for the dashboard's Realized P&L
+        tile (2026-07-16, Akhil's 'Realized P&L doesn't show values' report:
+        daily_stats.realized_pnl is real-money-only by design - it feeds the
+        risk engine's max_daily_loss guard - so a paper-only account showed
+        $0.00 forever). Kept OUT of daily_stats on purpose; this is a
+        display-only aggregate. created_at is stored as naive UTC isoformat,
+        so local-time conversion happens before comparing calendar days - an
+        evening close (00:xx UTC = same trading day locally) must not slip
+        into tomorrow.
+
+        2026-07-21 (Postgres migration): SQLite's date(created_at,'localtime')
+        relied on SQLite reading the OS's local timezone directly - Postgres
+        has no equivalent shorthand, and leaning on the Postgres SERVER's
+        configured timezone would silently break this if that's ever set to
+        anything other than the Mac's local zone. Computing the local-day
+        window in Python instead (using the same naive local/UTC offset the
+        app already assumes everywhere else) sidesteps the DB engine's
+        timezone config entirely - just a plain string-range comparison
+        against the already-UTC-isoformat created_at column, same as before."""
+        local_now = datetime.now()
+        local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_offset = datetime.utcnow() - datetime.now()  # naive local->UTC offset on this machine
+        start_utc = (local_midnight + utc_offset).isoformat()
+        end_utc = (local_midnight + timedelta(days=1) + utc_offset).isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0.0) FROM paper_trades "
+                "WHERE side = 'sell' AND created_at >= ? AND created_at < ?",
+                (start_utc, end_utc),
+            ).fetchone()
+            return round(row[0] or 0.0, 2)
+
+    def get_realized_pnl_all_time(self) -> float:
+        """All-time REAL realized P/L, for the Real Portfolio tab's summary
+        card (2026-07-24, Paper/Real toggle). daily_stats.realized_pnl is
+        real-money-only by design (see close_position()'s docstring above) and
+        one row per calendar day, so summing across every row is the
+        real-book equivalent of paper_account.realized_pnl's running total -
+        there's no single cumulative column for the real book since real
+        closes are recorded per-day, not per-account."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT COALESCE(SUM(realized_pnl), 0.0) FROM daily_stats").fetchone()
+            return round(row[0] or 0.0, 2)
+
+    # ---------- trade snapshots (immutable - never UPDATE after INSERT) ----------
+    def save_trade_snapshot(self, snapshot_id: str, signal_id, data_json: str):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO trade_snapshots (snapshot_id, signal_id, created_at, data) VALUES (?,?,?,?)",
+                (snapshot_id, signal_id, datetime.utcnow().isoformat(), data_json),
+            )
+
+    def get_trade_snapshot(self, snapshot_id: str):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM trade_snapshots WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
+            return dict(row) if row else None
+
+    # ---------- pattern database ----------
+    def add_pattern(self, ticker: str, mode: str, features: dict, trade_id: str = None) -> int:
+        import json
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO pattern_database (trade_id, ticker, mode, recorded_at, features, is_closed)
+                VALUES (?,?,?,?,?,0)
+                RETURNING id""",
+                (trade_id, ticker, mode, datetime.utcnow().isoformat(), json.dumps(features)),
+            )
+            return cur.lastrowid
+
+    def get_pattern_by_id(self, pattern_id: int):
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM pattern_database WHERE id = ?", (pattern_id,)).fetchone()
+            if not row:
+                return None
+            row = dict(row)
+            row["features"] = json.loads(row["features"])
+            return row
+
+    def close_pattern(self, pattern_id: int, outcome_pct: float, hold_hours: float, exit_reason: str):
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE pattern_database SET outcome_pct = ?, hold_hours = ?, exit_reason = ?, is_closed = 1
+                WHERE id = ?""",
+                (outcome_pct, hold_hours, exit_reason, pattern_id),
+            )
+
+    def get_patterns(self, mode: str = None, ticker: str = None, closed_only: bool = True) -> list:
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            query = "SELECT * FROM pattern_database WHERE 1=1"
+            params = []
+            if mode:
+                query += " AND mode = ?"
+                params.append(mode)
+            if ticker:
+                query += " AND ticker = ?"
+                params.append(ticker)
+            if closed_only:
+                query += " AND is_closed = 1"
+            cur = conn.execute(query, params)
+            rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                r["features"] = json.loads(r["features"])
+            return rows
+
+    # ---------- Bayesian weight updates ----------
+    def log_bayesian_update(self, rule_name: str, bucket: str, old_weight: float, new_weight: float,
+                             occurrences: int, win_rate_when_fired: float, overall_win_rate: float,
+                             applied: bool = True, block_reason: str = None):
+        change_pct = ((new_weight - old_weight) / old_weight * 100) if old_weight else 0.0
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO bayesian_weight_history
+                (timestamp, rule_name, bucket, old_weight, new_weight, change_pct, occurrences,
+                 win_rate_when_fired, overall_win_rate, applied, block_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (datetime.utcnow().isoformat(), rule_name, bucket, old_weight, new_weight, change_pct,
+                 occurrences, win_rate_when_fired, overall_win_rate, int(applied), block_reason),
+            )
+
+    def get_weekly_bayesian_change(self, week_start: str) -> float:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT total_weight_change_pct FROM bayesian_weekly_tracker WHERE week_start = ?", (week_start,)
+            ).fetchone()
+            return row[0] if row else 0.0
+
+    def add_weekly_bayesian_change(self, week_start: str, pct: float):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO bayesian_weekly_tracker (week_start, total_weight_change_pct) VALUES (?, ?)
+                   ON CONFLICT(week_start) DO UPDATE SET
+                     total_weight_change_pct = bayesian_weekly_tracker.total_weight_change_pct + excluded.total_weight_change_pct""",
+                (week_start, pct),
+            )
+
+    def get_monthly_bayesian_change(self, month_start: str) -> float:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT total_weight_change_pct FROM bayesian_monthly_tracker WHERE month_start = ?", (month_start,)
+            ).fetchone()
+            return row[0] if row else 0.0
+
+    def add_monthly_bayesian_change(self, month_start: str, pct: float):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO bayesian_monthly_tracker (month_start, total_weight_change_pct) VALUES (?, ?)
+                   ON CONFLICT(month_start) DO UPDATE SET
+                     total_weight_change_pct = bayesian_monthly_tracker.total_weight_change_pct + excluded.total_weight_change_pct""",
+                (month_start, pct),
+            )
+
+    def get_bayesian_history(self, rule_name: str = None, limit: int = 100) -> list:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            if rule_name:
+                cur = conn.execute(
+                    "SELECT * FROM bayesian_weight_history WHERE rule_name = ? ORDER BY id DESC LIMIT ?",
+                    (rule_name, limit),
+                )
+            else:
+                cur = conn.execute("SELECT * FROM bayesian_weight_history ORDER BY id DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ---------- champion/challenger ----------
+    def create_challenge(self, challenge_id: str, config_json: str):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO champion_challenger
+                (id, challenger_start, challenger_config, status, updated_at)
+                VALUES (?,?,?, 'running', ?)""",
+                (challenge_id, datetime.utcnow().isoformat(), config_json, datetime.utcnow().isoformat()),
+            )
+
+    def record_challenge_trade(self, challenge_id: str, is_challenger: bool, won: bool, pnl_pct: float):
+        field_trades = "challenger_trades" if is_challenger else "champion_trades"
+        field_wins = "challenger_wins" if is_challenger else "champion_wins"
+        field_pnl = "challenger_pnl_pct" if is_challenger else "champion_pnl_pct"
+        with self._conn() as conn:
+            conn.execute(
+                f"""UPDATE champion_challenger SET
+                    {field_trades} = {field_trades} + 1,
+                    {field_wins} = {field_wins} + ?,
+                    {field_pnl} = {field_pnl} + ?,
+                    updated_at = ?
+                WHERE id = ?""",
+                (int(won), pnl_pct, datetime.utcnow().isoformat(), challenge_id),
+            )
+
+    def get_challenge(self, challenge_id: str):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM champion_challenger WHERE id = ?", (challenge_id,)).fetchone()
+            return dict(row) if row else None
+
+    def update_challenge_status(self, challenge_id: str, status: str, significance: float = None):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE champion_challenger SET status = ?, statistical_significance = ?, updated_at = ? WHERE id = ?",
+                (status, significance, datetime.utcnow().isoformat(), challenge_id),
+            )
+
+    def get_active_challenges(self) -> list:
+        """Challenges still in 'running' status (create_challenge()'s default) -
+        used by the automated learning loop to know which challenges to
+        re-evaluate each trigger, without the caller needing to track IDs
+        themselves."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM champion_challenger WHERE status = 'running'")
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_all_challenges(self, limit: int = 50) -> list:
+        """Every champion/challenger row regardless of status (running,
+        promoted, discarded) - used by the Strategy tab's evolution history
+        to show past promotions/discards, not just what's currently active."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM champion_challenger ORDER BY updated_at DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ---------- learning-loop automation ----------
+    def log_learning_run(self, trigger_reason: str, mode: str, n_patterns: int,
+                          proposals: dict, challenges_evaluated: list):
+        import json
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO learning_runs (run_at, trigger_reason, mode, n_patterns, proposals, challenges_evaluated)
+                VALUES (?,?,?,?,?,?)""",
+                (datetime.utcnow().isoformat(), trigger_reason, mode, n_patterns,
+                 json.dumps(proposals, default=str), json.dumps(challenges_evaluated, default=str)),
+            )
+
+    def get_last_learning_run(self, mode: str = None):
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            if mode:
+                row = conn.execute(
+                    "SELECT * FROM learning_runs WHERE mode = ? ORDER BY id DESC LIMIT 1", (mode,)
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM learning_runs ORDER BY id DESC LIMIT 1").fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["proposals"] = json.loads(d["proposals"]) if d.get("proposals") else {}
+            d["challenges_evaluated"] = json.loads(d["challenges_evaluated"]) if d.get("challenges_evaluated") else []
+            return d
+
+    def get_recent_learning_runs(self, limit: int = 20) -> list:
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM learning_runs ORDER BY id DESC LIMIT ?", (limit,))
+            rows = [dict(r) for r in cur.fetchall()]
+            for d in rows:
+                d["proposals"] = json.loads(d["proposals"]) if d.get("proposals") else {}
+                d["challenges_evaluated"] = json.loads(d["challenges_evaluated"]) if d.get("challenges_evaluated") else []
+            return rows
+
+    # ---------- historical replay / backtest runs ----------
+    def log_backtest_run_start(self, tickers: list, start_date: str, end_date: str,
+                                triggered_by: str = "manual") -> int:
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                """INSERT INTO backtest_runs (started_at, status, triggered_by, tickers, start_date, end_date)
+                VALUES (?,?,?,?,?,?) RETURNING id""",
+                (datetime.utcnow().isoformat(), "running", triggered_by,
+                 json.dumps(tickers), start_date, end_date),
+            )
+            row = cur.fetchone()
+            return row["id"] if row else None
+
+    def log_backtest_run_complete(self, run_id: int, n_scored: int, veto_counts: dict,
+                                   summary: dict, trades: list, config: dict, output_dir: str = None):
+        import json
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE backtest_runs SET completed_at=?, status='completed', n_scored=?,
+                veto_counts=?, summary=?, trades=?, config=?, output_dir=? WHERE id=?""",
+                (datetime.utcnow().isoformat(), n_scored, json.dumps(veto_counts, default=str),
+                 json.dumps(summary, default=str), json.dumps(trades, default=str),
+                 json.dumps(config, default=str), output_dir, run_id),
+            )
+
+    def log_backtest_run_failed(self, run_id: int, error: str):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE backtest_runs SET completed_at=?, status='failed', error=? WHERE id=?",
+                (datetime.utcnow().isoformat(), error, run_id),
+            )
+
+    def _hydrate_backtest_row(self, d: dict) -> dict:
+        import json
+        for key in ("tickers", "veto_counts", "summary", "trades", "config"):
+            d[key] = json.loads(d[key]) if d.get(key) else ([] if key in ("tickers", "trades") else {})
+        return d
+
+    def get_last_backtest_run(self, status: str = None):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            if status:
+                row = conn.execute(
+                    "SELECT * FROM backtest_runs WHERE status = ? ORDER BY id DESC LIMIT 1", (status,)
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM backtest_runs ORDER BY id DESC LIMIT 1").fetchone()
+            return self._hydrate_backtest_row(dict(row)) if row else None
+
+    def get_running_backtest_run(self):
+        return self.get_last_backtest_run(status="running")
+
+    def get_recent_backtest_runs(self, limit: int = 20) -> list:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?", (limit,))
+            return [self._hydrate_backtest_row(dict(r)) for r in cur.fetchall()]
+
+    # ---------- override analytics ----------
+    def record_override(self, override_id: str, signal_id, override_type: str,
+                         system_recommendation: str, user_action: str):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO override_analytics
+                (id, signal_id, override_type, system_recommendation, user_action, recorded_at)
+                VALUES (?,?,?,?,?,?)""",
+                (override_id, signal_id, override_type, system_recommendation, user_action,
+                 datetime.utcnow().isoformat()),
+            )
+
+    def close_override_outcome(self, override_id: str, outcome_pct: float, system_would_have_pct: float):
+        improved = outcome_pct > system_would_have_pct
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE override_analytics SET outcome_pct = ?, system_would_have_pct = ?, override_improved = ?
+                WHERE id = ?""",
+                (outcome_pct, system_would_have_pct, int(improved), override_id),
+            )
+
+    def get_overrides(self, limit: int = 100) -> list:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM override_analytics ORDER BY recorded_at DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ---------- rejected signals / opportunity cost ----------
+    def log_rejected_signal(self, ticker: str, reject_stage: str, reject_reason: str,
+                             score_at_rejection: float, price_at_rejection: float) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO rejected_signals
+                (timestamp, ticker, reject_stage, reject_reason, score_at_rejection, price_at_rejection)
+                VALUES (?,?,?,?,?,?)
+                RETURNING id""",
+                (datetime.utcnow().isoformat(), ticker, reject_stage, reject_reason,
+                 score_at_rejection, price_at_rejection),
+            )
+            return cur.lastrowid
+
+    def record_simulated_outcome(self, rejected_id: int, simulated_outcome_pct: float):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE rejected_signals SET simulated_outcome_pct = ?, simulated_at = ? WHERE id = ?",
+                (simulated_outcome_pct, datetime.utcnow().isoformat(), rejected_id),
+            )
+
+    def get_rejected_signals(self, unsimulated_only: bool = False, limit: int = 200) -> list:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            query = "SELECT * FROM rejected_signals"
+            if unsimulated_only:
+                query += " WHERE simulated_at IS NULL"
+            query += " ORDER BY id DESC LIMIT ?"
+            cur = conn.execute(query, (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ---------- missed opportunity report ----------
+    def get_hold_signals(self, limit: int = 500) -> list:
+        """Every HOLD signal that was actually SCORED (bucket_scores +
+        threshold_breakdown present, i.e. it cleared hard-vetoes and reached
+        rules/swing_buy_rules.py's score() but didn't cross the buy
+        threshold) - the raw material for analytics/missed_opportunity.py.
+        Hard-vetoed tickers never reach score() so they have no bucket data
+        and are correctly excluded here (a "missed opportunity" report about
+        buckets/threshold doesn't apply to something that never got scored)."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                """SELECT * FROM signals WHERE signal = 'HOLD' AND bucket_scores IS NOT NULL
+                   AND threshold_breakdown IS NOT NULL ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            )
+            return [self._parse_signal_json(dict(r)) for r in cur.fetchall()]
+
+    def save_missed_opportunity_outcome(self, signal_id: int, ticker: str, hold_days: int,
+                                         entry_price: float, would_have_returned_pct: float = None,
+                                         peak_return_pct: float = None, peak_at_days: int = None,
+                                         trough_return_pct: float = None, trough_at_days: int = None,
+                                         still_pending: bool = False):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO missed_opportunity_outcomes
+                (signal_id, ticker, evaluated_at, hold_days, entry_price, would_have_returned_pct,
+                 peak_return_pct, peak_at_days, trough_return_pct, trough_at_days, still_pending)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(signal_id) DO UPDATE SET
+                    evaluated_at=excluded.evaluated_at, hold_days=excluded.hold_days,
+                    would_have_returned_pct=excluded.would_have_returned_pct,
+                    peak_return_pct=excluded.peak_return_pct, peak_at_days=excluded.peak_at_days,
+                    trough_return_pct=excluded.trough_return_pct, trough_at_days=excluded.trough_at_days,
+                    still_pending=excluded.still_pending""",
+                (signal_id, ticker, datetime.utcnow().isoformat(), hold_days, entry_price,
+                 would_have_returned_pct, peak_return_pct, peak_at_days, trough_return_pct, trough_at_days,
+                 int(bool(still_pending))),
+            )
+
+    def get_missed_opportunity_outcome(self, signal_id: int):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM missed_opportunity_outcomes WHERE signal_id = ?", (signal_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    # ---------- regret analysis ----------
+    def save_regret_analysis(self, pattern_id: int, ticker: str, entry_price: float, exit_price: float,
+                              exit_reason: str, forward_window_days: int, highest_afterwards: float,
+                              lowest_afterwards: float, regret_pts: float, regret_pct: float,
+                              downside_avoided_pts: float, downside_avoided_pct: float,
+                              classification: str, still_maturing: bool = False):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO regret_analysis
+                (pattern_id, ticker, computed_at, entry_price, exit_price, exit_reason, forward_window_days,
+                 highest_afterwards, lowest_afterwards, regret_pts, regret_pct, downside_avoided_pts,
+                 downside_avoided_pct, classification, still_maturing)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(pattern_id) DO UPDATE SET
+                    computed_at=excluded.computed_at, highest_afterwards=excluded.highest_afterwards,
+                    lowest_afterwards=excluded.lowest_afterwards, regret_pts=excluded.regret_pts,
+                    regret_pct=excluded.regret_pct, downside_avoided_pts=excluded.downside_avoided_pts,
+                    downside_avoided_pct=excluded.downside_avoided_pct, classification=excluded.classification,
+                    still_maturing=excluded.still_maturing""",
+                (pattern_id, ticker, datetime.utcnow().isoformat(), entry_price, exit_price, exit_reason,
+                 forward_window_days, highest_afterwards, lowest_afterwards, regret_pts, regret_pct,
+                 downside_avoided_pts, downside_avoided_pct, classification, int(bool(still_maturing))),
+            )
+
+    def get_regret_analysis(self, pattern_id: int):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM regret_analysis WHERE pattern_id = ?", (pattern_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_regret_analyses(self, limit: int = 200) -> list:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM regret_analysis ORDER BY pattern_id DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ---------- threshold regret analysis (2026-07-23) ----------
+    def log_threshold_regret_run(self, trigger_reason: str, report: dict) -> int:
+        """Persists one evaluate_threshold_regret() snapshot. Mirrors
+        log_learning_run()'s exact shape (run_at + trigger_reason + a JSON
+        payload column) - same "history of runs over time", not just the
+        latest one."""
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """INSERT INTO threshold_regret_runs
+                (run_at, trigger_reason, n_signals, n_evaluated, n_still_pending, report)
+                VALUES (?,?,?,?,?,?) RETURNING id""",
+                (datetime.utcnow().isoformat(), trigger_reason, report.get("n_signals"),
+                 report.get("n_evaluated"), report.get("n_still_pending"), json.dumps(report, default=str)),
+            ).fetchone()
+            return row["id"] if row else None
+
+    def get_last_threshold_regret_run(self):
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM threshold_regret_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["report"] = json.loads(d["report"]) if d.get("report") else {}
+            return d
+
+    def get_recent_threshold_regret_runs(self, limit: int = 20) -> list:
+        import json
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM threshold_regret_runs ORDER BY id DESC LIMIT ?", (limit,))
+            rows = [dict(r) for r in cur.fetchall()]
+            for d in rows:
+                d["report"] = json.loads(d["report"]) if d.get("report") else {}
+            return rows
+
+    # ---------- monitoring alerts ----------
+    def log_alert(self, alert_id: str, alert_type: str, severity: str, message: str):
+        """ON CONFLICT DO NOTHING - alert_id is caller-generated and often
+        deterministic per (ticker, day) (see scheduler.py's stale-data
+        health alert), so a second call for the same id on the same day is
+        expected (the SAME condition is still true next cycle) and should be
+        a silent no-op, not an IntegrityError."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO monitoring_alerts (id, alert_type, severity, message, triggered_at)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(id) DO NOTHING""",
+                (alert_id, alert_type, severity, message, datetime.utcnow().isoformat()),
+            )
+
+    def resolve_alert(self, alert_id: str, resolution: str):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE monitoring_alerts SET resolved_at = ?, resolution = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), resolution, alert_id),
+            )
+
+    def get_open_alerts(self) -> list:
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM monitoring_alerts WHERE resolved_at IS NULL ORDER BY triggered_at DESC")
+            return [dict(r) for r in cur.fetchall()]

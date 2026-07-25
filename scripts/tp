@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  scripts/tp - install, run, compare and maintain versions on this machine.
+#  Phase 0 steps 0.9 and 0.10 (§38, §39).
+#
+#  Committed to the repo; operates on ~/tp, which is not. ~/tp holds databases,
+#  logs and virtual environments - none of which should live inside a directory
+#  git is watching, and all of which are machine-specific.
+#
+#  `git checkout v1.0.0` gives you the CODE. It does not give you a runnable
+#  v1.0.0, because five things are shared and would collide: the working
+#  directory, the Postgres database, output/, port 8080, and the launchd
+#  labels. This script gives each version its own of all five.
+#
+#  The database is the one that genuinely constrains the design. Once §7 adds
+#  paper_trades_placed and §19 changes the scoring, a v1.0.0 process pointed at
+#  a v2.0.0 database will either crash or - worse - read columns that mean
+#  something different than they did. Sharing one database across versions is
+#  not a shortcut; it is a corruption risk.
+# =============================================================================
+set -euo pipefail
+
+TP_ROOT="${TP_ROOT:-$HOME/tp}"
+REPO="${TP_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+REGISTRY="$TP_ROOT/registry.json"
+BASE_PORT="${TP_BASE_PORT:-8080}"
+export REGISTRY
+
+# Every name this platform treats as secret. Mirrors storage/secrets.py
+# SECRET_KEYS - keep the two in step.
+SECRET_KEYS=(
+  ROBINHOOD_USERNAME ROBINHOOD_PASSWORD ROBINHOOD_TOTP_SECRET
+  RH_ACCOUNT_NUMBER UI_AUTH_TOKEN
+  POSTGRES_USER POSTGRES_PASSWORD
+  ALPHAVANTAGE_API_KEY FINNHUB_API_KEY FMP_API_KEY TIINGO_API_KEY
+  TWELVEDATA_API_KEY ALPACA_API_KEY ALPACA_API_SECRET
+  TRAYD_MCP_URL TRAYD_AUTH_TOKEN NVIDIA_API_KEY
+)
+# Secrets the platform cannot start without. The rest degrade gracefully.
+REQUIRED_KEYS=( UI_AUTH_TOKEN RH_ACCOUNT_NUMBER )
+
+die()  { echo "tp: $*" >&2; exit 1; }
+note() { echo "  $*"; }
+
+# ── registry: version -> port, database, install time ───────────────────────
+_reg() { python3 - "$@" <<'PY'
+import json, os, sys, datetime
+p = os.environ['REGISTRY']
+os.makedirs(os.path.dirname(p), exist_ok=True)
+reg = json.load(open(p)) if os.path.exists(p) else {}
+cmd = sys.argv[1]
+if cmd == 'get':
+    print(json.dumps(reg.get(sys.argv[2], {})))
+elif cmd == 'list':
+    print(json.dumps(reg, indent=2))
+elif cmd == 'field':
+    print(reg.get(sys.argv[2], {}).get(sys.argv[3], ''))
+elif cmd == 'add':
+    tag, base = sys.argv[2], int(sys.argv[3])
+    if tag not in reg:
+        used = {v['port'] for v in reg.values()}
+        port = next(p_ for p_ in range(base, base + 50) if p_ not in used)
+        reg[tag] = {
+            'port': port,
+            'db': 'tp_' + tag.replace('.', '_').replace('-', '_'),
+            'installed_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        }
+        json.dump(reg, open(p, 'w'), indent=2)
+    print(json.dumps(reg[tag]))
+elif cmd == 'del':
+    reg.pop(sys.argv[2], None)
+    json.dump(reg, open(p, 'w'), indent=2)
+PY
+}
+
+_port() { _reg field "$1" port; }
+_db()   { _reg field "$1" db; }
+
+# ── secrets (§39.1) ─────────────────────────────────────────────────────────
+#
+# Values never touch disk outside .env / the Keychain, and never appear in
+# argv, where `ps` would show them to every local process on the machine.
+
+_keychain_get() { security find-generic-password -a "$USER" -s "tp_$1" -w 2>/dev/null || true; }
+
+_secrets_export() {
+  # Emit `export K=V` lines for `eval`. .env first (the documented source of
+  # truth), Keychain as the encrypted-at-rest mirror. printf %q so a value
+  # containing a space or a quote survives the eval intact.
+  local k v
+  for k in "${SECRET_KEYS[@]}"; do
+    v=""
+    if [ -f "$REPO/.env" ]; then
+      v=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$k=" "$REPO/.env" 2>/dev/null \
+          | tail -1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?$k=//" \
+          | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true)
+    fi
+    [ -z "$v" ] && [ "$(uname)" = Darwin ] && v=$(_keychain_get "$k")
+    [ -n "$v" ] && printf 'export %s=%q\n' "$k" "$v"
+  done
+}
+
+cmd_secrets_import() {
+  [ "$(uname)" = Darwin ] || die "secrets import is macOS-only (§44 makes it portable in Phase 3)"
+  local envfile="${1:-$REPO/.env}" shred="${2:-}"
+  [ -f "$envfile" ] || die "no $envfile"
+  local n=0
+  while IFS='=' read -r k v; do
+    case "$k" in ''|'#'*) continue ;; esac
+    k="${k#export }"; k="$(echo "$k" | tr -d '[:space:]')"
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    [ -z "$v" ] && continue
+    security add-generic-password -a "$USER" -s "tp_$k" -w "$v" -U
+    note "stored tp_$k"; n=$((n+1))
+  done < "$envfile"
+  echo "imported $n secret(s) into the Keychain"
+  if [ "$shred" = "--shred" ]; then
+    # -P overwrites before unlinking. A plain rm leaves the bytes recoverable,
+    # and this file holds a brokerage password.
+    rm -P "$envfile" && echo "shredded $envfile"
+    echo "NOTE: storage/secrets.py still reads .env first. With it gone, the"
+    echo "      Keychain becomes the only source - which is the intent, but"
+    echo "      means `tp secrets check` is now the only way to see what is set."
+  fi
+}
+
+cmd_secrets_set() {
+  [ "$(uname)" = Darwin ] || die "secrets set is macOS-only"
+  local k="${1:?usage: tp secrets set KEY}"
+  printf 'value for %s (not echoed): ' "$k"; read -rs v; echo
+  [ -n "$v" ] || die "empty value refused"
+  security add-generic-password -a "$USER" -s "tp_$k" -w "$v" -U
+  echo "stored tp_$k"
+}
+
+cmd_secrets_check() {
+  local missing=0 k v src
+  for k in "${SECRET_KEYS[@]}"; do
+    v=""; src=""
+    if [ -f "$REPO/.env" ] && grep -qE "^[[:space:]]*(export[[:space:]]+)?$k=." "$REPO/.env" 2>/dev/null; then
+      v=set; src=".env"
+    elif [ "$(uname)" = Darwin ] && [ -n "$(_keychain_get "$k")" ]; then
+      v=set; src="keychain"
+    fi
+    if [ -n "$v" ]; then
+      printf '  ok       %-24s (%s)\n' "$k" "$src"
+    else
+      case " ${REQUIRED_KEYS[*]} " in
+        *" $k "*) printf '  MISSING  %-24s (REQUIRED)\n' "$k"; missing=1 ;;
+        *)        printf '  unset    %-24s (optional)\n' "$k" ;;
+      esac
+    fi
+  done
+  return $missing
+}
+
+# ── install <tag> ───────────────────────────────────────────────────────────
+cmd_install() {
+  local tag="${1:?usage: tp install <tag>}"
+  git -C "$REPO" rev-parse "$tag" >/dev/null 2>&1 || die "no such tag: $tag"
+  mkdir -p "$TP_ROOT"/{versions,venvs,data,archive}
+
+  local meta port db
+  meta=$(_reg add "$tag" "$BASE_PORT")
+  port=$(_port "$tag"); db=$(_db "$tag")
+
+  # 1. Code: a detached worktree at the tag. Read-only by intent - patches
+  #    belong on a release branch (see `tp patch`), never in a tag worktree.
+  if [ -d "$TP_ROOT/versions/$tag" ]; then
+    note "(worktree exists)"
+  else
+    git -C "$REPO" worktree add --detach "$TP_ROOT/versions/$tag" "$tag"
+  fi
+
+  # 2. Dependencies: its own venv, from THAT version's pinned requirements.
+  #    This is why §13 is a prerequisite - without ==, two versions installed
+  #    a month apart get different pandas and compute different indicators
+  #    from identical bars.
+  if [ ! -x "$TP_ROOT/venvs/$tag/bin/python" ]; then
+    python3 -m venv "$TP_ROOT/venvs/$tag"
+    "$TP_ROOT/venvs/$tag/bin/pip" install -q --upgrade pip
+    "$TP_ROOT/venvs/$tag/bin/pip" install -q -r "$TP_ROOT/versions/$tag/requirements.txt" \
+      || note "WARNING: some dependencies failed to install - run tp doctor"
+  else
+    note "(venv exists)"
+  fi
+
+  # 3. Data directory, outside the checkout.
+  mkdir -p "$TP_ROOT/data/$tag/output"/{logs,pending_prompts,backtest_results,archive}
+
+  # 4. Its own database, at that version's schema.
+  createdb "$db" 2>/dev/null && note "created database $db" || note "(database $db already exists)"
+  local m
+  for m in "$TP_ROOT/versions/$tag"/migrations/*.sql; do
+    [ -e "$m" ] || continue
+    psql -q -d "$db" -f "$m" >/dev/null 2>&1 && note "applied $(basename "$m")" \
+      || note "(skipped $(basename "$m") - tables not created yet; runs on first start)"
+  done
+
+  echo "installed $tag  port=$port  db=$db"
+  echo "  data: $TP_ROOT/data/$tag/output"
+  echo "  run:  tp run $tag --ui"
+}
+
+# ── run <tag> [--ui|--scheduler|--backtest|--shell] ─────────────────────────
+cmd_run() {
+  local tag="${1:?usage: tp run <tag> [--ui|--scheduler|--backtest|--shell]}"; shift || true
+  [ "$(_reg get "$tag")" != '{}' ] || die "not installed: $tag (run: tp install $tag)"
+
+  local port db; port=$(_port "$tag"); db=$(_db "$tag")
+
+  # Secrets resolved at the moment of use.
+  set -a; eval "$(_secrets_export)"; set +a
+
+  export POSTGRES_DB="$db"
+  export TP_OUTPUT_DIR="$TP_ROOT/data/$tag/output"
+  export TP_UI_PORT="$port"
+  export TP_UI_HOST=127.0.0.1
+  export TP_VERSION="$tag"
+
+  # SAFETY (§38.4): only one version may ever be armed, and a non-primary
+  # version may not be armed at all. Two schedulers both believing they own
+  # the account is the worst outcome this arrangement could produce.
+  local primary; primary=$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')
+  if [ "$tag" != "$primary" ]; then
+    export TP_FORCE_PAPER=1
+    echo "note: $tag is not the primary version - forcing paper mode"
+  fi
+
+  cd "$TP_ROOT/versions/$tag"
+  local py="$TP_ROOT/venvs/$tag/bin/python"
+  [ -x "$py" ] || die "no venv for $tag (run: tp install $tag)"
+
+  case "${1:---scheduler}" in
+    --ui)        exec "$py" main.py --ui ;;
+    --scheduler) exec "$py" scheduler.py ;;
+    --backtest)  shift; exec "$py" run_backtest.py "$@" ;;
+    --shell)     exec "$SHELL" ;;
+    *)           exec "$py" "$@" ;;
+  esac
+}
+
+# ── list ────────────────────────────────────────────────────────────────────
+cmd_list() {
+  local primary; primary=$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '-')
+  printf '%-12s %-6s %-16s %-10s %s\n' TAG PORT DATABASE DATA PRIMARY
+  python3 - "$TP_ROOT" "$primary" <<'PY'
+import json, os, subprocess, sys
+root, primary = sys.argv[1], sys.argv[2]
+p = os.path.join(root, 'registry.json')
+reg = json.load(open(p)) if os.path.exists(p) else {}
+for tag, v in sorted(reg.items()):
+    d = os.path.join(root, 'data', tag)
+    try:
+        size = subprocess.run(['du', '-sh', d], capture_output=True,
+                              text=True).stdout.split()[0]
+    except Exception:
+        size = '-'
+    print('%-12s %-6s %-16s %-10s %s' %
+          (tag, v['port'], v['db'], size, '*' if tag == primary else ''))
+PY
+}
+
+# ── promote <tag> - make this the launchd-managed version (§38.5) ───────────
+cmd_promote() {
+  local tag="${1:?usage: tp promote <tag>}"
+  [ "$(_reg get "$tag")" != '{}' ] || die "not installed: $tag"
+  local old; old=$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')
+  if [ -n "$old" ] && [ "$old" != "$tag" ]; then
+    ( cd "$TP_ROOT/versions/$old" && LABEL_SUFFIX=".$old" ./service.sh uninstall ) || true
+    note "uninstalled services for $old"
+  fi
+  echo "$tag" > "$TP_ROOT/PRIMARY"
+  ( cd "$TP_ROOT/versions/$tag" \
+    && TP_OUTPUT_DIR="$TP_ROOT/data/$tag/output" \
+       POSTGRES_DB="$(_db "$tag")" \
+       TP_VERSION="$tag" \
+       LABEL_SUFFIX=".$tag" ./service.sh install )
+  echo "primary is now $tag"
+  echo "  it is the ONLY version permitted to arm live execution, and even then"
+  echo "  only once the §32 re-arm gate passes."
+}
+
+# ── patch <line> - worktree on a release branch, for fixing 1.0.x (§38.6) ───
+cmd_patch() {
+  local line="${1:?usage: tp patch <line>   e.g. tp patch 1.0}"
+  local dir="$TP_ROOT/versions/release-$line"
+  git -C "$REPO" worktree add "$dir" "release/$line" 2>/dev/null || note "(worktree exists)"
+  echo "edit in $dir, then:"
+  echo "  cd $dir && ./scripts/release.sh patch     # -> v${line}.N"
+}
+
+# ── remove <tag> ────────────────────────────────────────────────────────────
+cmd_remove() {
+  local tag="${1:?usage: tp remove <tag>}"
+  local primary; primary=$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')
+  [ "$tag" = "$primary" ] && die "$tag is the primary version - promote another first"
+  cmd_backup "$tag" || note "(no database to back up)"
+  git -C "$REPO" worktree remove --force "$TP_ROOT/versions/$tag" 2>/dev/null || true
+  rm -rf "$TP_ROOT/venvs/$tag" "$TP_ROOT/data/$tag"
+  dropdb "$(_db "$tag")" 2>/dev/null || true
+  _reg del "$tag"
+  echo "removed $tag (a dump was written to $TP_ROOT/archive first)"
+}
+
+# ── backup [tag] (§39.2) ────────────────────────────────────────────────────
+cmd_backup() {
+  local tag="${1:-$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')}"
+  [ -n "$tag" ] || die "no primary set - usage: tp backup <tag>"
+  local db ts out; db=$(_db "$tag")
+  [ -n "$db" ] || die "unknown version: $tag"
+  ts=$(date +%Y%m%d_%H%M%S)
+  out="$TP_ROOT/archive/${tag}_${ts}.sql.gz"
+  mkdir -p "$TP_ROOT/archive"
+  pg_dump "$db" | gzip > "$out"
+  shasum -a 256 "$out" > "$out.sha256"
+  # Verify it is readable BEFORE trusting it. An unverified backup is a
+  # belief, not a backup.
+  gunzip -t "$out" || { echo 'FAIL: dump is corrupt'; rm -f "$out" "$out.sha256"; exit 1; }
+  # Keep 14; prune the rest.
+  ls -t "$TP_ROOT/archive/${tag}_"*.sql.gz 2>/dev/null | tail -n +15 | xargs -r rm --
+  echo "backed up $db -> $out ($(du -h "$out" | cut -f1))"
+  echo "  For off-machine safety, sync $TP_ROOT/archive to an encrypted"
+  echo "  destination - but NEVER to the git remote. A dump contains your"
+  echo "  positions, account activity and entire signal history. It is more"
+  echo "  sensitive than the code."
+}
+
+# ── doctor (§39.3) ──────────────────────────────────────────────────────────
+cmd_doctor() {
+  local fail=0
+
+  echo '== secrets are not in the tree =='
+  if [ -f "$REPO/.env" ]; then
+    if git -C "$REPO" check-ignore -q .env; then
+      note 'ok: .env exists and is ignored'
+    else
+      note 'FAIL: .env exists and is NOT gitignored'; fail=1
+    fi
+  else
+    note 'ok: no .env (secrets come from the Keychain)'
+  fi
+  if git -C "$REPO" ls-files | grep -Eiq '(^|/)\.env$|\.db$|\.pickle$'; then
+    note 'FAIL: a sensitive file is TRACKED'
+    git -C "$REPO" ls-files | grep -Ei '(^|/)\.env$|\.db$|\.pickle$' | sed 's/^/         /'
+    fail=1
+  else
+    note 'ok: nothing sensitive tracked'
+  fi
+
+  echo '== history is clean =='
+  if git -C "$REPO" log --all --diff-filter=A --name-only --pretty=format: 2>/dev/null \
+     | sort -u | grep -Eq '^\.env$|\.db$|\.pickle$'; then
+    note 'FAIL: a secret is in the history - see §34.6 (git filter-repo), then ROTATE'
+    fail=1
+  else
+    note 'ok: no secret ever committed'
+  fi
+
+  echo '== config.yaml has no literal secrets =='
+  python3 "$REPO/scripts/check_config_secrets.py" | sed 's/^/  /' || fail=1
+
+  echo '== gitleaks =='
+  if command -v gitleaks >/dev/null; then
+    gitleaks detect --source "$REPO" --no-banner --redact 2>&1 | tail -3 | sed 's/^/  /' || fail=1
+  else
+    note 'skipped: gitleaks not installed (brew install gitleaks)'
+  fi
+
+  echo '== hooks installed =='
+  [ -e "$REPO/.git/hooks/pre-push" ] && note 'ok: pre-push' \
+    || { note 'FAIL: pre-push hook missing - ln -sf ../../scripts/hooks/pre-push .git/hooks/pre-push'; fail=1; }
+  [ -e "$REPO/.git/hooks/pre-commit" ] && note 'ok: pre-commit' \
+    || { note 'FAIL: pre-commit hook missing - run: pre-commit install'; fail=1; }
+
+  echo '== credentials resolve =='
+  cmd_secrets_check || fail=1
+
+  echo '== dependencies match the pins =='
+  python3 "$REPO/scripts/check_deps.py" >/dev/null 2>&1 && note 'ok: no drift' \
+    || { note 'FAIL: dependency drift - python3 scripts/check_deps.py'; fail=1; }
+
+  echo '== live execution is disarmed =='
+  local live
+  live=$(cd "$REPO" && python3 -c "
+import yaml
+t = (yaml.safe_load(open('config.yaml')) or {}).get('trading', {}) or {}
+print(bool(t.get('live_execution_enabled')) and
+      str(t.get('watch_execute','WATCH')).upper()=='EXECUTE' and
+      bool(t.get('auto_trade')))" 2>/dev/null || echo unknown)
+  [ "$live" = "False" ] && note 'ok: config.yaml is disarmed' \
+    || { note "FAIL: config.yaml reports live mode = $live (§2)"; fail=1; }
+
+  echo '== backups exist and are recent =='
+  if find "$TP_ROOT/archive" -name '*.sql.gz' -mtime -2 2>/dev/null | grep -q .; then
+    note 'ok: a dump from the last 48h'
+  else
+    note 'FAIL: no recent backup - run: tp backup'; fail=1
+  fi
+
+  echo
+  if [ "$fail" = 0 ]; then echo 'ALL CLEAR'; else echo 'ISSUES FOUND'; return 1; fi
+}
+
+usage() {
+  cat <<'USAGE'
+tp - trading_platform version manager (§38, §39)
+
+  tp install <tag>            worktree + venv + database + data dir for a tag
+  tp run <tag> [--ui|--scheduler|--backtest|--shell]
+  tp list                     versions, ports, databases, sizes
+  tp promote <tag>            make this the launchd-managed (and only armable) version
+  tp patch <line>             worktree on release/<line> to cut a patch
+  tp remove <tag>             worktree + venv + database, after a dump to archive/
+
+  tp secrets check            what resolves, and from where
+  tp secrets set <KEY>        store one secret in the Keychain (prompts, no echo)
+  tp secrets import [file] [--shred]
+                              mirror .env into the Keychain
+  tp backup [tag]             verified, pruned pg_dump into ~/tp/archive
+  tp doctor                   standing audit - run before any push, and monthly
+
+Everyday use:
+  tp install v1.0.0           baseline, reproducible, forced paper
+  tp run v1.0.0 --backtest    reproduce the 0-trade result on the old code
+  tp promote v1.1.0           launchd now runs 1.1.0 in the background
+USAGE
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  run)     shift; cmd_run "$@" ;;
+  list)    shift; cmd_list "$@" ;;
+  promote) shift; cmd_promote "$@" ;;
+  patch)   shift; cmd_patch "$@" ;;
+  remove)  shift; cmd_remove "$@" ;;
+  backup)  shift; cmd_backup "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
+  secrets)
+    shift
+    case "${1:-}" in
+      check)  shift; cmd_secrets_check ;;
+      set)    shift; cmd_secrets_set "$@" ;;
+      import) shift; cmd_secrets_import "$@" ;;
+      *) die "usage: tp secrets check|set <KEY>|import [file] [--shred]" ;;
+    esac ;;
+  ''|-h|--help|help) usage ;;
+  *) die "unknown command: $1 (try: tp --help)" ;;
+esac

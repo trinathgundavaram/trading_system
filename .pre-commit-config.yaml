@@ -1,0 +1,53 @@
+# Phase 0 step 0.3 (§34.4).
+#
+# .gitignore protects against files you EXPECT. These hooks protect against a
+# key pasted into a Python file, a notebook, a comment or a markdown doc -
+# which is how the NVIDIA key in this project's .env got exposed in the first
+# place.
+#
+# Install once:
+#     pip install pre-commit && brew install gitleaks
+#     pre-commit install && pre-commit install --hook-type pre-push
+#     pre-commit run --all-files      # scan the whole tree, now
+#
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ['--maxkb=2048']
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: block-sensitive-paths
+        name: block .env / *.db / pickles / dumps from being staged
+        entry: bash -c '
+          bad=$(git diff --cached --name-only |
+                grep -Ei "(^|/)\.env$|\.db$|\.pickle$|\.sql\.gz$|secrets\.local|\.pem$|\.p12$") ;
+          if [ -n "$bad" ]; then
+            echo "BLOCKED - refusing to commit:" ; echo "$bad" ; exit 1 ;
+          fi'
+        language: system
+        pass_filenames: false
+
+      - id: no-literal-secrets-in-config
+        name: config.yaml must use ${VAR} for every secret
+        entry: python3 scripts/check_config_secrets.py
+        language: system
+        pass_filenames: false
+
+      - id: dependency-drift
+        name: installed packages match requirements.txt (§13)
+        entry: python3 scripts/check_deps.py
+        language: system
+        pass_filenames: false
+        files: ^requirements\.txt$

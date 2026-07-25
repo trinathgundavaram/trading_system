@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Refuse to push a version tag that has no release note and no CHANGELOG entry.
+# The note is part of the release, not paperwork that follows it (§36.3).
+#
+# Install:  ln -sf ../../scripts/hooks/pre-push .git/hooks/pre-push
+#           (scripts/tp doctor checks this is in place)
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/tags/v*)
+      tag="${remote_ref#refs/tags/}"
+      note="docs/releases/${tag}.md"
+      if [ ! -f "$note" ]; then
+        echo "BLOCKED: $tag has no $note"; exit 1
+      fi
+      for field in decision_function_changed revalidation_required rollback_safe; do
+        grep -q "^${field}:" "$note" || {
+          echo "BLOCKED: $note is missing required field '$field'"; exit 1; }
+      done
+      short=$(python3 scripts/version.py --shorthand "$tag")
+      grep -q "^## \[$short\]" CHANGELOG.md || {
+        echo "BLOCKED: CHANGELOG.md has no '## [$short]' entry"; exit 1; }
+      ;;
+  esac
+done
+
+# A push is the last moment before a secret leaves this machine. Check again.
+python3 scripts/check_config_secrets.py || exit 1
+if git ls-files | grep -Ei '(^|/)\.env$|\.db$|\.pickle$'; then
+  echo "BLOCKED: a sensitive file is tracked"; exit 1
+fi

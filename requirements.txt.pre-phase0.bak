@@ -1,0 +1,48 @@
+mcp>=1.0.0            # official MCP Python SDK - direct client calls, no Claude subprocess
+finviz>=2.0.0          # mcp_clients/finviz_mcp.py (2026-07-15b) - direct finviz.com scrape,
+                       # replaced the old finviz-mcp-server stdio binary. github.com/mariostoev/finviz
+yfinance>=0.2.40
+pandas>=2.0.0
+pandas-ta>=0.3.14b0
+APScheduler>=3.10.4
+rich>=13.7.0
+pyyaml>=6.0.1
+pytz>=2024.1
+requests>=2.31.0
+feedparser>=6.0.11
+numpy>=1.24.0
+python-dateutil>=2.8.2
+tabulate>=0.9.0
+scipy>=1.11.0            # Wilson/Clopper-Pearson CIs, two-proportion z-test (analytics/, learning/)
+robin_stocks>=3.0.0      # engine/live_trader.py (2026-07-16) - DIRECT live order
+                         # execution (the robinhood-mcp server is read-only by design);
+                         # also the engine under mcp_clients/robinhood_mcp.py's reads
+pyotp>=2.8.0             # TOTP codes for Robinhood 2FA login (live_trader)
+fastapi>=0.115.0         # server.py - Phase 2 web UI (optional: only needed for `main.py --ui`)
+uvicorn>=0.30.0
+websockets>=12.0
+psycopg2-binary>=2.9.9   # storage/database.py (2026-07-21) - Postgres driver + connection
+                         # pool, replaced sqlite3 to fix the OS-level file-open stalls the
+                         # old single-file SQLite store was prone to. See prod_readiness_plan.md.
+
+# NOTE: openai/python-dotenv/vaderSentiment were used by an earlier iteration
+# (engine/claude_brain.py's NVIDIA-NIM fallback) that is no longer part of the
+# active pipeline - see README.md "Superseded modules". Not required to run
+# the current scheduler.py/main.py.
+
+# NOT YET WIRED UP (still true after this pass - see README.md "What's built
+# vs deferred"):
+#   pandas-market-calendars>=4.3.1   # scheduler.py still uses the hardcoded NYSE_HOLIDAYS_2026 list
+#   scikit-learn>=1.3.0              # not needed yet - pattern_database.py's cosine similarity is plain numpy
+#   React / any frontend build step   # ui/index.html is deliberately a single vanilla-JS file, no npm/build
+
+# OPTIONAL (2026-07-22, Trinath: unlimited free data source research):
+#   defeatbeta-api>=1.0.0   # mcp_clients/defeatbeta_data.py - keyless, dataset-backed (Hugging
+#                           # Face parquet via DuckDB) OHLCV/fundamentals fallback with no per-
+#                           # request rate limit. NOT installed by default - it pulls in duckdb/
+#                           # openpyxl/huggingface-hub, a heavy chain for a fallback-of-a-fallback.
+#                           # `pip install defeatbeta-api` to activate; the module is fully inert
+#                           # (silently skipped everywhere) without it. No API key needed.
+# EDGAR (mcp_clients/edgar_data.py) needs no new package - stdlib xml.etree + the `requests` dep
+# already above. Only needs EDGAR_USER_AGENT set in .env (see .env.template) - SEC requires a
+# descriptive contact string, not a key.

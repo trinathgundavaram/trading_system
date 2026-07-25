@@ -1,0 +1,629 @@
+watchlist:
+- ASTS
+- NBIS
+- HCA
+trading:
+  # Phase 0 step 0.1 (2026-07-24): all three live-execution gates closed.
+  # Do not reopen these until the §32 re-arm gate passes - see CHANGELOG.md.
+  auto_trade: false
+  trade_size_usd: 100
+  max_positions: 25
+  scan_interval_minutes: 15
+  day_trade_scan_interval_minutes: 5
+  market_open_buffer_minutes: 30
+  market_close_buffer_minutes: 30
+  mode: HYBRID
+  watch_execute: WATCH
+  live_execution_enabled: false
+  cycle_max_parallel_tickers: 6
+  max_cycle_duration_minutes: 12
+  hard_kill_minutes: 15
+  day_eod_flatten_enabled: true
+  day_eod_flatten_time_et: '15:55'
+  max_day_positions: 5
+rotation:
+  enabled: true
+  min_candidate_score: 80.0
+  max_victim_health_score: 55
+  min_hold_days: 3
+  max_rotations_per_week: 2
+paper_trading:
+  starting_cash: 1000
+  price_watch:
+    enabled: true
+    interval_seconds: 30
+screener:
+  enabled: true
+  refresh_minutes: 15
+  max_candidates: 30
+  exploration_slots: 3
+  research_score_vetoed: true
+  dynamic_by_regime: true
+  discovery_max_parallel: 8
+  quality_gate:
+    enabled: true
+    min_price: 10.0
+    max_price: 1000.0
+    min_avg_volume: 1000000
+    max_parallel: 10
+  sources:
+    rs_gainers:
+      enabled: true
+    volume_surge:
+      enabled: true
+    gap_candidates:
+      enabled: true
+    pre_market_movers:
+      enabled: true
+    sector_leaders:
+      enabled: true
+      top_n_per_sector: 3
+    universe_sweep:
+      enabled: true
+      batch_per_cycle: 10
+    alpha_movers:
+      enabled: true
+    fq_movers:
+      enabled: true
+    momentum_screen:
+      enabled: false
+    finviz_screen:
+      enabled: false
+    insider_buying:
+      enabled: false
+  learning:
+    exclude_unhealthy_tickers: true
+    unhealthy_min_consecutive: 3
+    unhealthy_recheck_cooldown_minutes: 30
+    exclude_low_quality_tickers: true
+    min_track_record: 12
+    max_qualify_rate_to_exclude: 0.05
+    min_stale_block_rate_to_exclude: 0.5
+risk_level: TURBO
+risk:
+  max_daily_loss_usd: 500
+  max_trades_per_day: 10
+  max_position_size_usd: 500
+  max_portfolio_risk_pct: 5.0
+  min_confidence: 75
+  kill_switch_triggered: false
+  daily_loss_limit_triggered: false
+  daily_profit_lock_triggered: false
+  CONSERVATIVE:
+    buy_score_threshold_pct: 68
+    buy_score_threshold_day_pct: 73
+    rsi_oversold_threshold: 35
+    stochastic_threshold: 20
+    vix_entry_max: 22
+    fg_min: 25
+    fg_max: 80
+    macro_blackout: all
+    stop_loss_swing_pct: 4
+    stop_loss_day_pct: 2
+  MODERATE:
+    buy_score_threshold_pct: 60
+    buy_score_threshold_day_pct: 65
+    rsi_oversold_threshold: 40
+    stochastic_threshold: 25
+    vix_entry_max: 25
+    fg_min: 20
+    fg_max: 85
+    macro_blackout: fomc_nfp
+    stop_loss_swing_pct: 5
+    stop_loss_day_pct: 2.5
+  AGGRESSIVE:
+    buy_score_threshold_pct: 55
+    buy_score_threshold_day_pct: 60
+    rsi_oversold_threshold: 45
+    stochastic_threshold: 30
+    vix_entry_max: 26
+    fg_min: 15
+    fg_max: 90
+    macro_blackout: fomc
+    stop_loss_swing_pct: 7
+    stop_loss_day_pct: 3.5
+  TURBO:
+    buy_score_threshold_pct: 50
+    buy_score_threshold_day_pct: 55
+    rsi_oversold_threshold: 45
+    stochastic_threshold: 30
+    vix_entry_max: 27
+    fg_min: 10
+    fg_max: 95
+    macro_blackout: fomc
+    stop_loss_swing_pct: 8
+    stop_loss_day_pct: 4
+stop_machine:
+  DAY:
+    atr_multiplier_strong: 1.0
+    atr_multiplier_standard: 0.8
+    atr_multiplier_weak: 0.6
+    breakeven_r: 0.3
+    breakeven_lock_r: 0.05
+    profit_protect_r: 0.8
+    profit_protect_lock_r: 0.2
+    profit_protect_trail_atr_mult: 0.75
+    trend_trail_r: 1.5
+    trend_trail_atr_mult: 0.75
+  SWING:
+    atr_multiplier_strong: 2.0
+    atr_multiplier_standard: 1.5
+    atr_multiplier_weak: 1.2
+    breakeven_r: 0.5
+    breakeven_lock_r: 0.05
+    profit_protect_r: 1.0
+    profit_protect_lock_r: 0.25
+    profit_protect_trail_atr_mult: 1.5
+    trend_trail_r: 2.0
+    trend_trail_atr_mult: 1.5
+  atr_spike:
+    atr_pct_threshold: 5.0
+    multiplier_bonus: 0.4
+position_sizing:
+  enabled: true
+  score_tiers:
+  - min_score: 85
+    size_pct: 100
+  - min_score: 75
+    size_pct: 70
+  - min_score: 65
+    size_pct: 40
+  - min_score: 0
+    size_pct: 25
+  ev_confidence_multiplier:
+    insufficient: 0.5
+    low: 0.7
+    moderate: 0.9
+    high: 1.0
+  volatility_atr_pct_bands:
+  - max_atr_pct: 2.0
+    multiplier: 1.0
+  - max_atr_pct: 4.0
+    multiplier: 0.85
+  - max_atr_pct: 6.0
+    multiplier: 0.65
+  - max_atr_pct: 999.0
+    multiplier: 0.45
+  min_size_pct: 20
+  max_size_pct: 100
+  day_size_multiplier: 0.5
+portfolio_risk:
+  enabled: true
+  max_sector_exposure_pct: 35
+  max_theme_exposure_pct: 40
+  max_portfolio_beta: 1.6
+  correlation_lookback_days: 60
+  high_correlation_threshold: 0.75
+  max_high_correlation_cluster: 3
+  high_vol_atr_pct_threshold: 5.0
+  max_simultaneous_high_vol_positions: 4
+  hard_block_on_severe_breach: false
+  theme_map:
+    AI:
+    - NVDA
+    - MSFT
+    - GOOGL
+    - AMZN
+    - AMD
+    - META
+    SEMICONDUCTORS:
+    - NVDA
+    - AMD
+    MEGA_CAP_TECH:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - META
+    - NVDA
+    EV_AUTO:
+    - TSLA
+market_filters:
+  fear_greed:
+    enabled: true
+    no_buy_below: 20
+    no_buy_above: 85
+    no_sell_below: 15
+  vix:
+    enabled: true
+    no_trade_above: 28
+    tighten_stops_above: 20
+  yield_curve:
+    enabled: true
+    warn_if_inverted: true
+  macro_event_blackout:
+    enabled: true
+    no_trade_hours_before_cpi: 2
+    no_trade_hours_before_fomc: 4
+    no_trade_hours_before_nfp: 2
+buy_rules:
+  scoring_mode: weighted
+  min_score_to_buy: 60
+  rules:
+    price_above_sma20:
+      enabled: true
+      weight: 10
+    price_above_sma50:
+      enabled: true
+      weight: 10
+    price_above_sma200:
+      enabled: true
+      weight: 15
+    ema9_above_ema21:
+      enabled: true
+      weight: 8
+    rsi_oversold:
+      enabled: true
+      threshold: 40
+      weight: 12
+    stochastic_oversold:
+      enabled: true
+      k_threshold: 25
+      weight: 8
+    macd_bullish_crossover:
+      enabled: true
+      weight: 12
+    macd_histogram_positive:
+      enabled: true
+      weight: 6
+    bollinger_lower_touch:
+      enabled: true
+      weight: 8
+    price_above_vwap:
+      enabled: true
+      weight: 6
+    momentum_pct_gain:
+      enabled: true
+      min_gain_pct: 1.0
+      weight: 5
+    volume_surge:
+      enabled: true
+      min_ratio: 1.5
+      weight: 8
+    obv_rising:
+      enabled: true
+      weight: 5
+    finviz_technical_rating:
+      enabled: true
+      min_rating: Buy
+      weight: 10
+    finviz_analyst_rating:
+      enabled: true
+      min_rating: Buy
+      weight: 8
+    maverick_bullish_screen:
+      enabled: true
+      weight: 10
+    earnings_not_imminent:
+      enabled: true
+      days_buffer: 5
+      weight: 8
+    no_recent_earnings_miss:
+      enabled: true
+      weight: 5
+    news_sentiment_positive:
+      enabled: true
+      min_score: 0.55
+      weight: 8
+    insider_buying:
+      enabled: true
+      lookback_days: 30
+      weight: 10
+    low_short_interest:
+      enabled: true
+      max_short_float_pct: 15
+      weight: 5
+    sector_outperforming:
+      enabled: true
+      weight: 6
+  custom_rules: []
+sell_rules:
+  rules:
+    stop_loss:
+      enabled: true
+      pct: 5.0
+    take_profit:
+      enabled: true
+      pct: 10.0
+      r_multiple: 3.0
+    trailing_stop:
+      enabled: true
+      pct: 3.0
+    earnings_approaching:
+      enabled: true
+      days_before: 2
+    vix_spike:
+      enabled: true
+      threshold: 28
+  custom_rules: []
+mcp:
+  robinhood: robinhood-trading
+  yfinance: yfinance
+  fear_greed: fear-greed
+  stock_scanner: stock-scanner
+  maverick: maverick-mcp
+  finviz: finviz
+  fred: fred
+  model: claude-sonnet-4-6
+  timeout_seconds: 90
+  retry_on_failure: 1
+cache:
+  slow_ttl_minutes: 15
+  fast_ttl_minutes: 5
+account:
+  # Phase 0 step 0.2 (2026-07-24): the account number was a literal here and
+  # this file is versioned. It now resolves from the environment (.env, which
+  # is gitignored) via config_loader's ${VAR} expansion. A missing variable
+  # raises at load time rather than silently yielding an empty string.
+  robinhood_account_number: ${RH_ACCOUNT_NUMBER}
+  auto_sync: true
+data_quality:
+  stale_indicator_veto_threshold: 3
+  consecutive_stale_alert_cycles: 3
+execution_quality:
+  enabled: true
+  weights:
+    spread: 0.2
+    dollar_volume: 0.35
+    slippage: 0.25
+    liquidity_consistency: 0.2
+  dollar_volume_bands:
+  - min_usd: 50000000
+    score: 100
+  - min_usd: 15000000
+    score: 80
+  - min_usd: 5000000
+    score: 55
+  - min_usd: 1000000
+    score: 25
+  - min_usd: 0
+    score: 0
+  slippage_bands:
+  - max_pct: 0.05
+    score: 100
+  - max_pct: 0.15
+    score: 80
+  - max_pct: 0.35
+    score: 55
+  - max_pct: 0.75
+    score: 25
+  - max_pct: 999.0
+    score: 0
+  slippage_participation_factor: 50.0
+  score_adjustment_bounds:
+    max_bonus_pct: 3.0
+    max_penalty_pct: 8.0
+  size_multiplier_bounds:
+    min: 0.5
+    max: 1.0
+trade_attribution:
+  enabled: true
+  stop_too_tight_mfe_min_pct: 2.0
+  stop_too_tight_mfe_to_loss_ratio: 1.5
+  entry_too_early_mae_min_pct: 4.0
+  entry_too_early_mfe_max_pct: 1.5
+  conservative_target_mfe_ratio: 1.5
+  conservative_target_min_gap_pct: 2.0
+  news_event_min_abs_move_pct: 6.0
+  news_event_max_hold_hours: 24
+  trend_failure_min_hold_hours: 48
+asset_profiles:
+  etf_tickers:
+  - SPY
+  - XLK
+  - XLF
+  - XLE
+  - XLV
+  - XLY
+  - XLP
+  - XLI
+  - XLB
+  - XLU
+  - XLRE
+  - XLC
+weights:
+  swing_buy:
+    bucket_weights:
+      TREND: 0.225
+      MOMENTUM: 0.205
+      VOLUME_PA: 0.15
+      EXTERNAL: 0.16
+      SENTIMENT_MACRO: 0.15
+      MARKET_BREADTH: 0.11
+      VOLATILITY_EXPANSION: 0.0
+    bucket_min_pct:
+      TREND: 0.5
+      MOMENTUM: 0.4
+      VOLUME_PA: 0.4
+      EXTERNAL: 0.4
+      SENTIMENT_MACRO: 0.3
+      MARKET_BREADTH: 0.35
+      VOLATILITY_EXPANSION: 0.0
+  swing_buy_etf:
+    bucket_weights:
+      TREND: 0.29
+      MOMENTUM: 0.215
+      VOLUME_PA: 0.15
+      EXTERNAL: 0.065
+      SENTIMENT_MACRO: 0.085
+      MARKET_BREADTH: 0.195
+      VOLATILITY_EXPANSION: 0.0
+    bucket_min_pct:
+      TREND: 0.5
+      MOMENTUM: 0.4
+      VOLUME_PA: 0.4
+      EXTERNAL: 0.15
+      SENTIMENT_MACRO: 0.2
+      MARKET_BREADTH: 0.35
+      VOLATILITY_EXPANSION: 0.0
+  swing_buy_day:
+    bucket_weights:
+      TREND: 0.12
+      MOMENTUM: 0.25
+      VOLUME_PA: 0.27
+      EXTERNAL: 0.08
+      SENTIMENT_MACRO: 0.1
+      MARKET_BREADTH: 0.18
+      VOLATILITY_EXPANSION: 0.0
+    bucket_min_pct:
+      TREND: 0.5
+      MOMENTUM: 0.4
+      VOLUME_PA: 0.4
+      EXTERNAL: 0.4
+      SENTIMENT_MACRO: 0.3
+      MARKET_BREADTH: 0.35
+      VOLATILITY_EXPANSION: 0.0
+  swing_buy_etf_day:
+    bucket_weights:
+      TREND: 0.15
+      MOMENTUM: 0.26
+      VOLUME_PA: 0.27
+      EXTERNAL: 0.04
+      SENTIMENT_MACRO: 0.06
+      MARKET_BREADTH: 0.22
+      VOLATILITY_EXPANSION: 0.0
+    bucket_min_pct:
+      TREND: 0.5
+      MOMENTUM: 0.4
+      VOLUME_PA: 0.4
+      EXTERNAL: 0.15
+      SENTIMENT_MACRO: 0.2
+      MARKET_BREADTH: 0.35
+      VOLATILITY_EXPANSION: 0.0
+  exit_score:
+    bucket_weights:
+      TREND_DETERIORATION: 0.25
+      MOMENTUM_WEAKNESS: 0.2
+      VOLUME_DISTRIBUTION: 0.2
+      MARKET_CONTEXT: 0.15
+      FUNDAMENTAL_RISK: 0.1
+      POSITION_HEALTH: 0.1
+regime_weight_adaptation:
+  enabled: false
+  min_closed_trades_required: 200
+  bull:
+    TREND: 0.03
+    MOMENTUM: 0.02
+    MARKET_BREADTH: -0.03
+    SENTIMENT_MACRO: -0.02
+  bear:
+    MARKET_BREADTH: 0.04
+    SENTIMENT_MACRO: 0.02
+    MOMENTUM: -0.03
+    TREND: -0.03
+  choppy: {}
+  crisis:
+    MARKET_BREADTH: 0.05
+    SENTIMENT_MACRO: 0.03
+    MOMENTUM: -0.04
+    TREND: -0.04
+thresholds:
+  calendar_enabled: false
+system:
+  rule_engine_version: 8.5.0
+  regime_algorithm_version: regime_2.4
+  threshold_version: thresh_3.1
+probabilistic_decision:
+  enabled: true
+  target_gain_pct: 5.0
+  min_win_probability: 0.5
+  min_ev_pct: 0.0
+learning:
+  bayesian_learning_rate: 0.01
+  bayesian_max_change_per_trade_pct: 3
+  bayesian_weekly_max_total_pct: 10
+  bayesian_monthly_max_total_pct: 25
+  min_trades_before_bayesian: 10
+  loss_streak_halt: 5
+  walk_forward_trigger_trades: 10
+  walk_forward_trigger_days: 7
+  threshold_regret_trigger_days: 7
+  pattern_db_lambda_swing: 0.7
+  pattern_db_lambda_day: 1.4
+  champion_challenger_min_trades_for_significance: 30
+  pattern_hold_days: 5
+  require_shadow_validation: true
+backtest:
+  enabled: true
+  weekly_trigger_days: 7
+  # months 12 -> 24 -> 36 (2026-07-24, zero-trades follow-up): 12 months over
+  # the mega-cap list produced a 0-trade run (closest miss ASTS, 4.4pt
+  # deficit). 24 months + the screener_discovered auto universe (see
+  # ticker_source below) narrowed the closest miss to 2.33pt (MARA,
+  # 2024-12-05, 47.67% vs a 50.0% threshold) and pushed pct_scoring_ge_40 up
+  # to 5.3% - real movement, not noise, but still 0 trades. Extending to 36
+  # months gives ~1.5x more candidate-days and a wider spread of regimes to
+  # actually clear the bar at least once, without changing anything about
+  # the scoring/veto logic itself - this is more sampling, not another fix.
+  months: 36
+  warmup_days: 260
+  max_hold_days: 20
+  # ticker_source (2026-07-24, "pick tickers automatically instead of a
+  # hand-curated list, will that help or create noise"): "screener_discovered"
+  # means the tickers list below is IGNORED and engine/backtest_loop.py's
+  # resolve_backtest_tickers() instead pulls up to max_auto_tickers names
+  # from the live screener_candidates table, ordered by how often the real
+  # discovery sources (rs_gainers/volume_surge/sector_leaders/etc.) found
+  # them worth surfacing. Deliberately NOT "tickers that cleared 50%+
+  # historically" - selecting a backtest universe by an outcome measured
+  # over the SAME window being backtested is look-ahead/selection bias: with
+  # ~600+ tickers in screener_candidates, some will clear 50%+ in-sample by
+  # chance alone even with zero real edge, and a list curated that way would
+  # trivially "pass" this backtest without that meaning anything. Ordering by
+  # discovery frequency instead is knowable without knowing the outcome, so
+  # it's a legitimate universe rather than a curated winner list. Falls back
+  # to the static `tickers` list below if screener_candidates is empty/
+  # unreachable (e.g. a fresh install with no screener history yet) - set
+  # ticker_source back to "static" to always use the explicit list below
+  # instead (e.g. for a controlled, reproducible comparison run).
+  ticker_source: screener_discovered
+  max_auto_tickers: 60
+  # tickers: STATIC FALLBACK ONLY while ticker_source is screener_discovered
+  # above (used only if the DB is unreachable or screener_candidates is
+  # empty). The original 13 are mega-cap tech/growth names that structurally
+  # sit near their SMAs and rarely swing far enough to clear TURBO's
+  # threshold - confirmed via output/trading.db's real live `signals` table,
+  # where these same 13 cleared 50%+ on well under 2% of scored candidates.
+  # The 12 added on 2026-07-24 (HLN/USB/HOMB/NVO/ENOV/HBAN/TAK/WFC/JEF/KEY/
+  # PBR-A/MO) were a manually-curated "these cleared 50%+ live" list - kept
+  # here only as the static fallback, superseded by ticker_source above for
+  # normal runs since that manual curation has the same look-ahead-bias
+  # problem described above, just picked by hand instead of by code.
+  tickers:
+  - VRT
+  - ORCL
+  - MU
+  - FIX
+  - ASTS
+  - NFLX
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - GOOGL
+  - META
+  - TSLA
+  - HLN
+  - USB
+  - HOMB
+  - NVO
+  - ENOV
+  - HBAN
+  - TAK
+  - WFC
+  - JEF
+  - KEY
+  - PBR-A
+  - MO
+ui:
+  # Phase 0 step 0.2 (2026-07-24): this was a short literal token in a
+  # versioned file. It now resolves from the environment (.env, gitignored).
+  # The retired value is deliberately not quoted here - a comment recording
+  # what a secret used to be is still a secret in the history.
+  # Generate a real one (32+ chars) with:
+  #   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+  auth_token: ${UI_AUTH_TOKEN}
+notifications:
+  enabled: true
+  desktop_enabled: true
+  high_conviction_buy_pct: 80

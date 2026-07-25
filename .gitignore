@@ -29,7 +29,12 @@ output/
 *.db-shm
 *.db.bak-*
 *.postgres-backup-*
+# Database DUMPS - a dump holds positions, account activity and the entire
+# signal history. It is more sensitive than the code and must never reach a
+# remote. Schema MIGRATIONS are the opposite: they are source, and a version
+# that cannot recreate its own schema is not reproducible.
 *.sql
+!migrations/*.sql
 *.sql.gz
 *.sql.gz.sha256
 

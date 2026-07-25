@@ -1,0 +1,108 @@
+# =============================================================================
+#  Pinned dependencies (Phase 0 step 0.7, §13)
+# =============================================================================
+#
+#  Every entry used >= and there was no lockfile. For a trading system that is
+#  a CORRECTNESS risk, not merely a reproducibility one: a pandas-ta minor
+#  release changing a default smoothing period silently moves every score in
+#  the system, and nothing would tell you. This already bites - live_trader.py
+#  carries a getattr fallback because robin_stocks renamed
+#  order_sell_fractional_by_shares between releases, in the ORDER PATH.
+#
+#  Comments are grouped by BLAST RADIUS. Six months from now, "score-affecting"
+#  tells you instantly which upgrades require a full re-validation run (§23)
+#  and which are routine.
+#
+#  These pins were set from the versions the platform was running on
+#  2026-07-24. Confirm them against your actual environment and rewrite in one
+#  command:
+#
+#      python3 scripts/pin_requirements.py --write     # rewrite pins from pip
+#      python3 scripts/check_deps.py                   # verify no drift
+#
+#  scripts/tp install creates a per-version venv from THIS file, which is why
+#  pinning is a prerequisite for §38: without ==, two versions installed a
+#  month apart get different pandas and compute different indicators from
+#  identical bars.
+#
+# -----------------------------------------------------------------------------
+#  SCORE-AFFECTING - any change moves every indicator, every score, every
+#  decision. Upgrading one of these invalidates the validation receipt and
+#  requires a full re-validation before live execution may be re-armed.
+# -----------------------------------------------------------------------------
+pandas==2.2.3
+pandas-ta==0.3.14b0      # no wheel below Python 3.12 - see engine/ticker_analyzer.py,
+                         # which now REFUSES to start on the hand-rolled fallback
+                         # unless TP_REQUIRE_REFERENCE_TA=0 is set deliberately
+numpy==1.26.4            # pandas-ta 0.3.14b still does `from numpy import NaN`,
+                         # removed in numpy>=1.24 - ticker_analyzer patches it back
+scipy==1.11.4            # Wilson / Clopper-Pearson CIs, two-proportion z-test
+                         # (analytics/, learning/) - moves confidence gating
+
+# -----------------------------------------------------------------------------
+#  ORDER PATH - never float this. A renamed method here is a failed or
+#  misdirected order, not a stack trace.
+# -----------------------------------------------------------------------------
+robin_stocks==3.4.0
+pyotp==2.9.0             # TOTP codes for Robinhood 2FA login (live_trader)
+
+# -----------------------------------------------------------------------------
+#  DATA SHAPE - a changed column name or dtype silently degrades inputs
+# -----------------------------------------------------------------------------
+yfinance==0.2.54
+finviz==1.4.6            # mcp_clients/finviz_mcp.py - direct finviz.com scrape,
+                         # replaced the old finviz-mcp-server stdio binary
+feedparser==6.0.11
+python-dateutil==2.8.2
+pytz==2024.1
+
+# -----------------------------------------------------------------------------
+#  STORAGE - schema and driver behaviour
+# -----------------------------------------------------------------------------
+psycopg2-binary==2.9.9   # storage/database.py - Postgres driver + connection pool
+
+# -----------------------------------------------------------------------------
+#  ROUTINE - transport, scheduling, presentation. Upgrades here do not move a
+#  score and do not require re-validation.
+# -----------------------------------------------------------------------------
+mcp==1.1.2               # official MCP Python SDK - direct client calls
+APScheduler==3.10.4
+fastapi==0.115.6         # server.py - web UI (only needed for `main.py --ui`)
+uvicorn==0.30.6
+websockets==12.0
+requests==2.31.0
+pyyaml==6.0.1
+rich==13.7.1
+tabulate==0.9.0
+
+# -----------------------------------------------------------------------------
+#  DEVELOPMENT - not imported by the running platform
+# -----------------------------------------------------------------------------
+pytest==8.3.4
+pre-commit==4.0.1
+
+# -----------------------------------------------------------------------------
+#  NOTES
+# -----------------------------------------------------------------------------
+# openai / python-dotenv / vaderSentiment were used by an earlier iteration
+# (engine/claude_brain.py's NVIDIA-NIM fallback) that is no longer part of the
+# active pipeline - see README.md "Superseded modules". .env loading is now
+# storage/secrets.py, which is stdlib-only on purpose.
+#
+# NOT YET WIRED UP (still true after this pass):
+#   pandas-market-calendars==4.4.1  # §31 - scheduler.py still uses the
+#                                   # hardcoded NYSE_HOLIDAYS_2026 list
+#   scikit-learn                    # pattern_database.py's cosine similarity
+#                                   # is plain numpy; not needed yet
+#
+# OPTIONAL:
+#   defeatbeta-api      # mcp_clients/defeatbeta_data.py - keyless, unlimited
+#                       # OHLCV/fundamentals fallback (HuggingFace parquet via
+#                       # DuckDB). NOT installed by default: it pulls in duckdb,
+#                       # openpyxl and huggingface-hub, a heavy chain for a
+#                       # fallback-of-a-fallback. The module is fully inert
+#                       # without it. `pip install defeatbeta-api` to activate.
+#
+# EDGAR (mcp_clients/edgar_data.py) needs no new package - stdlib xml.etree plus
+# `requests` above. It needs EDGAR_USER_AGENT set in .env: the SEC requires a
+# descriptive contact string, not a key.
