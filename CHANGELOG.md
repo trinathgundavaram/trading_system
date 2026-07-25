@@ -20,6 +20,164 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+### Decision function: CHANGED by §53 — re-validation required before arming live
+
+Phase 2.5 (§48–§55) complete as far as code can take it. Plan and adjudication
+of the 2026-07-25 external review:
+[docs/PHASE2_5_PLAN.md](docs/PHASE2_5_PLAN.md).
+
+`scripts/classify_change.py` reports MAJOR, and most of that is the
+conservative heuristics: `engine/rules_catalog.py` sits in `DECISION_PATHS` and
+changed only in description strings plus one added `enforced_in` key, and the
+`migrations/` rule fires on 009/010/011, which add two nullable columns and
+three indexes. `config.yaml` changed only by removing two keys nothing read, and
+`config_fingerprint` is **unchanged at `cc9a149613427f56`**.
+
+**One change is genuinely decision-moving and should not be lost in that
+paragraph.** §53 changes which quantity `engine/portfolio_risk.py` counts as an
+open high-volatility position, and portfolio risk sizes and can block entries.
+The count becomes *stricter* — the old proxy read low — so expect marginally
+more size reduction around volatile names. Pattern rows remain poolable
+individually; anything reasoning about position sizing across this boundary has
+to account for it.
+
+Nothing else is on the decision path: nothing reads `exit_kind` or
+`get_pattern_excursions()` yet (lifting `ev_engine`'s `p_stop_loss` onto them is
+Phase 3, and will be its own declared change), and removing a config key with no
+reader cannot change a decision.
+
+### Added
+
+- **§50** `pattern_database.exit_kind` (`migrations/009`): the countable
+  companion to `exit_reason`. The reason string interpolates the price into
+  itself, so four stop-loss exits were recorded as four distinct strings and
+  the column could not be grouped at all — which is why `ev_engine`'s
+  `p_stop_loss` is a horizon proxy and says so. `rules/common.classify_exit()`
+  derives the kind from reasons that are structured tokens and returns None for
+  prose, deliberately: a bucket half-filled by guesswork is worse than an empty
+  one. Values outside `EXIT_KINDS` are refused rather than stored.
+- **§51** `Database.link_pattern_to_trade()` and `get_pattern_excursions()`
+  (`migrations/010`). `pattern_database.trade_id` had existed since the table
+  was created and was NULL on every row, because its only writer runs at signal
+  time when no position exists. Both ids are in scope exactly once — just after
+  the position opens — and that is now where the link is written.
+- **§49** `scripts/assess_test_damage.py` and `repair_test_damage.py` now cover
+  `mae_mfe_data`, by evidence rather than by time window (the table has no
+  provenance columns to filter on).
+- **§53** `positions.entry_atr_pct` (`migrations/011`), populated by
+  `scheduler.py` and `confirm_fill.py` from the ATR already in scope at entry.
+- **§52** `scripts/calibrate_risk_caps.py`. Writes nothing; turns the equity
+  curve into a recommended `max_intraday_drawdown_pct`, refuses to recommend
+  below `--min-days` because a percentile of four observations is arithmetic
+  rather than evidence, flags any day showing ≥10% intraday drawdown as far
+  more likely to be a purse re-seed than a trading loss, and converts the cap
+  into dollars at current equity so the scale dependence the review asked us to
+  document is visible rather than inferred.
+- **§55** the stale-data circuit breaker now writes a `rejected_signals` row
+  (`reject_stage = "data_quality"`) naming the defaulted indicators, so
+  `data_quality.stale_indicator_veto_threshold` can be set from a week of
+  evidence instead of swapped for another guess. Only this veto is
+  instrumented — the others are decisions about the name; this one is a
+  decision about our own data.
+- `tests/test_exit_vocabulary.py`, `tests/test_risk_calibration.py`.
+
+### Fixed
+
+- **§49** the 2026-07-25 test-against-production cleanup missed `mae_mfe_data`
+  entirely: it was absent from `repair_test_damage.py`'s `PURGE` list while
+  every neighbouring table was cleaned. On the pre-Postgres snapshot, 22 of 25
+  rows are test-fixture residue.
+
+  The consequence is worse than the residue. `mae_mfe_data.trade_id` is TEXT
+  with no unique constraint and no book scope, and `trade_id = '1'` is claimed
+  by five different tickers — so joining patterns to excursions returned 37 rows
+  for 23 patterns, with NVDA's excursion attaching itself to ADPT's pattern. An
+  `AVG(mae_pct)` over that join is wrong in a way nothing about the query looks
+  wrong, and Phase 3 was going to recalibrate against it.
+
+  `get_pattern_excursions()` is now the single sanctioned join: one indexed hop,
+  ticker agreement required, §15's quarantine honoured on both sides, and a
+  redundant in-Python dedupe so a database restored without `migrations/010`'s
+  unique index degrades to a warning rather than to wrong averages.
+
+- **§54** removed six module-level `check_*` risk helpers and `LegacyRiskEngine`
+  from `rules/risk_rules.py`. Zero call sites, including in tests, while the
+  limits they described are genuinely enforced in `position_sizing.py`,
+  `live_trader.py`, `paper_trader.py` and `RiskEngine.check()`. Two
+  implementations of one limit is a coin flip about which one a future edit
+  lands in — and they had already diverged: the dead copy compared today's trade
+  count with `>=` where the live one uses `>`, and read `max_daily_loss_usd` raw
+  where the live path uses §8's equity-scaled `daily_loss_limit()`.
+
+- **§54** `ACCOUNT_RISK_CATALOG` attributed all eight account-risk checks to
+  `rules/risk_rules.py`, which is where the dead copy lived; each entry now
+  names its real enforcement site. It also documented
+  `max_intraday_drawdown_pct` as defaulting to 3.0% while `config.yaml` says
+  2.0 — a catalogue that can disagree with the config is worse than none,
+  because it is what someone reads instead of the config. A test now pins them
+  together.
+
+- **§53** `engine/portfolio_risk.py`'s high-volatility count compared two
+  different quantities against one threshold: the candidate arrived as a true
+  ATR percentage (`atr / price * 100`), while open positions were measured by
+  `_position_risk_band_pct` — stop distance as a percentage of entry — both
+  against `high_vol_atr_pct_threshold`.
+
+  The proxy defended itself on the grounds that wider stops track wider ATR,
+  and that holds for ranking. It does not hold against a threshold denominated
+  in ATR, and it is biased in one direction twice over. `risk_per_share` is
+  `min(max(1.2*ATR, price*1.5%), price*stop_loss_pct)`, so past a certain
+  volatility the stop is clamped while ATR keeps going and the proxy saturates.
+  And the stop ratchets as a position moves in favour, so a position's measured
+  volatility *fell the better it did* — a winner quietly stopped counting
+  toward the cap. `max_simultaneous_high_vol_positions` was therefore looser in
+  practice than it read, and recalibrating the threshold (which the review
+  asked for) could not have fixed it.
+
+  `_position_atr_pct()` now reads the persisted entry ATR, with the proxy kept
+  as an explicit, debug-logged fallback for rows predating `migrations/011`.
+  Absent volatility is not zero volatility.
+
+- **§48** `reset_paper_account()` now clears `paper_equity_history` too. It did
+  not, so a "clean slate" account inherited the previous account's equity curve
+  — and that curve is the input to every drawdown figure. v1.3.1 exists because
+  of what a discontinuity there does: a downward re-seed reads as a 33%
+  intraday drawdown and, against a 2.0% cap, blocks entries for the rest of the
+  day for an accounting event. The epoch guards stay; they remain load-bearing
+  for a re-seed, which does not delete the account.
+
+- **§54** removed `risk.daily_loss_limit_triggered` and
+  `risk.daily_profit_lock_triggered` from `config.yaml`, `rules/hard_vetoes.py`,
+  `engine/position_management.py` and the catalogue. Nothing ever wrote either
+  flag, while three readers treated them as live controls — one of which used
+  the loss flag as a **priority-1 exit-everything** trigger, so hand-setting a
+  writerless key liquidated the book. No capability is lost:
+  `kill_switch_triggered` is the documented manual halt, it has a writer, a
+  persist step, a notification and a test, and it reaches the same priority-1
+  branch. `config_fingerprint` is unchanged, so this is not a decision change.
+
+- **§54** `scripts/backfill_drawdown.py` printed "the configured 3.0%" while
+  `config.yaml` said 2.0 — the same drift as the catalogue, in the place an
+  operator is most likely to read it as authoritative. It now reads the value.
+
+### Known / deferred
+
+- `migrations/009`, `010` and `011` are written but **not applied**. 010 will
+  fail while duplicate `trade_id`s remain; that failure is the gate on §49's
+  purge, not a bug.
+- **§48's reset has not been run.** It is destructive and needs the live
+  database; nothing in this work touched production data. Run
+  `scripts/assess_test_damage.py` and `scripts/tp backup` first.
+- **§52's cap values are unchanged.** The tooling is in; the numbers need a
+  clean curve, so they wait on §48.
+- **§53's `high_vol_atr_pct_threshold` is unchanged at 5.0.** Recalibrating it
+  is now worth doing — before this change it would have been tuning against the
+  wrong axis.
+- **§55's threshold is unchanged at 3.** It needs a week of the new
+  `rejected_signals` rows.
+- 92 tests require Postgres and were not executed in the environment this work
+  was done in. Run `pytest` locally before releasing.
+
 ## [1.3.1] — v1.3.1 — 2026-07-25
 
 ### Decision function: unchanged — v1.3.0 trade data remains poolable
