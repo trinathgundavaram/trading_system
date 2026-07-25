@@ -238,10 +238,27 @@ def _run_cycle_impl(force: bool = False):
         logger.warning("KILL SWITCH ACTIVE - halted")
         return
 
-    risk = RiskEngine(db, cfg)
-    risk_check = risk.check()
+    # §10 (Phase 2): book-aware, and the block is now RECORDED.
+    #
+    # RiskEngine(db, cfg) defaults to the book this mode actually trades (§7),
+    # but state it explicitly here - which book a cycle was budgeted against is
+    # exactly the sort of thing that should not be inferred from a default two
+    # modules away.
+    #
+    # This is a cheap early exit, NOT the real gate. It runs once, before the
+    # ticker loop, so a cycle that starts at 9 trades and finds 15 qualifying
+    # candidates would still place all 15. The binding check is per-trade,
+    # inside paper_trader.execute_buy() - see §10.
+    watch_mode = paper_trader.is_watch_mode(cfg)
+    risk_check = RiskEngine(db, cfg, simulated=watch_mode).check()
     if not risk_check["can_trade"]:
         logger.warning(f"Risk limit: {risk_check['reason']}")
+        # Every other blocking path in this function logs the block; this one
+        # returned silently, so a cycle halted by a risk limit vanished from
+        # the cycles table and the Journal tab entirely. "Why did nothing
+        # happen for three hours?" had no recorded answer.
+        db.log_cycle(cycle_count, 0, blocked=True, reason=risk_check["reason"],
+                     triggered_by=triggered_by)
         return
 
     # Layer 1: Market context via MCPs

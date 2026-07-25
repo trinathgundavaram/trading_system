@@ -153,6 +153,21 @@ def test_absolute_cap_wins_when_it_is_tighter():
     assert daily_loss_limit(db, cfg, simulated=True) == pytest.approx(500.0)
 
 
+def test_equity_includes_open_positions_not_just_cash():
+    """A fully-invested account must not read as near-zero equity.
+
+    Valuing at cost rather than market is deliberate: market value needs a
+    live quote per position, this runs on every buy, and an unpriced position
+    contributing 0 would TIGHTEN the limit. A $1,000 account with $100 cash
+    and $900 deployed would resolve to a $2 daily stop and halt the session
+    for entirely the wrong reason."""
+    db = FakeDB(cash=100.0)
+    db.positions = [{"dollar_amount": 400.0}, {"dollar_amount": 500.0}]
+    cfg = _cfg(max_daily_loss_usd=500, max_daily_loss_pct=2.0)
+    # 100 cash + 900 deployed = 1000 equity -> 2% = 20, not 2.
+    assert daily_loss_limit(db, cfg, simulated=True) == pytest.approx(20.0)
+
+
 def test_zero_percent_falls_back_to_the_absolute_cap():
     db = FakeDB(cash=1000.0)
     assert daily_loss_limit(db, _cfg(max_daily_loss_pct=0), True) == pytest.approx(500.0)
@@ -248,6 +263,56 @@ def test_kill_switch_records_which_book_breached(cfg_file):
     db.pnl["paper"] = -50.0
     trip_kill_switch_if_needed(db, cfg, simulated=True)
     assert "paper" in cfg_file.read()["risk"]["kill_switch_reason"]
+
+
+# ── §10: the gate binds per trade, and never blocks an exit ─────────────────
+
+def test_engine_blocks_entry_but_the_sell_path_has_no_gate():
+    """§10's asymmetry, asserted structurally.
+
+    execute_buy() must consult RiskEngine; execute_sell() must not. Being
+    unable to close a losing position because you already hit the daily trade
+    count is how a small loss becomes a large one - the limit would convert
+    itself from a risk control into a risk.
+
+    Read from the source rather than executed, so this needs no database: the
+    property is "does this code path consult the gate", which is exactly what
+    a future well-meaning edit would change."""
+    import inspect
+
+    from engine import paper_trader
+    buy = inspect.getsource(paper_trader.execute_buy)
+    sell = inspect.getsource(paper_trader.execute_sell)
+
+    assert "RiskEngine" in buy, "execute_buy lost its per-trade risk check"
+    assert "RiskEngine" not in sell, (
+        "execute_sell has acquired a risk check - exits must NEVER be blocked "
+        "by a daily limit; see §10 and this function's docstring")
+
+
+def test_sell_still_records_against_the_budget():
+    """An exit is not blocked by the budget, but it does consume it - the next
+    ENTRY should see the cost of the churn."""
+    import inspect
+
+    from engine import paper_trader
+    sell = inspect.getsource(paper_trader.execute_sell)
+    assert "record_trade_placed" in sell
+
+
+def test_cycle_level_block_is_recorded():
+    """A cycle halted by a risk limit used to return without logging, so it
+    vanished from the cycles table and the Journal tab: 'why did nothing
+    happen for three hours?' had no recorded answer."""
+    # Read the file rather than importing it: scheduler pulls the whole
+    # analysis stack (scipy, pandas_ta) and this assertion is about a dozen
+    # lines of text. A structural test that needs the numerical stack
+    # installed is a structural test that gets skipped.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "scheduler.py")).read()
+    gate = src.split("risk_check = RiskEngine")[1][:700]
+    assert "log_cycle" in gate, "the risk-limit block is not recorded"
+    assert "simulated=watch_mode" in gate, "cycle-level check is not book-aware"
 
 
 def test_persist_preserves_config_comments(tmp_path, monkeypatch):

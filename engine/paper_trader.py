@@ -113,6 +113,24 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
     if db.get_open_position(ticker, simulated=True):
         return {}  # same setup already held - identical to live behavior
 
+    # ── §10 (Phase 2): the risk gate, per TRADE ────────────────────────────
+    # scheduler.py checks once per cycle, before the ticker loop. A cycle that
+    # begins at 9 trades and finds 15 qualifying candidates placed all 15.
+    # engine/live_trader.py has always re-checked per trade, so the LIVE path
+    # was protected and the paper path was not - exactly backwards, since the
+    # paper book is the one being used to estimate future behaviour.
+    #
+    # Placed here, before any state is mutated: after the already-held check
+    # (which is not a risk decision and should not consume budget) and before
+    # the purse, the position row or the counters are touched.
+    from rules.risk_rules import RiskEngine
+    risk = RiskEngine(db, cfg, simulated=True).check()
+    if not risk["can_trade"]:
+        logger.info(f"{ticker}: [PAPER] buy blocked - {risk['reason']}")
+        db.log_ui_event("paper_buy_skipped",
+                        {"ticker": ticker, "reason": risk["reason"]})
+        return {}
+
     # DAY-specific position cap (2026-07-22, enhancement item #1 - Trinath's
     # "mode-level position caps" ask): checked BEFORE the general max_positions/
     # rotation logic below and deliberately does NOT rotate - day trading is
@@ -225,7 +243,18 @@ def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None,
                   cfg: dict = None) -> dict:
     """Closes the simulated position at the current price and settles the
     purse. Closes the linked pattern with the rule-driven outcome so the
-    learning loop trains on realistic exits. Returns {} if nothing to sell."""
+    learning loop trains on realistic exits. Returns {} if nothing to sell.
+
+    DELIBERATELY HAS NO RISK-ENGINE CHECK (§10). execute_buy() gained one;
+    this did not, and must not. Being unable to close a losing position
+    because you already hit the daily trade count is how a small loss becomes
+    a large one - the limit would convert itself from a risk control into a
+    risk. This mirrors the reasoning already documented in live_trader's sell
+    path and in the kill switch, both of which block entries and never exits.
+
+    The sell still INCREMENTS the counter (§7), so an exit consumes budget for
+    the purposes of the next entry. It is only never BLOCKED by it.
+    """
     if not price or price <= 0:
         return {}
     closed = db.close_position(ticker, price, simulated=True)

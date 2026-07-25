@@ -107,23 +107,23 @@ def daily_loss_limit(db, cfg: dict, simulated: bool) -> float:
     if pct <= 0:
         return absolute
     try:
+        # Equity = cash + what is deployed, valued at COST.
+        #
+        # Deliberately cost basis, not market value. Market value needs a
+        # current price per position, and this runs on every buy - an
+        # unpriced position would contribute 0 and silently understate equity,
+        # which TIGHTENS the limit. A fully-invested $1,000 paper account with
+        # $100 cash would resolve to a $2 daily stop and halt the session for
+        # the wrong reason. Cost basis needs no quotes, cannot collapse to
+        # zero while positions are open, and is close enough for sizing a
+        # limit that is already a round percentage.
+        deployed = sum(float(p.get("dollar_amount") or 0)
+                       for p in db.get_all_positions(simulated=simulated))
         if simulated:
             acct = db.get_paper_account() or {}
-            equity = float(acct.get("cash", 0) or 0)
-            snap = None
-            try:
-                from engine.paper_trader import snapshot
-                snap = snapshot(db, cfg=cfg)
-            except Exception:
-                snap = None
-            if snap and snap.get("market_value") is not None:
-                equity += float(snap.get("market_value") or 0)
-            else:
-                equity += sum(float(p.get("dollar_amount") or 0)
-                              for p in db.get_all_positions(simulated=True))
+            equity = float(acct.get("cash", 0) or 0) + deployed
         else:
-            equity = sum(float(p.get("dollar_amount") or 0)
-                         for p in db.get_all_positions(simulated=False))
+            equity = deployed
     except Exception:
         return absolute
     return min(absolute, equity * pct / 100.0) if equity > 0 else absolute
