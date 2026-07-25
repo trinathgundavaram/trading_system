@@ -67,6 +67,21 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
 
+      # The source-only half of the Phase 2 verifier - config flags set, guards
+      # wired, no call site left unscoped. --no-db keeps it to a few hundred
+      # milliseconds and means it works on a machine with no Postgres running,
+      # which a pre-commit hook has to.
+      #
+      # The database half (migrations actually applied, no duplicate open
+      # positions) runs in release.sh, where a live database is a reasonable
+      # thing to require and a stale one is worth blocking on.
+      - id: verify-phase2
+        name: Phase 2 guards are in force
+        entry: python3 scripts/verify_phase2.py --no-db
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
       # Complements gitleaks rather than duplicating it: this catches the shape
       # `NAME = "long-opaque-string"` in any staged file, including the .py and
       # .md files where a key gets pasted "just to test something".

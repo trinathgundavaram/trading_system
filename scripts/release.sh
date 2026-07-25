@@ -22,20 +22,42 @@ case "$BRANCH" in
 esac
 
 # ── 2. Tests must pass. Not 'mostly'. ───────────────────────────────────────
-# §12 (Phase 2 step 2.1) restores the suite; until then 33 of 58 tests cannot
-# run, so this is soft-failed with a loud warning rather than silently skipped.
-if ! python3 -m pytest tests/ -q; then
-  echo
-  echo 'WARNING: the test suite is red. This is finding E-2 and is scheduled'
-  echo '         for Phase 2 step 2.1 (§12). Until then a release cannot be'
-  echo '         gated on it - but you are releasing without a safety net.'
-  read -rp 'Continue anyway? [y/N] ' ok; [ "$ok" = y ] || exit 1
-fi
+# HARD GATE as of Phase 2. This used to soft-fail with a warning and a y/N
+# prompt, because §12 had not yet restored the suite and 33 of 58 tests could
+# not run (finding E-2). §12 is done, so the exemption is over.
+#
+# The prompt is not merely redundant now, it is dangerous: the 2026-07-25
+# incident was a release.sh run whose suite executed against the LIVE database,
+# and a gate you can answer 'y' to is a gate that gets answered 'y' at 5pm.
+python3 -m pytest tests/ -q
 
 python3 scripts/check_deps.py            # §13 - no dependency drift
 python3 scripts/check_config_secrets.py  # §34 - no literal secret in config
 command -v gitleaks >/dev/null && gitleaks detect --no-banner --redact \
   || echo 'note: gitleaks not installed - `brew install gitleaks` (§34.4)'
+
+# ── 2b. The guards must be IN FORCE, not merely implemented ─────────────────
+# Tests prove the code is correct. These prove the correct code is what is
+# running here - config flags actually set, migrations actually applied, no
+# new write route left unguarded. That gap is where the 2026-07-25 incident
+# lived, and it is not a gap a code review closes.
+#
+# Blocking, both of them. A Phase 1 or Phase 2 regression is exactly the kind
+# of thing nobody would choose to release past if they were asked in a
+# language stronger than a prompt.
+python3 scripts/verify_phase1.py
+python3 scripts/verify_phase2.py
+
+# Cross-table integrity (§15). Non-blocking BY DESIGN: this reads the state of
+# the DATA, not of the code, and a book that needs reconciling is not a reason
+# to refuse a release that might contain the fix for it. It is a reason to know
+# before you tag.
+if ! python3 scripts/reconcile.py --quiet; then
+  echo
+  echo 'NOTE: reconcile.py reported findings (see above). These describe the'
+  echo '      DATABASE, not this release. Releasing is allowed - resolving'
+  echo '      them by writing corrective rows at invented prices is not.'
+fi
 
 # ── 3. Compute the next version ─────────────────────────────────────────────
 PREV=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo v0.0.0)

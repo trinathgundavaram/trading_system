@@ -174,6 +174,28 @@ def main() -> int:
         check(f"call site uses managed query: {path} ({fn})",
               "get_managed_positions" in src(path))
 
+    # The complement, and the one that actually prevents a regression. The
+    # check above only proves the managed query appears SOMEWHERE in the file;
+    # it would still pass if someone added a get_all_positions() call beside
+    # it. These three modules can close a position, so for them the unmanaged
+    # query is not a thing to use carefully - it is a thing not to use.
+    #
+    # Comments are excluded deliberately: all three files DISCUSS
+    # get_all_positions in comments explaining why they must not call it, and
+    # a check that flagged those would be silenced within a week.
+    reintroduced = []
+    for path in ("engine/position_management.py", "engine/rotation.py",
+                 "rules/sell_rules.py"):
+        for n, line in enumerate(src(path).splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if "get_all_positions" in code:
+                reintroduced.append(f"{path}:{n}")
+    check("no exit-path module calls get_all_positions", not reintroduced,
+          "\n         ".join(reintroduced)
+          + ("\n         An exit path must never see a SYNC/SEED row: as of the"
+             "\n         2026-07-24 audit the eight SYNC rows totalled ~$42,000."
+             if reintroduced else ""))
+
     # ── §6 banner ───────────────────────────────────────────────────────────
     section("§6 - runtime posture banner")
     check("storage/banner.py exists", (REPO / "storage" / "banner.py").exists())
