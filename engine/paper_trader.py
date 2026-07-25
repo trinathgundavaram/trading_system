@@ -212,8 +212,33 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
     # dissected by the strategy category it was bought under.
     trade_mode = (trade_mode or cfg.get("trading", {}).get("mode", "SWING")).upper()
     shares = amount / price
-    db.open_position(ticker, price, shares, amount, pattern_id=pattern_id, simulated=True,
-                      trade_mode=trade_mode)
+
+    # ── §14 (Phase 2): the buy is ONE transaction ──────────────────────────
+    #
+    # Every check above this line is still worth making - they decide STRATEGY
+    # (rotate a holding out, skip a DAY leg, log why the purse said no) and
+    # they produce the log lines that make a skipped buy legible. What they
+    # cannot do is hold. Between the already-held check at the top of this
+    # function and this point, six ThreadPoolExecutor workers run the same
+    # code on different tickers, and nothing stopped two of them agreeing that
+    # there were 24 of 25 positions open, or that the purse held $100.
+    #
+    # So the checks above stay advisory and this call is authoritative: the
+    # duplicate check, the cap and the cash debit happen inside a single
+    # transaction, under a lock, against a table that now has a unique index.
+    # None means another worker got there first - a normal outcome on a
+    # parallel cycle, not an error.
+    opened = db.try_open_position(
+        ticker, price, shares, amount, pattern_id=pattern_id, simulated=True,
+        trade_mode=trade_mode, max_positions=max_positions,
+        debit_paper_cash=amount)
+    if opened is None:
+        logger.info(f"{ticker}: [PAPER] buy skipped - already held, at cap, or "
+                    f"insufficient cash (lost the race to a parallel worker)")
+        db.log_ui_event("paper_buy_skipped",
+                        {"ticker": ticker, "reason": "lost_open_race"})
+        return {}
+
     if entry_seed:
         seed = dict(entry_seed)
         rps = seed.get("risk_per_share") or 0
@@ -223,17 +248,24 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
         seed["stop_state"] = "INITIAL_RISK"
         seed["high_watermark_price"] = price
         db.update_position_by_ticker(ticker, seed)
-    db.adjust_paper_cash(-amount)
     db.log_paper_trade(ticker, "buy", price, shares, amount,
                         reason="buy_signal", pattern_id=pattern_id, trade_mode=trade_mode)
     # §7 (Phase 2): the paper book now consumes the daily budget. Placed AFTER
     # the fill is recorded, so a skipped or failed buy never burns budget.
     db.record_trade_placed(simulated=True)
+    # Re-read rather than computing account['cash'] - amount. That arithmetic
+    # was correct when this function was the only writer, but under §14 a
+    # parallel worker may have debited the purse between the snapshot taken at
+    # the top of this call and the debit that just happened - so the
+    # subtraction would print a balance that was never true. The purse is the
+    # first number an operator reconciles against the UI; it should be read,
+    # not inferred.
+    cash_after = float((db.get_paper_account() or {}).get("cash", 0.0) or 0.0)
     logger.info(f"{ticker}: [PAPER] BOUGHT {shares:.4f} sh @ ${price:.2f} "
-                f"(${amount:.2f}) [{trade_mode}] - purse now ${account['cash'] - amount:.2f}")
+                f"(${amount:.2f}) [{trade_mode}] - purse now ${cash_after:.2f}")
     db.log_ui_event("paper_buy", {
         "ticker": ticker, "price": price, "shares": round(shares, 4),
-        "dollar_amount": round(amount, 2), "cash_after": round(account["cash"] - amount, 2),
+        "dollar_amount": round(amount, 2), "cash_after": round(cash_after, 2),
         "trade_mode": trade_mode,
     })
     return {"ticker": ticker, "price": price, "shares": shares, "dollar_amount": amount}

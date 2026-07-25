@@ -1,0 +1,76 @@
+-- 006_unique_open_position.sql  (Phase 2 step 2.6, §14)
+--
+-- engine/paper_trader.execute_buy() read db.get_open_position(ticker) near the
+-- top and called db.open_position() ~100 lines later - two separate
+-- auto-committed transactions, running inside a ThreadPoolExecutor with
+-- cycle_max_parallel_tickers: 6. The max_positions count had the same shape,
+-- and so did the cash check. A repo-wide grep for CREATE UNIQUE across
+-- storage/database.py returned exactly one hit, on news_items(ticker,
+-- headline). Nothing protected positions.
+--
+-- Two workers on the same ticker in one cycle, or six workers each reading
+-- open_count = 24 against a cap of 25, all passed the check and all wrote.
+-- The window widened on 17 July, when the process-level lock that once
+-- wrapped every _conn() call was removed to fix an unrelated hang - the right
+-- call for the hang, but it took away incidental serialisation without
+-- replacing it with real protection.
+--
+-- Application-level checks cannot fix this; only the database can. A partial
+-- unique index costs nothing and makes the invariant structural.
+--
+-- rollback_safe: true. The index constrains writes, not reads - v1.2.0 can
+-- still read this database. What it cannot do is write a duplicate, which is
+-- the point.
+--
+-- Apply:    psql "$POSTGRES_DB" -f migrations/006_unique_open_position.sql
+-- Rollback: see the commented block at the bottom.
+
+-- ── FIRST: does the book already violate the invariant? ─────────────────────
+-- Run this BEFORE the CREATE below. If it returns rows, the CREATE will fail,
+-- and that failure is the audit you want rather than an obstacle to work
+-- around: it means the race described above has already happened on this
+-- database and there are real duplicate positions to reconcile by hand.
+--
+--     SELECT ticker, COALESCE(simulated,0) AS book, COUNT(*)
+--     FROM positions WHERE status='open'
+--     GROUP BY 1,2 HAVING COUNT(*) > 1;
+--
+-- Do NOT resolve duplicates by closing rows at an invented price - that writes
+-- a fictional P&L into paper_trades and, via §15's reconciliation, into the
+-- learning tables. Decide which row is real, and delete the other outright.
+
+-- ── The invariant ───────────────────────────────────────────────────────────
+-- PARTIAL (WHERE status = 'open'): the constraint is about what is held now,
+-- not about what was ever held, so the history of closed positions in the same
+-- ticker is untouched.
+--
+-- COALESCE(simulated, 0): rows predating the simulated column have it NULL,
+-- and NULL is not equal to anything in a unique index - including itself - so
+-- an unwrapped column would let a NULL-book row duplicate freely. Every
+-- book-sensitive query in storage/database.py already COALESCEs for the same
+-- reason; the index has to agree with them or it constrains a different
+-- grouping than the code reads.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_open_position_per_ticker_book
+    ON positions (ticker, (COALESCE(simulated, 0)))
+    WHERE status = 'open';
+
+-- ── What this does NOT cover ────────────────────────────────────────────────
+-- A uniqueness constraint cannot express "too many rows", so it cannot enforce
+-- max_positions. That is done in storage/database.try_open_position() with a
+-- transaction-scoped advisory lock (pg_advisory_xact_lock). The remediation
+-- plan specifies SELECT ... FOR UPDATE there; that was changed deliberately,
+-- because FOR UPDATE locks the rows it finds and there are no rows to lock at
+-- 0-of-25 - the state every trading day starts in.
+--
+-- Nor does it cover the purse. Two concurrent buys reading $100 and both
+-- spending it is the same bug in a different table; see
+-- try_debit_paper_cash(), whose WHERE clause makes the check and the write one
+-- statement.
+
+-- ── BACKWARD ────────────────────────────────────────────────────────────────
+-- DROP INDEX IF EXISTS uq_open_position_per_ticker_book;
+--
+-- Dropping this re-opens the race. storage/database.py recreates it on every
+-- Database() construction (_ensure_open_position_uniqueness), so a rollback
+-- also means pinning to a build that predates that call - otherwise the next
+-- process start puts it back.

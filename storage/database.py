@@ -79,6 +79,22 @@ def is_unmanaged_mode(trade_mode) -> bool:
     return str(trade_mode or "").upper() in MANAGED_EXCLUDED_MODES
 
 
+# §14: the advisory-lock key that serialises position-opening. Any constant
+# works as long as nothing else in this database picks the same one; a literal
+# is used rather than hashtext('...') so the value is greppable and stable
+# across Postgres versions. The second key slot carries the book (0 = live,
+# 1 = paper), so the two books never wait on each other.
+_OPEN_POSITION_LOCK_KEY = 0x7B0DEB17
+
+
+class _PositionRaceLost(Exception):
+    """Internal. Raised inside try_open_position()'s transaction so that a
+    lost race rolls back any cash already debited in the same transaction,
+    and caught immediately by its caller. Never escapes this module - losing
+    a race is a normal outcome that the public method reports by returning
+    None, not an error condition."""
+
+
 def _local_day_window_utc(day: date = None) -> tuple:
     """[start, end) in naive-UTC isoformat for one LOCAL calendar day.
 
@@ -835,6 +851,14 @@ class Database:
             self._migrate_rotation_log(conn)
             self._migrate_phase1_columns(conn)
 
+        # LAST, and deliberately on its own transaction. This is the only
+        # statement in init_db that can legitimately fail on existing DATA
+        # rather than on schema, and in Postgres a failed statement aborts the
+        # whole transaction it is in - so running it above would mean one
+        # pre-existing duplicate position silently rolled back every migration
+        # that preceded it. See the method for what it does when it fails.
+        self._ensure_open_position_uniqueness()
+
     def _migrate_phase1_columns(self, conn):
         """Phase 1 (§5, §17). Mirrors migrations/002 and 003 so that a FRESH
         database converges to the same schema as a migrated one.
@@ -943,6 +967,41 @@ class Database:
             realized_pnl REAL,
             n_open INTEGER
         )""")
+
+    def _ensure_open_position_uniqueness(self):
+        """The §14 invariant, as a structural guarantee: at most one OPEN
+        position per (ticker, book). Mirrors migrations/006.
+
+        Partial (WHERE status = 'open') so the history of closed positions in
+        the same ticker is unaffected - the constraint is about what is held
+        now, not about what was ever held.
+
+        Creating it can FAIL, on exactly one condition: the table already
+        contains duplicates. That is not a reason to take the process down -
+        scheduler.py, server.py and main.py each construct a Database() at
+        startup, and refusing to boot would take the UI with it, including the
+        page an operator would use to look at the duplicates. So it logs
+        CRITICAL with the query that finds them and carries on WITHOUT the
+        index, which means the race stays open until someone reconciles the
+        book.
+
+        scripts/reconcile.py (§15) checks for the index's absence directly, so
+        this cannot degrade quietly into a log line nobody reads.
+        """
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS uq_open_position_per_ticker_book
+                       ON positions (ticker, (COALESCE(simulated, 0)))
+                       WHERE status = 'open'""")
+        except Exception as e:
+            logger.critical(
+                "§14: could NOT create uq_open_position_per_ticker_book - the "
+                "duplicate-position race is still open on this database. "
+                "Almost certainly duplicates already exist; find them with:\n"
+                "  SELECT ticker, COALESCE(simulated,0) AS book, COUNT(*) "
+                "FROM positions WHERE status='open' GROUP BY 1,2 HAVING COUNT(*) > 1;\n"
+                f"  underlying error: {e}")
 
     def _migrate_market_mood_columns(self, conn):
         """News tab follow-up (2026-07-14) - latest_regime gains fear/greed +
@@ -2455,15 +2514,200 @@ class Database:
     def open_position(self, ticker: str, entry_price: float, shares: float, dollar_amount: float,
                        pattern_id: int = None, simulated: bool = False, entry_time: str = None,
                        trade_mode: str = None):
+        """Unconditional open. Returns the new row id, or None if this book
+        already holds an open position in this ticker.
+
+        The ON CONFLICT clause was added with §14's unique index. It is
+        deliberately DO NOTHING rather than letting the constraint raise,
+        because of where the live callers sit: engine/live_trader.py calls
+        this AFTER a real order has filled, and confirm_fill.py after a human
+        has confirmed one. An exception there would mean a fill that happened
+        and was never recorded, which is a strictly worse outcome than the
+        duplicate the index exists to prevent - the account would hold shares
+        the system had no row for.
+
+        So the collision is survivable and LOUD instead. Callers that care -
+        anything that needs to know it actually got the position - should use
+        try_open_position(), which takes the lock, enforces the cap and settles
+        the purse in the same transaction.
+        """
         with self._conn() as conn:
-            conn.execute(
+            row = conn.execute(
                 """INSERT INTO positions
                 (ticker, entry_price, entry_time, shares, dollar_amount, trail_high, status, pattern_id, simulated, trade_mode)
-                VALUES (?,?,?,?,?,?, 'open', ?, ?, ?)""",
+                VALUES (?,?,?,?,?,?, 'open', ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                RETURNING id""",
                 (ticker, entry_price, entry_time or datetime.utcnow().isoformat(), shares,
                  dollar_amount, entry_price, pattern_id, 1 if simulated else 0,
                  trade_mode.upper() if trade_mode else None),
-            )
+            ).fetchone()
+        if row is None:
+            logger.critical(
+                f"open_position({ticker}, simulated={simulated}, "
+                f"trade_mode={trade_mode}): this book ALREADY holds an open "
+                f"{ticker} - no row written. If a real fill preceded this "
+                f"call, the account now holds more {ticker} than the existing "
+                f"position row records. Reconcile by hand; "
+                f"scripts/reconcile.py will not catch this one, because the "
+                f"row that is there looks perfectly consistent.")
+            return None
+        return row[0] if not isinstance(row, dict) else row.get("id")
+
+    # ── §14 (Phase 2): opening a position is ONE transaction ────────────────
+    #
+    # execute_buy() used to read get_open_position() at line 113 and call
+    # open_position() at line 215 - two separate auto-committed transactions,
+    # running inside a ThreadPoolExecutor with cycle_max_parallel_tickers: 6.
+    # The max_positions count had the same shape, and so did the cash check.
+    # A repo-wide grep for CREATE UNIQUE across this file returned exactly one
+    # hit, on news_items(ticker, headline). Nothing protected positions.
+    #
+    # Two workers processing the same ticker in one cycle, or six workers each
+    # reading open_count = 24 against a cap of 25, all passed the check and all
+    # wrote. The window widened on 17 July, when the process-level lock that
+    # once wrapped every _conn() call was removed to fix an unrelated hang -
+    # the right call for the hang, but it took away incidental serialisation
+    # without replacing it with real protection.
+    #
+    # Application-level checks cannot fix this. Only the database can.
+
+    def try_debit_paper_cash(self, amount: float, conn=None) -> bool:
+        """Conditional debit. Returns False if the purse could not cover it.
+
+        The WHERE clause does the check, so the read and the write are the
+        same statement and cannot be interleaved. execute_buy() previously
+        read account['cash'], compared it to the amount, and called
+        adjust_paper_cash(-amount) some 25 lines later: two concurrent buys
+        could both see $100 and both spend it.
+
+        `conn` lets a caller run this inside an existing transaction - which
+        is how try_open_position() makes the debit and the insert succeed or
+        fail together, rather than leaving a position that was never paid for
+        or cash that bought nothing.
+        """
+        if amount is None or amount <= 0:
+            return False
+        sql = ("UPDATE paper_account SET cash = cash - ?, updated_at = ? "
+               "WHERE id = 1 AND cash >= ?")
+        params = (amount, datetime.utcnow().isoformat(), amount)
+        if conn is not None:
+            return conn.execute(sql, params).rowcount == 1
+        with self._conn() as c:
+            return c.execute(sql, params).rowcount == 1
+
+    def try_open_position(self, *args, **kwargs):
+        """Open a position, or return None. One transaction.
+
+        None means "another worker won" - the duplicate check, the cap check,
+        the cash debit and the insert cannot be interleaved, so the loser of
+        a race gets an empty result rather than an exception. That matters:
+        catching IntegrityError as flow control would put the normal path
+        inside an exception handler.
+
+        Three protections, because there are three distinct ways to get this
+        wrong and no single mechanism covers all of them:
+
+          A transaction-scoped ADVISORY LOCK serialises position-opening for
+          this book, which is what makes the duplicate check and the cap check
+          below mean anything. Note this is NOT the SELECT ... FOR UPDATE the
+          remediation plan specifies, and the difference is load-bearing: FOR
+          UPDATE locks the rows it finds, so it serialises correctly at
+          24-of-25 but not at 0-of-25, where there are no rows to lock and six
+          workers can all insert. An advisory lock is the one mechanism that
+          still holds when the table is empty - which is the state every
+          trading day starts in.
+
+          The partial UNIQUE INDEX uq_open_position_per_ticker_book (migration
+          006) makes the invariant structural rather than procedural. Under
+          the lock above it should never fire from this method; it is here for
+          the paths that do not take the lock (open_position, account_sync,
+          confirm_fill) and for the next one somebody writes. ON CONFLICT DO
+          NOTHING ... RETURNING means the loser of such a race gets an empty
+          result instead of an exception.
+
+          The CASH is protected by try_debit_paper_cash's conditional UPDATE,
+          run on this same connection so that if the insert then yields
+          nothing, the rollback takes the debit with it and the purse is never
+          charged for a position that does not exist.
+
+        `excluded_modes` defaults to SEED only, matching execute_buy: SEED
+        rows are an informational mirror of the real account, and counting
+        them toward max_positions would starve out genuine signals just
+        because the real book happens to hold a lot of names. SYNC cannot
+        appear in the paper book; a live caller should pass
+        MANAGED_EXCLUDED_MODES.
+        """
+        try:
+            return self._try_open_position_txn(*args, **kwargs)
+        except _PositionRaceLost:
+            # Losing is a normal outcome, not an error. The exception exists
+            # only so the transaction rolls back; it stops here.
+            return None
+
+    def _try_open_position_txn(self, ticker: str, entry_price: float, shares: float,
+                               dollar_amount: float, pattern_id: int = None,
+                               simulated: bool = False, entry_time: str = None,
+                               trade_mode: str = None, max_positions: int = None,
+                               excluded_modes: tuple = ("SEED",),
+                               debit_paper_cash: float = None):
+        """The transaction itself. See try_open_position() for the reasoning."""
+        sim = 1 if simulated else 0
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+
+            # Transaction-scoped, so it is released on commit OR rollback with
+            # no explicit unlock. A lock that has to be unwound by hand is one
+            # that leaks the first time something raises between the two calls.
+            conn.execute("SELECT pg_advisory_xact_lock(?, ?)",
+                         (_OPEN_POSITION_LOCK_KEY, sim))
+
+            if conn.execute(
+                    "SELECT 1 FROM positions WHERE ticker = ? AND status = 'open' "
+                    "AND COALESCE(simulated, 0) = ? LIMIT 1",
+                    (ticker, sim)).fetchone():
+                return None
+
+            if max_positions is not None:
+                rows = conn.execute(
+                    "SELECT trade_mode FROM positions "
+                    "WHERE status = 'open' AND COALESCE(simulated, 0) = ?",
+                    (sim,)).fetchall()
+                excluded = tuple(m.upper() for m in (excluded_modes or ()))
+                counted = [r for r in rows
+                           if str(r["trade_mode"] or "").upper() not in excluded]
+                if len(counted) >= max_positions:
+                    return None
+
+            if debit_paper_cash is not None and not self.try_debit_paper_cash(
+                    debit_paper_cash, conn=conn):
+                return None
+
+            row = conn.execute(
+                """INSERT INTO positions
+                   (ticker, entry_price, entry_time, shares, dollar_amount,
+                    trail_high, status, pattern_id, simulated, trade_mode)
+                   VALUES (?,?,?,?,?,?, 'open', ?, ?, ?)
+                   ON CONFLICT DO NOTHING
+                   RETURNING *""",
+                (ticker, entry_price, entry_time or datetime.utcnow().isoformat(),
+                 shares, dollar_amount, entry_price, pattern_id, sim,
+                 trade_mode.upper() if trade_mode else None)).fetchone()
+
+            if row is None:
+                # Only reachable if something outside this method inserted the
+                # row while the lock was held - i.e. a path that bypasses the
+                # lock. Roll back so the debit above does not stand alone, and
+                # say so loudly: this is the index doing a job the lock was
+                # supposed to have made unnecessary.
+                logger.error(
+                    f"try_open_position({ticker}, simulated={simulated}): the "
+                    f"unique index rejected the insert while the advisory lock "
+                    f"was held. Some other code path opens positions without "
+                    f"taking it - find it.")
+                raise _PositionRaceLost(ticker)
+
+            return dict(row)
 
     def close_position(self, ticker: str, exit_price: float, simulated: bool = False) -> dict:
         """Returns the closed position's details (entry_price, entry_time, shares,

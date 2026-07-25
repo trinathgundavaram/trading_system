@@ -433,8 +433,28 @@ def execute_buy_live(db, cfg: dict, ticker: str, price: float, position_size=Non
             qty = amount / fill_price if fill_price else 0
         breaker.record(True)
         trade_mode = (trade_mode or cfg.get("trading", {}).get("mode", "SWING")).upper()
-        db.open_position(ticker, fill_price, qty, round(fill_price * qty, 2),
-                          pattern_id=pattern_id, simulated=False, trade_mode=trade_mode)
+        # §14: open_position returns None when this book already holds an open
+        # position in this ticker - the unique index refusing a duplicate. The
+        # pre-check at the top of this function makes that near-impossible
+        # here, but "near-impossible after a real fill" is the case worth
+        # naming: the order HAS filled, so the account holds shares regardless
+        # of what the positions table says. Alert rather than continue
+        # silently; the seeding below would otherwise write this fill's stop
+        # onto the pre-existing row, which is the §16 failure in a new place.
+        if db.open_position(ticker, fill_price, qty, round(fill_price * qty, 2),
+                            pattern_id=pattern_id, simulated=False,
+                            trade_mode=trade_mode) is None:
+            try:
+                from engine.notifications import send_critical
+                send_critical(
+                    "LIVE FILL NOT RECORDED",
+                    f"{ticker}: bought {qty} @ ${fill_price} but the live book "
+                    f"already had an open {ticker}. The fill is real and the "
+                    f"position row is not. Reconcile by hand before trading "
+                    f"this name again.")
+            except Exception as e:
+                logger.error(f"could not send the unrecorded-fill alert: {e}")
+            return {}
         if entry_seed:
             # 2026-07-20: same entry-context seeding confirm_fill.py already
             # does for the manual live-confirm path (entry_signal_score/
