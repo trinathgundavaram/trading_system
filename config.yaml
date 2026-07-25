@@ -642,12 +642,12 @@ backtest:
   - KEY
   - PBR-A
   - MO
-# The `ui:` section is gone entirely (v1.1.1), key included - a bare `ui:` with
+# The `ui:` section is gone entirely (v1.2.0), key included - a bare `ui:` with
 # only comments under it parses as None, and `cfg.get("ui", {})` then returns
 # None rather than {}, which crashes on the next .get(). An absent key is
 # safer than an empty one.
 #
-# auth_token REMOVED from this file (v1.1.1).
+# auth_token REMOVED from this file (v1.2.0).
 #
 # Phase 0 step 0.2 turned a literal token into ${UI_AUTH_TOKEN}. §4 then
 # moved the ACTUAL lookup to storage/secrets.py, so nothing has read

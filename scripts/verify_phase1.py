@@ -147,7 +147,7 @@ def main() -> int:
         check("every money/config write route is guarded", must <= guarded,
               f"unguarded: {sorted(must - guarded)}" if must - guarded else
               f"{len(guarded)}/{len(rows)} write routes guarded")
-        # v1.1.1 closed the last eight. This is now a FAIL, not a warning: a
+        # v1.2.0 closed the last eight. This is now a FAIL, not a warning: a
         # new unguarded write route is a regression, and the whole point of
         # the require_token dependency is that it cannot be forgotten.
         open_routes = sorted(p for p, a in rows if not a)

@@ -115,7 +115,7 @@ def test_every_write_route_is_guarded():
     tenth write endpoint ships unauthenticated. Any route added to the list
     below must carry the dependency.
 
-    As of v1.1.1 this is EVERY write route, not a chosen subset. The eight
+    As of v1.2.0 this is EVERY write route, not a chosen subset. The eight
     that were left open through v1.1.0 (run_now, cancel, validate,
     evaluate_now, backtest/run, alerts/resolve, prompt/copy,
     threshold_regret/run) are now guarded too, and the UI sends the header via

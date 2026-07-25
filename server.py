@@ -161,10 +161,10 @@ connected_clients: list = []
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    """The single-page dashboard, served with caching DISABLED (v1.1.1).
+    """The single-page dashboard, served with caching DISABLED (v1.2.0).
 
     This response previously carried no cache headers, so browsers cached the
-    page indefinitely. That is how v1.1.1 shipped and appeared not to work: the
+    page indefinitely. That is how v1.2.0 shipped and appeared not to work: the
     server required a token on /api/cycle/run_now while the browser was still
     running the PREVIOUS index.html, which had no authFetch(), never sent the
     header, and therefore never prompted for a token. The symptom was a

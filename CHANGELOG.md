@@ -20,11 +20,17 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
-## [1.11] — v1.1.1 — 2026-07-25
+## [1.2] — v1.2.0 — 2026-07-25
 
-### Decision function: unchanged
+### Decision function: unchanged — v1.0.x/v1.1.0 trade data remains poolable
 
-Bug fix. Full note: [docs/releases/v1.1.1.md](docs/releases/v1.1.1.md).
+A **minor** bump, not a patch. `scripts/classify_change.py` reports MINOR
+because `server.py` is a behaviour path, and it is right: requiring auth on
+eight routes and disabling dashboard caching change what you observe, even
+though no scoring, sizing or exit logic moved. Shipping this as a patch would
+have meant overriding the classifier on its first real disagreement.
+
+Full note: [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md).
 
 ### Security
 
