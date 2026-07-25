@@ -17,6 +17,18 @@ from engine import paper_trader, rotation
 CFG = {
     "trading": {"watch_execute": "WATCH", "trade_size_usd": 100, "max_positions": 2},
     "paper_trading": {"starting_cash": 1000.0},
+    # §10 put the risk gate inside execute_buy - see test_paper_trading.py's
+    # CFG for why these are stated rather than defaulted. Wide open: rotation
+    # is about which position gets closed to make room, not about whether the
+    # daily budget allows it.
+    "risk": {
+        "kill_switch_triggered": False,
+        "max_trades_per_day": 1000,
+        "max_daily_loss_usd": 1_000_000,
+        "max_daily_loss_pct": 0,
+        "max_intraday_drawdown_pct": 0,
+        "max_running_drawdown_pct": 0,
+    },
     "rotation": {
         "enabled": True,
         "min_candidate_score": 85,

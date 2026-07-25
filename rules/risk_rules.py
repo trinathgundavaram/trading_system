@@ -218,13 +218,31 @@ class RiskEngine:
 
     def check(self) -> dict:
         cfg = self.cfg
-        if (cfg.get("risk", {}) or {}).get("kill_switch_triggered"):
+        risk = cfg.get("risk", {}) or {}
+        if risk.get("kill_switch_triggered"):
             return {"can_trade": False, "reason": "Kill switch is ON"}
 
         book = "paper" if self.simulated else "live"
 
+        # A config with no `risk` section is a BROKEN config, not a config with
+        # no limits. This method was half-defensive: the kill-switch read above
+        # used .get() and the very next line indexed cfg["risk"] directly, so a
+        # missing section raised KeyError from inside execute_buy - where
+        # scheduler.py's try/except logs it as "paper buy failed". A risk
+        # misconfiguration presenting as a buy failure is the wrong diagnosis
+        # on the wrong line.
+        #
+        # Fails CLOSED and says why. The alternative - .get() with a default
+        # limit - would let a truncated or hand-edited config silently
+        # substitute limits nobody chose, which is the failure mode §8 exists
+        # to prevent.
+        if "max_trades_per_day" not in risk:
+            return {"can_trade": False,
+                    "reason": "config has no risk.max_trades_per_day - refusing "
+                              "to trade against limits nobody set"}
+
         trades_today = self.db.trades_placed_today(self.simulated)
-        max_trades = int(cfg["risk"]["max_trades_per_day"])
+        max_trades = int(risk["max_trades_per_day"])
         if trades_today >= max_trades:
             return {"can_trade": False,
                     "reason": f"{trades_today}/{max_trades} {book} trades today"}

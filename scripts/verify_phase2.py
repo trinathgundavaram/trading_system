@@ -234,13 +234,39 @@ def main() -> int:
                 clean = conn.execute(
                     "SELECT COUNT(*) FROM mae_mfe_data "
                     "WHERE COALESCE(data_quality,'ok') = 'ok'").fetchone()[0]
-                # Not a FAIL either way - this reports the state of the
-                # evidence. Roughly zero clean rows is the expected and honest
-                # position after the sweep, not a problem to fix.
-                check("mae_mfe_data quarantine has been run", None,
-                      f"{quarantined} quarantined, {clean} clean. Zero clean "
-                      f"rows is expected after migration 007 - it means there "
-                      f"is no untainted learning data yet, which is true.")
+                # The column existing proves only that the SCHEMA half of 007
+                # ran - storage/database.py self-heals that on every startup.
+                # The sweep is the data half and lives solely in the .sql file,
+                # so it has to be applied by hand and can be missed.
+                #
+                # Distinguishing the two states matters. "0 quarantined, 30
+                # clean" against a table known to contain a ticker called AAA
+                # means the sweep has NOT run, and reporting that as the
+                # expected end state would have been the reassuring answer to
+                # a question nobody had asked properly.
+                stale = conn.execute(
+                    """SELECT COUNT(*) FROM mae_mfe_data
+                        WHERE COALESCE(data_quality,'ok') = 'ok'
+                          AND (hold_hours < 0.01
+                               OR (COALESCE(mae_pct,0) = 0 AND COALESCE(mfe_pct,0) = 0
+                                   AND COALESCE(outcome_pct,0) <> 0)
+                               OR recorded_at < '2026-07-20T00:00:00')"""
+                ).fetchone()[0]
+                if stale:
+                    check("migration 007's sweep has been applied", False,
+                          f"{stale} row(s) still marked 'ok' that the sweep "
+                          f"would quarantine ({quarantined} quarantined, "
+                          f"{clean} clean). The COLUMN exists because "
+                          f"storage/database.py self-heals the schema; the "
+                          f"DATA half only runs when you apply the file:\n"
+                          f"           psql \"$POSTGRES_DB\" -f "
+                          f"migrations/007_learning_data_quarantine.sql")
+                else:
+                    check("migration 007's sweep has been applied", None,
+                          f"{quarantined} quarantined, {clean} clean. Near-zero "
+                          f"clean rows is the expected end state - it means "
+                          f"there is no untainted learning data yet, which is "
+                          f"true and is not a number to make go up.")
         except Exception as e:
             check("database checks ran", None,
                   f"{str(e)[:200]}\n         (run without --no-db against the "

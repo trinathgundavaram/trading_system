@@ -19,6 +19,23 @@ from engine import paper_trader
 CFG = {
     "trading": {"watch_execute": "WATCH", "trade_size_usd": 100, "max_positions": 3},
     "paper_trading": {"starting_cash": 500.0},
+    # §10 put the risk gate INSIDE execute_buy, so every test that exercises a
+    # paper buy now runs through RiskEngine and has to declare the risk posture
+    # it is testing under. Stated explicitly rather than left to defaults: a
+    # test asserting purse arithmetic should fail if a limit blocks the buy,
+    # not quietly pass because the limit was generous.
+    #
+    # Limits are wide open here on purpose - these tests are about accounting
+    # and position mechanics. The limits themselves are tested in
+    # test_daily_budget.py and test_drawdown.py.
+    "risk": {
+        "kill_switch_triggered": False,
+        "max_trades_per_day": 1000,
+        "max_daily_loss_usd": 1_000_000,
+        "max_daily_loss_pct": 0,
+        "max_intraday_drawdown_pct": 0,
+        "max_running_drawdown_pct": 0,
+    },
 }
 
 

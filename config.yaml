@@ -100,17 +100,45 @@ risk:
   # (daily_stats.paper_max_drawdown / paper_running_drawdown, written by
   # storage/database.update_drawdown on every equity point).
   #
-  # 3.0 is 1.5x the 2.0% daily-loss percentage above, deliberately: intraday
-  # excursion is always wider than the realised figure, so a cap set equal to
-  # it would fire on days that ended fine. Set from the backfill over the
-  # existing curve (scripts/backfill_drawdown.py prints the observed
-  # distribution) rather than guessed - re-check it once there is more than
-  # one day of history and tighten if 3.0 never binds.
-  max_intraday_drawdown_pct: 3.0     # halt for the day
+  # 2.0, set from the MEASUREMENT rather than from an argument.
+  #
+  # This was 3.0 on the reasoning that intraday excursion runs wider than the
+  # realised figure, so the cap should sit above the 2.0% daily-loss
+  # percentage. Then scripts/backfill_drawdown.py was run against the real
+  # curve - 371 equity points over 8 local days - and reported:
+  #
+  #     median intraday drawdown  0.17%
+  #     worst                     1.25%   (2026-07-16)
+  #
+  # 3.0% therefore had never bound and would not have halted anything. That
+  # is the precise failure §18 is about: a limit that is never measured and
+  # never fires is documentation, not risk management.
+  #
+  # 2.0 is ~1.6x the worst day observed. Above it, so a normal session is
+  # untouched; close enough that an abnormal one is actually caught.
+  #
+  # PROVISIONAL, and honestly so. Eight days of a barely-trading account is
+  # not a distribution, and the sample includes days whose equity curve was
+  # disturbed by the 2026-07-25 account re-seed. Re-run the backfill after ~20
+  # real sessions and set this from the wider sample; expect to RAISE it as
+  # position sizes grow, since a $100 entry cannot move a $1,000 book far.
+  max_intraday_drawdown_pct: 2.0     # halt for the day
   # 15% from the all-time high is not a bad day, it is the strategy having
   # stopped working. Halts entirely; clearing it is a human act, same as the
   # kill switch, because the one thing an automatic breaker must never do is
   # re-arm itself overnight.
+  #
+  # UNVALIDATED, unlike the intraday figure above. The account has never been
+  # more than ~1.6% off its peak, so there is no observed distribution to set
+  # this from - 15% is a judgement about how much of the book you are willing
+  # to lose before a human looks, not a measurement.
+  #
+  # The peak it measures against is scoped to the CURRENT paper-account epoch
+  # (storage/database._paper_epoch_start). Before that scoping existed, the
+  # 2026-07-25 re-seed - which stepped the curve from ~984 to 1491.54 - made
+  # the re-seed the all-time high, so every later day read a ~34% running
+  # drawdown and this cap would have tripped the kill switch on the next
+  # cycle for an accounting event.
   max_running_drawdown_pct: 15.0     # halt entirely, human review required
 
   max_trades_per_day: 10

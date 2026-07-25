@@ -3128,9 +3128,35 @@ class Database:
                 if peak > 0:
                     intraday_dd = max(intraday_dd, (peak - v) / peak * 100)
 
-            all_time_peak = float(conn.execute(
-                "SELECT MAX(total_value) FROM paper_equity_history").fetchone()[0]
-                or eq[-1])
+            # The peak is taken over the CURRENT ACCOUNT EPOCH, not over the
+            # whole table (2026-07-25, found by running the backfill against
+            # real data).
+            #
+            # reset_paper_account() and robinhood_sync's re-seed replace the
+            # purse but paper_equity_history survives, so the curve can step
+            # discontinuously: on this machine it ran at ~984 for eight days
+            # and then jumped to 1491.54 when the account was re-seeded at a
+            # higher balance. An all-table MAX makes that jump the all-time
+            # high, so every subsequent day reads a ~34% running drawdown
+            # against a 15% cap - and since a running breach trips the kill
+            # switch, the next cycle would have halted trading entirely on the
+            # strength of an accounting event.
+            #
+            # An equity series from a different starting balance is a
+            # different series. Comparing them produces a drawdown that never
+            # happened, which is the same class of error as the market_value
+            # equity bug: a number that is arithmetically derived, obviously
+            # wrong to a human, and completely invisible to the control that
+            # consumes it.
+            epoch = self._paper_epoch_start()
+            if epoch:
+                peak_row = conn.execute(
+                    "SELECT MAX(total_value) FROM paper_equity_history "
+                    "WHERE timestamp >= ?", (epoch,)).fetchone()
+            else:
+                peak_row = conn.execute(
+                    "SELECT MAX(total_value) FROM paper_equity_history").fetchone()
+            all_time_peak = float(peak_row[0] or eq[-1])
             running_dd = (((all_time_peak - eq[-1]) / all_time_peak * 100)
                           if all_time_peak > 0 else 0.0)
             running_dd = max(0.0, running_dd)
@@ -3161,6 +3187,28 @@ class Database:
         return {"date": today, "paper_max_drawdown": intraday_dd,
                 "paper_running_drawdown": running_dd}
 
+    def _paper_epoch_start(self) -> str | None:
+        """When the CURRENT paper account was created, as a naive-UTC string.
+
+        The boundary for running drawdown (§11). paper_account is a single row
+        that reset_paper_account() deletes and the next seed recreates, so
+        created_at marks the start of the equity series that is actually
+        comparable to today. paper_equity_history is NOT cleared by that reset,
+        which is why the boundary has to be consulted rather than assumed.
+
+        Returns None when there is no account or no created_at, in which case
+        callers fall back to the whole table - a missing boundary should widen
+        the window, not silently empty it.
+        """
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT created_at FROM paper_account WHERE id = 1").fetchone()
+            return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.warning(f"could not read the paper-account epoch: {e}")
+            return None
+
     def backfill_drawdown(self) -> int:
         """Recompute paper drawdown for EVERY day in paper_equity_history.
 
@@ -3179,6 +3227,17 @@ class Database:
 
         by_day, running_peak, written = {}, 0.0, 0
         offset = datetime.utcnow() - datetime.now()   # naive UTC->local, as elsewhere
+        # Same epoch boundary as update_drawdown. Points from before the
+        # current account was created belong to a different equity series, and
+        # carrying their peak forward manufactures a drawdown that never
+        # happened - see update_drawdown for the 1491.54 case that found this.
+        epoch = self._paper_epoch_start()
+        epoch_day = None
+        if epoch:
+            try:
+                epoch_day = (datetime.fromisoformat(epoch) - offset).date().isoformat()
+            except (TypeError, ValueError):
+                epoch_day = None
         for r in rows:
             try:
                 local_day = (datetime.fromisoformat(r["timestamp"]) - offset).date().isoformat()
@@ -3195,6 +3254,12 @@ class Database:
                 peak = max(peak, v)
                 if peak > 0:
                     intraday_dd = max(intraday_dd, (peak - v) / peak * 100)
+            # The running peak RESETS at the epoch boundary. A re-seeded
+            # account starts a new series; letting the old one's peak carry
+            # across is what would have read a 34% drawdown on day one of the
+            # new account and tripped the kill switch.
+            if epoch_day and day == epoch_day:
+                running_peak = 0.0
             # All-time peak AS OF that day, not as of now: a backfill that used
             # today's peak would report drawdowns the account had not yet had
             # any way of experiencing.

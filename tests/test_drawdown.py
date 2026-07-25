@@ -288,6 +288,56 @@ def test_backfill_uses_the_peak_as_of_each_day(db):
     assert rows[first]["paper_running_drawdown"] == pytest.approx(0.0, abs=1e-3)
 
 
+def test_running_drawdown_ignores_a_pre_reset_peak(db):
+    """THE test for the 2026-07-25 finding, and it is a real one - the backfill
+    on the live database produced exactly this shape.
+
+    The curve ran at ~984 for eight days, the paper account was re-seeded at a
+    higher balance, and the next point was 1491.54. Taking MAX over the whole
+    table makes that jump the all-time high, so every later day reads a ~34%
+    running drawdown against a 15% cap. A running breach trips the KILL
+    SWITCH, so the next cycle would have halted trading entirely on the
+    strength of an accounting event.
+
+    An equity series from a different starting balance is a different series.
+    """
+    # Old epoch: a high-water mark that no longer belongs to this account.
+    _equity(db, [1491.54, 1491.54], day_offset=-2)
+    # The account is (re-)created now, starting the current epoch.
+    db.init_paper_account(1000.0)
+    _equity(db, [1000.0, 984.0])
+
+    db.update_drawdown(simulated=True)
+    dd = db.get_daily_stats()["paper_running_drawdown"]
+    assert dd == pytest.approx(1.6, abs=0.1)      # 984 off a 1000 peak
+    assert dd < 15.0                              # would NOT trip the breaker
+
+
+def test_backfill_resets_the_running_peak_at_the_epoch(db):
+    _equity(db, [1491.54, 1491.54], day_offset=-2)
+    db.init_paper_account(1000.0)
+    _equity(db, [1000.0, 984.0], day_offset=0)
+    db.backfill_drawdown()
+
+    today = datetime.now().date().isoformat()
+    with db._conn() as conn:
+        conn.row_factory = __import__("sqlite3").Row
+        row = dict(conn.execute(
+            "SELECT paper_running_drawdown FROM daily_stats WHERE date = ?",
+            (today,)).fetchone())
+    assert row["paper_running_drawdown"] < 15.0
+
+
+def test_missing_epoch_falls_back_to_the_whole_table(db):
+    """A missing boundary must WIDEN the window, not empty it. Returning no
+    peak at all would report a 0% drawdown forever, which is the reassuring
+    answer and the wrong one."""
+    _equity(db, [1000.0, 900.0])
+    assert db._paper_epoch_start() is None        # no account seeded
+    db.update_drawdown(simulated=True)
+    assert db.get_daily_stats()["paper_running_drawdown"] == pytest.approx(10.0, abs=0.1)
+
+
 def test_unpriced_cycle_does_not_manufacture_a_drawdown(db):
     """The §8 lesson, applied here. snapshot() carries unpriced positions at
     COST, so a cycle with no quotes must not read as a portfolio that lost all
