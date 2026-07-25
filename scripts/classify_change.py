@@ -65,7 +65,24 @@ BEHAVIOUR_PATHS = (
 
 
 def _git(*args) -> str:
-    return subprocess.run(["git", *args], capture_output=True, text=True).stdout
+    """Run git, and FAIL if git failed.
+
+    This used to return .stdout unconditionally. An unknown base ref - a
+    mistyped tag, or a release note referring to a tag that has not been cut
+    yet - produced an empty file list, no files matched any rule, and the
+    function returned PATCH. The most reassuring possible answer, from a
+    command that had not managed to read the diff at all.
+
+    A classifier whose failure mode is "everything is fine" is worse than no
+    classifier, because release.sh only prompts when the suggestion is MAJOR.
+    """
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(
+            f"classify_change: git {' '.join(args)} failed:\n"
+            f"{r.stderr.strip()}\n"
+            f"Refusing to guess - a bad base ref must not be reported as PATCH.")
+    return r.stdout
 
 
 def classify(base_ref: str) -> str:
