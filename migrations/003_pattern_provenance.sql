@@ -24,7 +24,10 @@
 --
 -- Purely additive, both nullable, no default. rollback_safe: true.
 --
--- Apply:    psql "$POSTGRES_DB" -f migrations/003_pattern_provenance.sql
+-- Apply:    ./scripts/apply_migration.sh migrations/003_pattern_provenance.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
 -- Rollback: see the commented block at the bottom.
 
 ALTER TABLE pattern_database ADD COLUMN IF NOT EXISTS engine_version     TEXT;

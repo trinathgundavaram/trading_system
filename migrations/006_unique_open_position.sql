@@ -22,7 +22,10 @@
 -- still read this database. What it cannot do is write a duplicate, which is
 -- the point.
 --
--- Apply:    psql "$POSTGRES_DB" -f migrations/006_unique_open_position.sql
+-- Apply:    ./scripts/apply_migration.sh migrations/006_unique_open_position.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
 -- Rollback: see the commented block at the bottom.
 
 -- ── FIRST: does the book already violate the invariant? ─────────────────────

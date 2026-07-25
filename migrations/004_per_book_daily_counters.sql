@@ -17,7 +17,10 @@
 --
 -- Purely additive, all defaulted. rollback_safe: true.
 --
--- Apply:    psql "$POSTGRES_DB" -f migrations/004_per_book_daily_counters.sql
+-- Apply:    ./scripts/apply_migration.sh migrations/004_per_book_daily_counters.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
 -- Rollback: see the commented block at the bottom.
 
 ALTER TABLE daily_stats ADD COLUMN IF NOT EXISTS paper_trades_placed  INTEGER DEFAULT 0;

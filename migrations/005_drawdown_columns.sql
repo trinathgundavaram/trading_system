@@ -16,7 +16,10 @@
 --
 -- Purely additive, all defaulted. rollback_safe: true.
 --
--- Apply:    psql "$POSTGRES_DB" -f migrations/005_drawdown_columns.sql
+-- Apply:    ./scripts/apply_migration.sh migrations/005_drawdown_columns.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
 -- Rollback: see the commented block at the bottom.
 
 ALTER TABLE daily_stats ADD COLUMN IF NOT EXISTS running_drawdown        REAL DEFAULT 0;

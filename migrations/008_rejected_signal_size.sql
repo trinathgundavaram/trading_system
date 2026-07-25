@@ -16,7 +16,10 @@
 --
 -- Purely additive, nullable. rollback_safe: true.
 --
--- Apply:    psql "$POSTGRES_DB" -f migrations/008_rejected_signal_size.sql
+-- Apply:    ./scripts/apply_migration.sh migrations/008_rejected_signal_size.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
 -- Rollback: see the commented block at the bottom.
 
 ALTER TABLE rejected_signals ADD COLUMN IF NOT EXISTS would_have_size REAL;

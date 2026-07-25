@@ -16,7 +16,10 @@
 -- database sees NULL stops on SYNC/SEED rows, which is precisely the
 -- behaviour intended, and sees two extra columns it ignores.
 --
--- Apply:    psql "$POSTGRES_DB" -f migrations/002_quarantine_unmanaged_positions.sql
+-- Apply:    ./scripts/apply_migration.sh migrations/002_quarantine_unmanaged_positions.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
 -- Rollback: see the commented block at the bottom.
 
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS quarantined_stop_price REAL;

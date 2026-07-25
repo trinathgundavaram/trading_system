@@ -22,7 +22,10 @@
 -- harmless (nothing reads the column), while rolling back this file without
 -- the code is not: the reads would filter on a column that does not exist.
 --
--- Apply:    psql "$POSTGRES_DB" -f migrations/007_learning_data_quarantine.sql
+-- Apply:    ./scripts/apply_migration.sh migrations/007_learning_data_quarantine.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
 -- Rollback: see the commented block at the bottom.
 
 ALTER TABLE mae_mfe_data     ADD COLUMN IF NOT EXISTS data_quality TEXT DEFAULT 'ok';

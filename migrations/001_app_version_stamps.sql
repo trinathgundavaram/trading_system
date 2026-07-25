@@ -5,7 +5,10 @@
 -- version reading this database sees columns it does not know about and
 -- ignores them. rollback_safe: true.
 --
--- Apply:    psql "$POSTGRES_DB" -f migrations/001_app_version_stamps.sql
+-- Apply:    ./scripts/apply_migration.sh migrations/001_app_version_stamps.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
 -- Rollback: see the commented block at the bottom.
 
 ALTER TABLE signals           ADD COLUMN IF NOT EXISTS app_version TEXT;
