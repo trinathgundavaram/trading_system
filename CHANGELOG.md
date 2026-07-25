@@ -20,6 +20,40 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+## [1.31] — v1.3.1 — 2026-07-25
+
+### Decision function: unchanged — v1.3.0 trade data remains poolable
+
+A patch. The control shipped in v1.3.0 and was computing one of its two
+numbers incorrectly under one condition.
+
+Full note: [docs/releases/v1.3.1.md](docs/releases/v1.3.1.md).
+
+### Fixed
+
+- **§11** the paper-account epoch now bounds the **intraday** drawdown window,
+  not only the running peak. v1.3.0 fixed half of this: scoping the peak alone
+  left a mid-day reset inside today's window, so the peak-to-trough scan ran
+  across the discontinuity. A re-seed downward — 1491 back to a 1000
+  `starting_cash` — reads as a 33% intraday drawdown, which against the 2.0%
+  cap blocks entries for the rest of the day, for an accounting event.
+
+  The 2026-07-25 re-seed stepped *up*, and an upward step produces no
+  drawdown, so the live data exercised the running half of the bug and was
+  silent about the intraday half. It surfaced because a test failed on an
+  unrelated assertion.
+
+- `backfill_drawdown` drops pre-reset points on the epoch day only. Earlier
+  days keep theirs — they belong to the previous account and are self-contained
+  and true for it.
+
+- test fixture: `_equity()` wrote today's points at a fixed 10:00 local, which
+  depending on the hour the suite ran landed *before* `init_paper_account`
+  stamped `created_at`. They were then correctly excluded and the assertion
+  read 0.0% against an expected 1.6% — the code was right and the fixture
+  depended on what time you ran it. Points are now written forward from
+  `utcnow()`.
+
 ## [1.3] — v1.3.0 — 2026-07-25
 
 ### Decision function: CHANGED — re-validation required before arming live
