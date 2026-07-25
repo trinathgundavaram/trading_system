@@ -16,7 +16,12 @@ from engine.backtest_loop import maybe_run_weekly as maybe_run_weekly_backtest
 from engine.learning_loop import maybe_run as maybe_run_learning_loop
 from engine.learning_loop import maybe_run_threshold_regret
 from engine.market_context import MarketContext, evaluate_market_gate
-from engine.notifications import notify_buy_signal, notify_urgent_exit
+# §47.3: the cycle body no longer calls notify_buy_signal/notify_urgent_exit.
+# It writes to the ui_events outbox via _notify_via_outbox() and lets
+# scripts/tp_agent.py do the OS-specific part - which is what allows the
+# engine to run in a container that cannot reach a notification centre. The
+# fallback path imports engine.notifications.notify lazily, inside that
+# helper, so there is nothing to import at module scope any more.
 from engine.packet_builder import build_trade_prompt, build_ticker_packet
 from engine.pattern_features import build_pattern_features
 from engine.position_management import run_loop_b
@@ -68,6 +73,105 @@ def load_config() -> dict:
     config_path = os.path.join(BASE_DIR, "config.yaml")
     with open(config_path) as f:
         return yaml.safe_load(f)
+
+
+def _notify_via_outbox(cfg: dict, *, severity: str, title: str, body: str,
+                       threshold_pct: float | None = None) -> None:
+    """Emit a user-facing notification through the ui_events outbox (§47.3),
+    and - only when no host agent is running - deliver it directly as well.
+
+    THE SPLIT THIS IMPLEMENTS. The engine's job is to say what happened and
+    how urgent it is. Deciding how a human finds out is the host agent's job,
+    because it is the only OS-specific part of the system and the only process
+    with a route to a notification centre. Under §47 the engine runs in a
+    container, where osascript and notify-send simply do not exist.
+
+    THE FALLBACK IS NOT OPTIONAL. Someone running natively today, with no
+    agent installed, must not silently stop getting notifications the moment
+    this ships - that would be a regression dressed as an architecture. So if
+    TP_HOST_AGENT is not set, this also calls engine/notifications.py directly.
+    The agent sets TP_HOST_AGENT=1 in the container environment it writes, so
+    exactly one of the two paths delivers and nobody gets two popups.
+    """
+    # The high_conviction_buy_pct gate is checked FIRST, before the outbox
+    # write. It used to live inside notify_buy_signal(); moving the call site
+    # here moved the gate too, and putting it after the write would mean every
+    # buy signal pops once a host agent is attached - the gate would silently
+    # apply only to the fallback path, which is the opposite of the intent.
+    if threshold_pct is not None:
+        threshold = (cfg.get("notifications", {}) or {}).get("high_conviction_buy_pct", 80)
+        if threshold_pct < threshold:
+            return
+
+    payload = {"severity": severity, "title": title, "body": body}
+    try:
+        db.log_ui_event("notify", payload)
+    except Exception as e:
+        logger.warning(f"could not write notify event to the outbox: {e}")
+
+    if os.getenv("TP_HOST_AGENT", "").strip() in ("1", "true", "yes"):
+        return
+
+    try:
+        from engine.notifications import notify
+
+        notify(cfg, title=title, message=body, subtitle="Trading Platform",
+               severity=severity)
+    except Exception as e:
+        logger.warning(f"direct notification failed: {e}")
+
+
+_CLOCK_SKEW_CACHE = {"at": 0.0, "value": None}
+_CLOCK_SKEW_TTL_SECONDS = 300
+
+
+def _clock_skew_seconds(timeout: float = 3.0, _force: bool = False) -> float | None:
+    """How far the local clock is from the real world, in seconds. None if
+    unknown (no network) - which is NOT treated as a failure.
+
+    §42.4 (Phase 3). Under the containerised architecture this stops being a
+    nicety. Docker Desktop on macOS and Windows runs containers inside a VM
+    whose clock can lag the host badly after the laptop sleeps, and this
+    process decides whether the market is open and when a stop was hit. A
+    container that wakes up believing it is 14:05 when it is really 16:40 will
+    happily place orders into a closed market and mis-time every stop - and
+    that is very close in shape to the 22 July incident, so the failure would
+    be hunted in the wrong place.
+
+    Compares the local clock against an HTTP Date header rather than running
+    NTP: no client needed in the image, no privileged port, no daemon, and one
+    cheap request. Cached for five minutes because this runs at the top of
+    every cycle and the answer does not change quickly.
+
+    A None result (no network, blocked egress, DNS down) means "cannot tell",
+    and the caller proceeds. Refusing to trade because the health *check*
+    failed would convert a network blip into a trading outage, which is a
+    worse trade than the risk it guards against - and the market-data calls
+    downstream will fail loudly on their own if the network is genuinely gone.
+    """
+    import email.utils
+    import urllib.request
+    from datetime import timezone
+
+    now_mono = time.time()
+    if not _force and now_mono - _CLOCK_SKEW_CACHE["at"] < _CLOCK_SKEW_TTL_SECONDS:
+        return _CLOCK_SKEW_CACHE["value"]
+
+    value = None
+    for url in ("https://www.google.com", "https://www.cloudflare.com"):
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                served = email.utils.parsedate_to_datetime(r.headers["Date"])
+            value = abs((datetime.now(timezone.utc) - served).total_seconds())
+            break
+        except Exception:
+            continue
+
+    _CLOCK_SKEW_CACHE.update({"at": now_mono, "value": value})
+    if value is None:
+        logger.debug("clock skew unknown - no reference host reachable")
+    return value
 
 
 def is_market_open(cfg: dict) -> bool:
@@ -228,6 +332,26 @@ def _run_cycle_impl(force: bool = False):
     logger.info(f"Cycle #{cycle_count} started ({triggered_by})")
 
     cfg = load_config()
+
+    # §42.4 (Phase 3). Before ANY market-hours reasoning, check the clock.
+    # This gate is deliberately above is_market_open(): every decision below
+    # it - whether the market is open, whether a stop was hit and when, how
+    # long a position has been held - is a function of the local clock, and a
+    # wrong clock corrupts all of them silently rather than loudly.
+    skew = _clock_skew_seconds()
+    max_skew = float(cfg.get("trading", {}).get("max_clock_skew_seconds", 120))
+    if skew is not None and skew > max_skew:
+        msg = (f"CLOCK SKEW {skew:.0f}s (limit {max_skew:.0f}s) - refusing to trade. "
+               f"Market-hours and stop timing cannot be trusted. Restart the "
+               f"container/VM, or check NTP on this host.")
+        logger.error(msg)
+        try:
+            db.log("CRITICAL", f"cycle aborted: clock skew {skew:.0f}s")
+        except Exception:
+            pass
+        db.log_cycle(cycle_count, 0, blocked=True, reason=f"clock_skew_{skew:.0f}s",
+                     triggered_by=triggered_by)
+        return
 
     if not force and not is_market_open(cfg):
         logger.info("Market closed - skipping")
@@ -986,11 +1110,23 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                     logger.error(f"{ticker}: live sell failed: {e}", exc_info=True)
         elif buy_result.should_buy:
             logger.info(f"{ticker}: BUY CANDIDATE - score {buy_result.pct_score:.0f}%")
-            notify_buy_signal(cfg, ticker, buy_result.pct_score, regime.dominant_regime)
             db.log_ui_event("buy_signal", {
                 "ticker": ticker, "pct_score": buy_result.pct_score,
                 "regime": regime.dominant_regime, "cycle": cycle_count,
             })
+            # §47.3 (Phase 3). The engine states WHAT happened and how urgent
+            # it is. It does not know or care how the human finds out - that
+            # is scripts/tp_agent.py's job, and it is the only part of the
+            # system that differs by operating system. This is what lets the
+            # engine run in a container that has no route to a notification
+            # centre while the popups keep working.
+            _notify_via_outbox(
+                cfg,
+                severity="info",
+                title=f"BUY {ticker} {buy_result.pct_score:.0f}%",
+                body=f"regime {regime.dominant_regime}",
+                threshold_pct=buy_result.pct_score,
+            )
             if watch_mode or live_mode:
                 # Take the buy at the signal price, sized by the Position
                 # Sizing Engine - simulated fill in WATCH mode, a REAL
@@ -1283,11 +1419,14 @@ def _run_cycle_tail(mkt, cfg: dict, trading_mode: str, regime, packets: list,
         pa = a["priority_action"]
         logger.info(f"{a['ticker']}: [Loop B] {pa['label']} (priority {pa['priority']}) - {pa['reason']}")
         if pa.get("urgent"):
-            notify_urgent_exit(cfg, a["ticker"], pa["reason"])
             db.log_ui_event("urgent_exit", {
                 "ticker": a["ticker"], "label": pa["label"], "reason": pa["reason"],
                 "priority": pa["priority"], "cycle": cycle_count,
             })
+            # §47.3, as above: state the event, let the host agent deliver it.
+            _notify_via_outbox(cfg, severity="critical",
+                               title=f"URGENT EXIT: {a['ticker']}",
+                               body=pa["reason"])
             # Urgent Loop B exits are acted on immediately: paper sell for
             # SIMULATED positions - ALWAYS, regardless of watch/live mode
             # (2026-07-24, Trinath: paper positions must keep being
@@ -1812,7 +1951,7 @@ def _log_startup_health_check():
     itself. Best-effort only: any failure here is logged and swallowed, it
     must never block startup."""
     try:
-        import resource
+        import resource  # POSIX only; Windows has no per-process fd limit
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         if soft < 2048:
             logger.warning(
@@ -1821,34 +1960,44 @@ def _log_startup_health_check():
                 f"run ./service.sh install to pick up the raised 4096/8192 limits.")
         else:
             logger.info(f"Startup check: open-file limit soft={soft} hard={hard} (OK)")
+    except ImportError:
+        logger.info("Startup check: no per-process open-file limit on this platform")
     except Exception as e:
         logger.warning(f"Startup check: could not read open-file limit: {e}")
 
+    _log_sleep_prevention_check()
+
+
+def _log_sleep_prevention_check():
+    """Is anything stopping this machine idle-sleeping through a scan window?
+
+    A sleeping machine is a stopped scheduler on every OS - that is what
+    happened on the morning of 2026-07-21 - and the failure is silent, so it
+    has to be checked rather than assumed.
+
+    PHASE 3 CHANGED WHO HOLDS THE LOCK. This used to walk the process ancestry
+    looking for `caffeinate`, which answered the question only on macOS and
+    only when the scheduler was a direct child of it. Under §47 the scheduler
+    runs in a container, where a power assertion is meaningless, and
+    scripts/tp_agent.py holds the wakelock on the host instead. So: inside a
+    container, say who owns it and stop; outside, check the mechanism this
+    platform actually uses.
+
+    The OS-specific part is storage/platform_support.py's business, not this
+    file's - the engine must stay free of host binaries so it can run in a
+    container (§47.1). Best-effort: a diagnostic must never block startup."""
     try:
-        import subprocess
-        ppid = os.getppid()
-        parent = subprocess.run(["ps", "-o", "comm=", "-p", str(ppid)],
-                                 capture_output=True, text=True, timeout=3).stdout.strip()
-        chain = parent
-        if "caffeinate" not in chain:
-            gppid = subprocess.run(["ps", "-o", "ppid=", "-p", str(ppid)],
-                                    capture_output=True, text=True, timeout=3).stdout.strip()
-            if gppid:
-                grandparent = subprocess.run(["ps", "-o", "comm=", "-p", gppid],
-                                              capture_output=True, text=True, timeout=3).stdout.strip()
-                chain = f"{chain} <- {grandparent}"
-        if "caffeinate" in chain:
-            logger.info(f"Startup check: caffeinate detected in process ancestry ({chain}) - "
-                        f"idle sleep should be prevented during scan windows (OK)")
+        from storage.platform_support import sleep_prevention_status
+
+        held, explanation = sleep_prevention_status()
+        if held is True:
+            logger.info(f"Startup check: {explanation} (OK)")
+        elif held is False:
+            logger.warning(f"Startup check: {explanation}")
         else:
-            logger.warning(
-                f"Startup check: caffeinate NOT detected in process ancestry ({chain}) - "
-                f"the Mac can idle-sleep through scheduled cycles, which will silently stall "
-                f"the cron schedule (this is what happened the morning of 2026-07-21). "
-                f"If this is launchd-managed, run ./service.sh install to pick up the "
-                f"caffeinate wrapper.")
+            logger.info(f"Startup check: {explanation}")
     except Exception as e:
-        logger.warning(f"Startup check: could not determine caffeinate status: {e}")
+        logger.warning(f"Startup check: could not determine sleep-prevention status: {e}")
 
 
 def start():

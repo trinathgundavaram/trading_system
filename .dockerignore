@@ -1,0 +1,60 @@
+# =============================================================================
+#  §42 (Phase 3). What must never enter the image.
+#
+#  Two separate reasons, and both matter:
+#    1. SECRETS. A file copied into a layer stays in that layer even if a
+#       later layer deletes it. Anyone who can pull the image can read it.
+#    2. REPRODUCIBILITY. Local output/, __pycache__ and venvs are
+#       machine-specific. Including them makes two builds of the same tag
+#       produce different images, which defeats the entire point of §42.
+# =============================================================================
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.template
+.tokens/
+tokens/
+*.pem
+*.p12
+*.key
+*.pickle
+credentials.json
+service-account*.json
+
+# ── Local runtime data ──────────────────────────────────────────────────────
+output/
+*.db
+*.db-wal
+*.db-shm
+*.sql
+!migrations/*.sql
+*.sql.gz
+*.postgres-backup-*
+
+# ── Build and editor noise ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+node_modules/
+venv/
+.venv/
+*.egg-info/
+.DS_Store
+
+# ── Git: the .git directory is large and the image does not need history ────
+# storage/version.py checks TP_VERSION before it shells out to `git describe`,
+# and docker-compose.yml sets TP_VERSION on every service - so rows written
+# from a container are stamped with the image tag, which is a stronger
+# provenance claim than a describe of a detached checkout would be.
+.git/
+.github/
+
+# ── Documentation and one-off artefacts ─────────────────────────────────────
+*.docx
+docs/releases/
+BUILD_FROM_SCRATCH_GUIDE.md

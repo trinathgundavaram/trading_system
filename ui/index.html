@@ -336,6 +336,12 @@
       <div class="segmented" id="book-toggle" style="margin-left:6px;" title="Switches Dashboard, Positions, and Portfolio to show either the simulated (Paper) book or your real Robinhood/confirm_fill.py (Real) book - never both mixed together."></div>
       <div class="fill"></div>
       <button class="btn btn-primary btn-sm" id="copy-btn" onclick="copyPrompt()"></button>
+      <!-- §47.5: was macOS `open` on the SERVER, which needed the server and
+           the human to be the same machine and a .md handler to be
+           registered. A tab works on every OS, over a tunnel, and on a
+           phone. -->
+      <button class="btn btn-sm" id="open-btn" onclick="openPrompt()"
+              title="Open trade_prompt.md in a new tab">Open</button>
     </div>
     <div id="content"></div>
   </div>
@@ -613,21 +619,50 @@ function loadTab(name) {
   (renderers[name] || renderDashboard)(el);
 }
 
-/* ============================== COPY PROMPT ============================== */
+/* ============================== COPY PROMPT ==============================
+   §47.5 (Phase 3). This used to POST /api/prompt/copy, which shelled out to
+   `pbcopy` on the SERVER. That worked only when the server process and the
+   person clicking the button were the same machine - false over an SSH
+   tunnel, false from a phone, and definitively false once the UI runs in a
+   container, which has no host clipboard to write to.
+
+   The browser has had navigator.clipboard on every OS for years. Doing it
+   here removes a shell-out from the server process and makes the feature
+   strictly better: it now works remotely and needs no auth round-trip,
+   because reading your own prompt was never a write operation.
+
+   navigator.clipboard requires a secure context - https, or localhost, which
+   is exactly how §4 and docker-compose.yml bind the UI. The textarea
+   fallback below covers a plain-http LAN access, where the API is absent. */
 async function copyPrompt() {
   try {
-    const res = await authFetch("/api/prompt/copy", { method: "POST" });
-    if (res.status === 403 || res.status === 429) return;   // authFetch already explained it
+    const res = await fetch("/api/prompt");
     if (res.status === 404) { toast("No prompt ready yet - runs after the first scheduler.py cycle", "alert"); return; }
-    const data = await res.json();
-    if (data.status === "copied") {
-      toast("trade_prompt.md copied to clipboard");
+    const { content } = await res.json();
+    if (!content) { toast("No prompt ready yet - runs after the first scheduler.py cycle", "alert"); return; }
+
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(content);
     } else {
-      toast(data.message || "Copy failed - pbcopy not available (not on macOS?)", "alert");
+      const ta = document.createElement("textarea");
+      ta.value = content;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
     }
+    toast("trade_prompt.md copied to clipboard");
   } catch (e) {
-    toast("Copy failed - could not reach server", "alert");
+    toast("Copy failed - " + e.message, "alert");
   }
+}
+
+/* Was macOS `open`, which needed the server and the human to be the same
+   machine and a .md handler to be registered. A tab works everywhere. */
+function openPrompt() {
+  window.open("/api/prompt/raw", "_blank");
 }
 
 /* ============================== TOASTS / MODAL ============================== */

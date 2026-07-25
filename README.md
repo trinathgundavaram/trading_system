@@ -272,8 +272,15 @@ show the one rule that triggered (`rules/sell_rules.py` is first-triggered-wins
 OR logic, not a weighted score, so a single triggered rule + reason is the
 complete, honest explanation there — there's no hidden multi-factor breakdown to
 surface). Also fixed the Copy Prompt button, which called an undefined
-`copyPrompt()` function and silently did nothing — it now posts to
-`/api/prompt/copy` and shows a toast.
+`copyPrompt()` function and silently did nothing.
+
+> **Superseded by §47.5 (Phase 3).** The button no longer posts to
+> `/api/prompt/copy`; that endpoint is gone. It ran `pbcopy` on the *server*,
+> which assumed the server process and the person clicking were on the same
+> machine — already false over an SSH tunnel, and definitively false once the
+> UI runs in a container. The browser now copies with `navigator.clipboard`,
+> and an Open button fetches `/api/prompt/raw` into a new tab. Both work on
+> every OS, remotely, and from a phone.
 
 **Real-time push + notifications** (`storage/database.py`'s `ui_events`/`latest_regime`
 tables, `server.py`, `engine/notifications.py`) — `scheduler.py` and `server.py` run
@@ -293,9 +300,20 @@ which was silently broken before this pass: `engine/regime_engine.py`'s
 calls `calculate()` itself) always saw `None` even while `scheduler.py` had a real
 regime running for hours — `scheduler.py` now also persists the latest regime to a
 `latest_regime` table each cycle, and `server.py` reads from there instead.
-Desktop notifications (`engine/notifications.py`) use macOS's `osascript` (same
-mechanism `server.py`'s Copy Prompt button already used for `pbcopy` — no new
-dependency, no API key); silently no-ops on non-macOS. Complemented by the
+Desktop notifications (`engine/notifications.py`) originally used macOS's
+`osascript` and silently no-opped everywhere else.
+
+> **Superseded by §43.3 and §47.3 (Phase 3).** Notifications are now an ordered
+> chain of transports — `desktop` (osascript / notify-send / win10toast), then
+> `webhook` (ntfy, Slack, Discord, Pushover — anything accepting a POST), then
+> `log`, which is last and *always* succeeds, so a notification is never
+> silently dropped. Configure with `notifications.transports` and
+> `notifications.webhook_url`. Under the §47 architecture the containerised
+> engine does not notify at all: it writes a `notify` row to `ui_events` and
+> the native host agent (`scripts/tp_agent.py`) delivers it, because a
+> container has no route to a notification centre.
+
+Complemented by the
 browser's own Notification API on the UI side (fires only when the tab is open but
 not focused, to avoid double-alerting on top of the toast). Both are gated by
 `config.yaml`'s new `notifications:` section (`enabled`, `desktop_enabled`,

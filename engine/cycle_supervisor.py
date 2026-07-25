@@ -36,7 +36,18 @@ as designed instead of being coalesced away.
 Also used by server.py's manual /api/cycle/run_now (identical protection,
 since it too just calls scheduler.py's run_cycle()) and by
 /api/cycle/cancel, which now hard-kills the SAME child pid directly via
-kill_current_cycle() below instead of only setting a cooperative flag."""
+kill_current_cycle() below instead of only setting a cooperative flag.
+
+PHASE 3 (§43.2) - THE SAME PROTECTION ON EVERY OS. The mechanism above was
+POSIX-only: os.killpg, os.getpgid, signal.SIGKILL and start_new_session do
+not exist on Windows, so this module raised AttributeError at import there
+and the platform had NO hang protection at all - the single most serious of
+the eleven Mac-locked places §41 inventoried. _kill_process_tree() below is
+the portable replacement. On POSIX it keeps the process-group path, which is
+atomic and catches even a grandchild that re-parented away; on Windows it
+falls back to psutil walking the tree explicitly, which is slightly racier
+(a process spawned mid-walk can be missed) but is the only mechanism the OS
+offers, and is vastly better than nothing."""
 import logging
 import os
 import signal
@@ -45,6 +56,7 @@ import sys
 import time
 
 from storage.database import Database
+from storage.platform_support import IS_WINDOWS, detached_popen_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +67,17 @@ TERM_GRACE_SECONDS = 5  # SIGTERM, then this long to exit cleanly, before SIGKIL
 REAP_GRACE_SECONDS = 8  # how long to wait for the OS to actually reap after SIGKILL
 
 
-def _kill_process_group(pid: int, *, reason: str) -> None:
+def _kill_process_group_posix(pid: int, *, reason: str) -> None:
     """Best-effort SIGTERM -> grace -> SIGKILL of an entire process group.
     Safe to call on a pid that's already dead or was never a group leader
     (ProcessLookupError swallowed either way) - the 15-min auto-kill and a
     user-triggered /api/cycle/cancel can legitimately race to kill the same
-    pid, and that must never raise."""
+    pid, and that must never raise.
+
+    POSIX keeps this path rather than using the psutil tree walk below: a
+    process group is killed atomically by the kernel, so a grandchild that
+    re-parented itself away from the child (which uvx and npx wrappers do)
+    still dies. Walking a tree cannot promise that."""
     try:
         pgid = os.getpgid(pid)
     except ProcessLookupError:
@@ -83,6 +100,74 @@ def _kill_process_group(pid: int, *, reason: str) -> None:
                         f"{TERM_GRACE_SECONDS}s grace - sent SIGKILL")
     except ProcessLookupError:
         pass
+
+
+def _kill_process_tree_psutil(pid: int, *, reason: str) -> None:
+    """Terminate a process and every descendant, without process groups.
+
+    Windows has no process group in the POSIX sense, so the tree has to be
+    enumerated and signalled explicitly. Two honest limitations, stated
+    rather than hidden: a process spawned *during* the walk can be missed,
+    and a descendant that has already re-parented to a system process is no
+    longer reachable from this root. Both are strictly better than the
+    previous Windows behaviour, which was an AttributeError at import and no
+    hang protection whatsoever."""
+    try:
+        import psutil
+    except ImportError:
+        logger.error(f"cycle_supervisor: psutil not installed - CANNOT kill pid={pid} tree "
+                     f"on this platform ({reason}). Install psutil; until then a hung cycle "
+                     f"must be killed by hand.")
+        return
+
+    logger.warning(f"cycle_supervisor: killing pid={pid} tree - {reason}")
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    try:
+        victims = parent.children(recursive=True) + [parent]
+    except psutil.NoSuchProcess:
+        return
+
+    for p in victims:
+        try:
+            p.terminate()  # SIGTERM on POSIX, TerminateProcess on Windows
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as e:
+            logger.debug(f"cycle_supervisor: terminate pid={getattr(p, 'pid', '?')} failed: {e}")
+    _, alive = psutil.wait_procs(victims, timeout=TERM_GRACE_SECONDS)
+
+    for p in alive:
+        try:
+            p.kill()
+            logger.error(f"cycle_supervisor: pid={p.pid} ignored terminate - killed")
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as e:
+            logger.debug(f"cycle_supervisor: kill pid={getattr(p, 'pid', '?')} failed: {e}")
+    _, still = psutil.wait_procs(alive, timeout=REAP_GRACE_SECONDS)
+    for p in still:
+        logger.error(f"cycle_supervisor: pid={p.pid} SURVIVED kill - possible zombie")
+
+
+def _kill_process_tree(pid: int, *, reason: str) -> None:
+    """Kill a cycle child and everything it spawned, on any OS.
+
+    One entry point so callers never branch on the platform themselves."""
+    if IS_WINDOWS:
+        _kill_process_tree_psutil(pid, reason=reason)
+    else:
+        _kill_process_group_posix(pid, reason=reason)
+
+
+# Name alias only. Both call sites in this module reference
+# _kill_process_tree directly, so patching THIS name in a test does not
+# intercept anything - which is worth stating plainly, because a
+# monkeypatch that silently fails to take effect would let a test kill a
+# real process group. Patch _kill_process_tree.
+_kill_process_group = _kill_process_tree
 
 
 def kill_current_cycle(reason: str = "user_cancel") -> bool:
@@ -112,7 +197,7 @@ def kill_current_cycle(reason: str = "user_cancel") -> bool:
     # immediate "not running" the instant Cancel is clicked rather than
     # waiting on the supervisor thread's own wait() to notice.
     db.mark_cycle_killed(expected_pid=pid, reason=reason)
-    _kill_process_group(pid, reason=reason)
+    _kill_process_tree(pid, reason=reason)
     return True
 
 
@@ -146,11 +231,15 @@ def run_supervised(force: bool, timeout_seconds: float) -> None:
 
     proc = None
     try:
-        # start_new_session=True makes this child (and every grandchild MCP
-        # subprocess it spawns - uvx, npx, etc.) its own process group, which
-        # is what lets os.killpg() below take the WHOLE tree down atomically
-        # instead of just the immediate child.
-        proc = subprocess.Popen(cmd, cwd=ROOT_DIR, start_new_session=True)
+        # Detach the child (and every grandchild MCP subprocess it spawns -
+        # uvx, npx, etc.) from this process's group. On POSIX that is
+        # start_new_session=True, which is what lets os.killpg() take the
+        # WHOLE tree down atomically instead of just the immediate child; on
+        # Windows it is CREATE_NEW_PROCESS_GROUP, so the child does not
+        # inherit this console's Ctrl-C and can be signalled independently.
+        # storage/platform_support.py owns that branch (§43.1) so this file
+        # does not have to know which OS it is on.
+        proc = subprocess.Popen(cmd, cwd=ROOT_DIR, **detached_popen_kwargs())
         db.set_cycle_pid(proc.pid)
         logger.info(f"cycle_supervisor: spawned cycle child pid={proc.pid} "
                     f"(triggered_by={triggered_by}, hard ceiling {timeout_seconds / 60:.1f} min)")
@@ -164,7 +253,7 @@ def run_supervised(force: bool, timeout_seconds: float) -> None:
                      f"{timeout_seconds / 60:.1f} min hard limit - force-killing the whole cycle "
                      f"(process group, every MCP subprocess it spawned included) and clearing "
                      f"state so the next cycle isn't blocked.")
-        _kill_process_group(proc.pid, reason=f"exceeded {timeout_seconds / 60:.1f} min hard limit")
+        _kill_process_tree(proc.pid, reason=f"exceeded {timeout_seconds / 60:.1f} min hard limit")
         try:
             proc.wait(timeout=REAP_GRACE_SECONDS)
         except subprocess.TimeoutExpired:

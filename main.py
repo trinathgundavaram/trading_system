@@ -10,8 +10,11 @@ server.py's /api/status returns it (§6, 2026-07-24). Terminal mode starts a
 scheduler thread, so it inherits whatever posture the banner reports.
 
 Terminal mode keyboard: [R] run a cycle now  [C] copy trade_prompt.md to clipboard
-          (pbcopy)  [O] open trade_prompt.md (macOS `open`)  [P] pause/resume
-          [Q] quit
+          [O] open trade_prompt.md  [P] pause/resume  [Q] quit
+
+Both [C] and [O] go through storage/platform_support.py (§43.1), so they work
+on macOS, Linux, WSL and Windows and degrade with a useful message rather than
+an error where no clipboard or file handler exists.
 
 Web mode: `python3 main.py --ui` serves http://localhost:8080 (see server.py).
 Run `python3 scheduler.py` in a second process for the actual scan loop -
@@ -167,22 +170,32 @@ class Dashboard:
         if not os.path.exists(TRADE_PROMPT_PATH):
             console.print("[yellow]No trade_prompt.md yet - run a cycle first.[/yellow]")
             return
-        try:
-            with open(TRADE_PROMPT_PATH) as f:
-                content = f.read()
-            subprocess.run(["pbcopy"], input=content.encode(), check=True)
-            console.print("[green]Copied output/trade_prompt.md to clipboard.[/green]")
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            console.print("[yellow]pbcopy not available (not on macOS?) - open the file manually.[/yellow]")
+        # §43.1 (Phase 3): the OS branch lives in storage/platform_support.py,
+        # not here. This used to shell out to pbcopy directly, which worked on
+        # exactly one operating system and reported "not on macOS?" as though
+        # that were the user's problem. The terminal dashboard is one of the
+        # few places where the process and the human genuinely ARE the same
+        # machine, so a host clipboard is still the right call here - unlike
+        # the web UI, which now copies in the browser (§47.5).
+        from storage.platform_support import copy_to_clipboard
+
+        with open(TRADE_PROMPT_PATH) as f:
+            content = f.read()
+        ok, msg = copy_to_clipboard(content)
+        if ok:
+            console.print(f"[green]Copied output/trade_prompt.md to clipboard ({msg}).[/green]")
+        else:
+            console.print(f"[yellow]{msg} - the file is at {TRADE_PROMPT_PATH}[/yellow]")
 
     def open_prompt(self):
         if not os.path.exists(TRADE_PROMPT_PATH):
             console.print("[yellow]No trade_prompt.md yet - run a cycle first.[/yellow]")
             return
-        try:
-            subprocess.run(["open", TRADE_PROMPT_PATH], check=True)
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            console.print(f"[yellow]Could not auto-open. Path: {TRADE_PROMPT_PATH}[/yellow]")
+        from storage.platform_support import open_file
+
+        ok, msg = open_file(TRADE_PROMPT_PATH)
+        if not ok:
+            console.print(f"[yellow]{msg}[/yellow]")
 
     def run(self):
         with KeyReader() as keys, Live(self.render(), console=console, refresh_per_second=2) as live:

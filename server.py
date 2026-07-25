@@ -38,7 +38,7 @@ from typing import Optional
 import yaml
 from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
                      Request)
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
 from storage import banner, secrets
@@ -997,18 +997,25 @@ async def get_prompt():
     return {"content": p.read_text() if p.exists() else None}
 
 
-@app.post("/api/prompt/copy")
-async def copy_prompt(_: bool = Depends(require_token)):
+@app.get("/api/prompt/raw", response_class=PlainTextResponse)
+async def get_prompt_raw():
+    """The prompt as plain text, for the browser to open in a tab (§47.5).
+
+    THIS REPLACED TWO SHELL-OUTS. The old /api/prompt/copy ran `pbcopy` and
+    the UI's open button ran macOS `open`. Both assumed the server process and
+    the person clicking the button were on the same machine - an assumption
+    that was already false over an SSH tunnel and is definitively false once
+    the UI runs in a container (§47). It was never really a portability
+    problem so much as a design accident.
+
+    The browser has had both capabilities on every OS for years:
+    navigator.clipboard.writeText() and window.open(). Moving them there
+    fixes the container case AND makes the feature better on macOS - it now
+    works from a phone, from a second machine, and through a tunnel."""
     p = BASE_DIR / "output" / "trade_prompt.md"
     if not p.exists():
         raise HTTPException(404, "No prompt ready")
-    try:
-        subprocess.run(["pbcopy"], input=p.read_bytes(), check=True, timeout=5)
-        return {"status": "copied"}
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return {"status": "error", "message": "pbcopy not available (not on macOS?)"}
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "message": "pbcopy didn't respond in time"}
+    return p.read_text()
 
 
 @app.get("/api/trades")

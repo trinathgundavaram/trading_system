@@ -1,15 +1,25 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # =============================================================================
 #  scripts/tp - install, run, compare and maintain versions on this machine.
-#  Phase 0 steps 0.9 and 0.10 (§38, §39).
+#  Phase 0 steps 0.9 and 0.10 (§38, §39); rewritten in Python by §46 (Phase 3).
 #
-#  Committed to the repo; operates on ~/tp, which is not. ~/tp holds databases,
-#  logs and virtual environments - none of which should live inside a directory
-#  git is watching, and all of which are machine-specific.
+#  WHY PYTHON NOW. The bash version worked, on one machine. It used
+#  BSD-flavoured flags that silently differ on Linux or do not exist at all on
+#  Windows - `rm -P` (overwrite-then-unlink), `shasum` (Linux has sha256sum),
+#  `sed -i ''` (GNU sed reads the '' as the script), `du -sh`, `security`. A
+#  version manager whose whole job is "make two installs behave identically"
+#  cannot itself behave differently per platform. This project already
+#  requires Python, so rewriting removes both the portability problem and the
+#  shell dependency.
+#
+#  WHAT IT DOES, unchanged. Committed to the repo; operates on the TP root,
+#  which is not. That root holds databases, logs and virtual environments -
+#  none of which should live inside a directory git is watching, and all of
+#  which are machine-specific.
 #
 #  `git checkout v1.0.0` gives you the CODE. It does not give you a runnable
 #  v1.0.0, because five things are shared and would collide: the working
-#  directory, the Postgres database, output/, port 8080, and the launchd
+#  directory, the Postgres database, output/, port 8080, and the service
 #  labels. This script gives each version its own of all five.
 #
 #  The database is the one that genuinely constrains the design. Once §7 adds
@@ -17,366 +27,676 @@
 #  a v2.0.0 database will either crash or - worse - read columns that mean
 #  something different than they did. Sharing one database across versions is
 #  not a shortcut; it is a corruption risk.
-# =============================================================================
-set -euo pipefail
-
-TP_ROOT="${TP_ROOT:-$HOME/tp}"
-REPO="${TP_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-REGISTRY="$TP_ROOT/registry.json"
-BASE_PORT="${TP_BASE_PORT:-8080}"
-export REGISTRY
-
-# Every name this platform treats as secret. Mirrors storage/secrets.py
-# SECRET_KEYS - keep the two in step.
-SECRET_KEYS=(
-  ROBINHOOD_USERNAME ROBINHOOD_PASSWORD ROBINHOOD_TOTP_SECRET
-  RH_ACCOUNT_NUMBER UI_AUTH_TOKEN
-  POSTGRES_USER POSTGRES_PASSWORD
-  ALPHAVANTAGE_API_KEY FINNHUB_API_KEY FMP_API_KEY TIINGO_API_KEY
-  TWELVEDATA_API_KEY ALPACA_API_KEY ALPACA_API_SECRET
-  TRAYD_MCP_URL TRAYD_AUTH_TOKEN NVIDIA_API_KEY
-)
-# Secrets the platform cannot start without. The rest degrade gracefully.
-REQUIRED_KEYS=( UI_AUTH_TOKEN RH_ACCOUNT_NUMBER )
-
-die()  { echo "tp: $*" >&2; exit 1; }
-note() { echo "  $*"; }
-
-# ── registry: version -> port, database, install time ───────────────────────
-_reg() { python3 - "$@" <<'PY'
-import json, os, sys, datetime
-p = os.environ['REGISTRY']
-os.makedirs(os.path.dirname(p), exist_ok=True)
-reg = json.load(open(p)) if os.path.exists(p) else {}
-cmd = sys.argv[1]
-if cmd == 'get':
-    print(json.dumps(reg.get(sys.argv[2], {})))
-elif cmd == 'list':
-    print(json.dumps(reg, indent=2))
-elif cmd == 'field':
-    print(reg.get(sys.argv[2], {}).get(sys.argv[3], ''))
-elif cmd == 'add':
-    tag, base = sys.argv[2], int(sys.argv[3])
-    if tag not in reg:
-        used = {v['port'] for v in reg.values()}
-        port = next(p_ for p_ in range(base, base + 50) if p_ not in used)
-        reg[tag] = {
-            'port': port,
-            'db': 'tp_' + tag.replace('.', '_').replace('-', '_'),
-            'installed_at': datetime.datetime.now().isoformat(timespec='seconds'),
-        }
-        json.dump(reg, open(p, 'w'), indent=2)
-    print(json.dumps(reg[tag]))
-elif cmd == 'del':
-    reg.pop(sys.argv[2], None)
-    json.dump(reg, open(p, 'w'), indent=2)
-PY
-}
-
-_port() { _reg field "$1" port; }
-_db()   { _reg field "$1" db; }
-
-# ── secrets (§39.1) ─────────────────────────────────────────────────────────
 #
-# Values never touch disk outside .env / the Keychain, and never appear in
-# argv, where `ps` would show them to every local process on the machine.
+#  The bash original is kept verbatim as scripts/tp.sh.bak.
+# =============================================================================
+"""tp - trading_platform version manager (§38, §39, §46)."""
+from __future__ import annotations
 
-_keychain_get() { security find-generic-password -a "$USER" -s "tp_$1" -w 2>/dev/null || true; }
+import argparse
+import datetime
+import getpass
+import gzip
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import venv
+from pathlib import Path
 
-_secrets_export() {
-  # Emit `export K=V` lines for `eval`. .env first (the documented source of
-  # truth), Keychain as the encrypted-at-rest mirror. printf %q so a value
-  # containing a space or a quote survives the eval intact.
-  local k v
-  for k in "${SECRET_KEYS[@]}"; do
-    v=""
-    if [ -f "$REPO/.env" ]; then
-      v=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$k=" "$REPO/.env" 2>/dev/null \
-          | tail -1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?$k=//" \
-          | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true)
-    fi
-    [ -z "$v" ] && [ "$(uname)" = Darwin ] && v=$(_keychain_get "$k")
-    [ -n "$v" ] && printf 'export %s=%q\n' "$k" "$v"
-  done
-}
+IS_WINDOWS = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
 
-cmd_secrets_import() {
-  [ "$(uname)" = Darwin ] || die "secrets import is macOS-only (§44 makes it portable in Phase 3)"
-  local envfile="${1:-$REPO/.env}" shred="${2:-}"
-  [ -f "$envfile" ] || die "no $envfile"
-  local n=0
-  while IFS='=' read -r k v; do
-    case "$k" in ''|'#'*) continue ;; esac
-    k="${k#export }"; k="$(echo "$k" | tr -d '[:space:]')"
-    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
-    [ -z "$v" ] && continue
-    security add-generic-password -a "$USER" -s "tp_$k" -w "$v" -U
-    note "stored tp_$k"; n=$((n+1))
-  done < "$envfile"
-  echo "imported $n secret(s) into the Keychain"
-  if [ "$shred" = "--shred" ]; then
-    # -P overwrites before unlinking. A plain rm leaves the bytes recoverable,
-    # and this file holds a brokerage password.
-    rm -P "$envfile" && echo "shredded $envfile"
-    echo "NOTE: storage/secrets.py still reads .env first. With it gone, the"
-    echo "      Keychain becomes the only source - which is the intent, but"
-    echo "      means `tp secrets check` is now the only way to see what is set."
-  fi
-}
+REPO = Path(os.getenv("TP_REPO", Path(__file__).resolve().parent.parent))
+BASE_PORT = int(os.getenv("TP_BASE_PORT", "8080"))
 
-cmd_secrets_set() {
-  [ "$(uname)" = Darwin ] || die "secrets set is macOS-only"
-  local k="${1:?usage: tp secrets set KEY}"
-  printf 'value for %s (not echoed): ' "$k"; read -rs v; echo
-  [ -n "$v" ] || die "empty value refused"
-  security add-generic-password -a "$USER" -s "tp_$k" -w "$v" -U
-  echo "stored tp_$k"
-}
+sys.path.insert(0, str(REPO))
 
-cmd_secrets_check() {
-  local missing=0 k v src
-  for k in "${SECRET_KEYS[@]}"; do
-    v=""; src=""
-    if [ -f "$REPO/.env" ] && grep -qE "^[[:space:]]*(export[[:space:]]+)?$k=." "$REPO/.env" 2>/dev/null; then
-      v=set; src=".env"
-    elif [ "$(uname)" = Darwin ] && [ -n "$(_keychain_get "$k")" ]; then
-      v=set; src="keychain"
-    fi
-    if [ -n "$v" ]; then
-      printf '  ok       %-24s (%s)\n' "$k" "$src"
-    else
-      case " ${REQUIRED_KEYS[*]} " in
-        *" $k "*) printf '  MISSING  %-24s (REQUIRED)\n' "$k"; missing=1 ;;
-        *)        printf '  unset    %-24s (optional)\n' "$k" ;;
-      esac
-    fi
-  done
-  return $missing
-}
 
-# ── install <tag> ───────────────────────────────────────────────────────────
-cmd_install() {
-  local tag="${1:?usage: tp install <tag>}"
-  git -C "$REPO" rev-parse "$tag" >/dev/null 2>&1 || die "no such tag: $tag"
-  mkdir -p "$TP_ROOT"/{versions,venvs,data,archive}
+# =============================================================================
+#  Locations
+# =============================================================================
+def tp_root() -> Path:
+    """Where versions, venvs and data live.
 
-  local meta port db
-  meta=$(_reg add "$tag" "$BASE_PORT")
-  port=$(_port "$tag"); db=$(_db "$tag")
+    Deliberately NOT ~/tp on every platform. Windows has a convention
+    (%LOCALAPPDATA%) and ignoring it puts a multi-gigabyte directory in the
+    user's ROAMING profile, which on a domain-joined machine is synced over
+    the network at every login - a genuinely bad day for whoever runs that
+    domain. Linux has XDG. macOS keeps ~/tp so an existing install is
+    untouched by this rewrite."""
+    if env := os.getenv("TP_ROOT"):
+        return Path(env)
+    if IS_WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "TradingPlatform"
+    if IS_MAC:
+        return Path.home() / "tp"
+    return Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local/share")) / "trading-platform"
 
-  # 1. Code: a detached worktree at the tag. Read-only by intent - patches
-  #    belong on a release branch (see `tp patch`), never in a tag worktree.
-  if [ -d "$TP_ROOT/versions/$tag" ]; then
-    note "(worktree exists)"
-  else
-    git -C "$REPO" worktree add --detach "$TP_ROOT/versions/$tag" "$tag"
-  fi
 
-  # 2. Dependencies: its own venv, from THAT version's pinned requirements.
-  #    This is why §13 is a prerequisite - without ==, two versions installed
-  #    a month apart get different pandas and compute different indicators
-  #    from identical bars.
-  if [ ! -x "$TP_ROOT/venvs/$tag/bin/python" ]; then
-    python3 -m venv "$TP_ROOT/venvs/$tag"
-    "$TP_ROOT/venvs/$tag/bin/pip" install -q --upgrade pip
-    "$TP_ROOT/venvs/$tag/bin/pip" install -q -r "$TP_ROOT/versions/$tag/requirements.txt" \
-      || note "WARNING: some dependencies failed to install - run tp doctor"
-  else
-    note "(venv exists)"
-  fi
+def venv_python(tag: str) -> Path:
+    base = tp_root() / "venvs" / tag
+    return base / ("Scripts/python.exe" if IS_WINDOWS else "bin/python")
 
-  # 3. Data directory, outside the checkout.
-  mkdir -p "$TP_ROOT/data/$tag/output"/{logs,pending_prompts,backtest_results,archive}
 
-  # 4. Its own database, at that version's schema.
-  createdb "$db" 2>/dev/null && note "created database $db" || note "(database $db already exists)"
-  local m
-  for m in "$TP_ROOT/versions/$tag"/migrations/*.sql; do
-    [ -e "$m" ] || continue
-    psql -q -d "$db" -f "$m" >/dev/null 2>&1 && note "applied $(basename "$m")" \
-      || note "(skipped $(basename "$m") - tables not created yet; runs on first start)"
-  done
+def registry_path() -> Path:
+    return tp_root() / "registry.json"
 
-  echo "installed $tag  port=$port  db=$db"
-  echo "  data: $TP_ROOT/data/$tag/output"
-  echo "  run:  tp run $tag --ui"
-}
 
-# ── run <tag> [--ui|--scheduler|--backtest|--shell] ─────────────────────────
-cmd_run() {
-  local tag="${1:?usage: tp run <tag> [--ui|--scheduler|--backtest|--shell]}"; shift || true
-  [ "$(_reg get "$tag")" != '{}' ] || die "not installed: $tag (run: tp install $tag)"
+def primary_path() -> Path:
+    return tp_root() / "PRIMARY"
 
-  local port db; port=$(_port "$tag"); db=$(_db "$tag")
 
-  # Secrets resolved at the moment of use.
-  set -a; eval "$(_secrets_export)"; set +a
-
-  export POSTGRES_DB="$db"
-  export TP_OUTPUT_DIR="$TP_ROOT/data/$tag/output"
-  export TP_UI_PORT="$port"
-  export TP_UI_HOST=127.0.0.1
-  export TP_VERSION="$tag"
-
-  # SAFETY (§38.4): only one version may ever be armed, and a non-primary
-  # version may not be armed at all. Two schedulers both believing they own
-  # the account is the worst outcome this arrangement could produce.
-  local primary; primary=$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')
-  if [ "$tag" != "$primary" ]; then
-    export TP_FORCE_PAPER=1
-    echo "note: $tag is not the primary version - forcing paper mode"
-  fi
-
-  cd "$TP_ROOT/versions/$tag"
-  local py="$TP_ROOT/venvs/$tag/bin/python"
-  [ -x "$py" ] || die "no venv for $tag (run: tp install $tag)"
-
-  case "${1:---scheduler}" in
-    --ui)        exec "$py" main.py --ui ;;
-    --scheduler) exec "$py" scheduler.py ;;
-    --backtest)  shift; exec "$py" run_backtest.py "$@" ;;
-    --shell)     exec "$SHELL" ;;
-    *)           exec "$py" "$@" ;;
-  esac
-}
-
-# ── list ────────────────────────────────────────────────────────────────────
-cmd_list() {
-  local primary; primary=$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '-')
-  printf '%-12s %-6s %-16s %-10s %s\n' TAG PORT DATABASE DATA PRIMARY
-  python3 - "$TP_ROOT" "$primary" <<'PY'
-import json, os, subprocess, sys
-root, primary = sys.argv[1], sys.argv[2]
-p = os.path.join(root, 'registry.json')
-reg = json.load(open(p)) if os.path.exists(p) else {}
-for tag, v in sorted(reg.items()):
-    d = os.path.join(root, 'data', tag)
+def read_primary() -> str:
     try:
-        size = subprocess.run(['du', '-sh', d], capture_output=True,
-                              text=True).stdout.split()[0]
+        return primary_path().read_text().strip()
     except Exception:
-        size = '-'
-    print('%-12s %-6s %-16s %-10s %s' %
-          (tag, v['port'], v['db'], size, '*' if tag == primary else ''))
-PY
-}
+        return ""
 
-# ── promote <tag> - make this the launchd-managed version (§38.5) ───────────
-cmd_promote() {
-  local tag="${1:?usage: tp promote <tag>}"
-  [ "$(_reg get "$tag")" != '{}' ] || die "not installed: $tag"
-  local old; old=$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')
-  if [ -n "$old" ] && [ "$old" != "$tag" ]; then
-    ( cd "$TP_ROOT/versions/$old" && LABEL_SUFFIX=".$old" ./service.sh uninstall ) || true
-    note "uninstalled services for $old"
-  fi
-  echo "$tag" > "$TP_ROOT/PRIMARY"
-  ( cd "$TP_ROOT/versions/$tag" \
-    && TP_OUTPUT_DIR="$TP_ROOT/data/$tag/output" \
-       POSTGRES_DB="$(_db "$tag")" \
-       TP_VERSION="$tag" \
-       LABEL_SUFFIX=".$tag" ./service.sh install )
-  echo "primary is now $tag"
-  echo "  it is the ONLY version permitted to arm live execution, and even then"
-  echo "  only once the §32 re-arm gate passes."
-}
 
-# ── patch <line> - worktree on a release branch, for fixing 1.0.x (§38.6) ───
-cmd_patch() {
-  local line="${1:?usage: tp patch <line>   e.g. tp patch 1.0}"
-  local dir="$TP_ROOT/versions/release-$line"
-  git -C "$REPO" worktree add "$dir" "release/$line" 2>/dev/null || note "(worktree exists)"
-  echo "edit in $dir, then:"
-  echo "  cd $dir && ./scripts/release.sh patch     # -> v${line}.N"
-}
+# =============================================================================
+#  Small helpers
+# =============================================================================
+def die(msg: str, code: int = 1):
+    print(f"tp: {msg}", file=sys.stderr)
+    sys.exit(code)
 
-# ── remove <tag> ────────────────────────────────────────────────────────────
-cmd_remove() {
-  local tag="${1:?usage: tp remove <tag>}"
-  local primary; primary=$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')
-  [ "$tag" = "$primary" ] && die "$tag is the primary version - promote another first"
-  cmd_backup "$tag" || note "(no database to back up)"
-  git -C "$REPO" worktree remove --force "$TP_ROOT/versions/$tag" 2>/dev/null || true
-  rm -rf "$TP_ROOT/venvs/$tag" "$TP_ROOT/data/$tag"
-  dropdb "$(_db "$tag")" 2>/dev/null || true
-  _reg del "$tag"
-  echo "removed $tag (a dump was written to $TP_ROOT/archive first)"
-}
 
-# ── backup [tag] (§39.2) ────────────────────────────────────────────────────
-cmd_backup() {
-  local tag="${1:-$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')}"
-  local db ts out
+def note(msg: str):
+    print(f"  {msg}")
 
-  if [ -n "$tag" ]; then
-    db=$(_db "$tag")
-    [ -n "$db" ] || die "unknown version: $tag"
-  else
-    # No version manager in use (S-3, 2026-07-25). `tp install` has never been
-    # run on this machine, so there is no registry and no PRIMARY - and the
-    # previous behaviour was to die, which meant the ONE command whose whole
-    # job is "make sure a restore point exists" refused to run on the setup
-    # that most needed it. The 2026-07-25 incident had no restore point for
-    # exactly this reason.
-    #
-    # Fall back to the database the checkout in $REPO actually uses. Same
-    # resolution order as storage/database.py: POSTGRES_DB, else the default.
-    tag='working'
-    db="${POSTGRES_DB:-}"
-    if [ -z "$db" ] && [ -f "$REPO/.env" ]; then
-      db=$(grep -E '^(export )?POSTGRES_DB=' "$REPO/.env" 2>/dev/null \
-           | tail -1 | sed 's/.*=//' | tr -d '"'"'"'' || true)
-    fi
-    db="${db:-trading_platform}"
-    note "no PRIMARY set - backing up the working checkout's database ($db)"
-    note "run 'tp install <tag>' if you want per-version databases (§38)"
-  fi
-  ts=$(date +%Y%m%d_%H%M%S)
-  out="$TP_ROOT/archive/${tag}_${ts}.sql.gz"
-  mkdir -p "$TP_ROOT/archive"
-  pg_dump "$db" | gzip > "$out"
-  shasum -a 256 "$out" > "$out.sha256"
-  # Verify it is readable BEFORE trusting it. An unverified backup is a
-  # belief, not a backup.
-  gunzip -t "$out" || { echo 'FAIL: dump is corrupt'; rm -f "$out" "$out.sha256"; exit 1; }
-  # Keep 14; prune the rest.
-  ls -t "$TP_ROOT/archive/${tag}_"*.sql.gz 2>/dev/null | tail -n +15 | xargs -r rm --
-  echo "backed up $db -> $out ($(du -h "$out" | cut -f1))"
-  echo "  For off-machine safety, sync $TP_ROOT/archive to an encrypted"
-  echo "  destination - but NEVER to the git remote. A dump contains your"
-  echo "  positions, account activity and entire signal history. It is more"
-  echo "  sensitive than the code."
-}
 
-# ── autobackup (S-3) ────────────────────────────────────────────────────────
-# `tp backup` only helps if something runs it. On 2026-07-25 a test suite wiped
-# the paper ledger and there was no restore point, because nothing ever had.
-# A daily launchd job is the smallest thing that fixes that permanently -
-# deliberately NOT tied to the scheduler, so backups keep happening on days the
-# scheduler is stopped, which are exactly the days you are changing things.
-AUTOBACKUP_LABEL="com.tradingplatform.autobackup"
-_autobackup_plist() { echo "$HOME/Library/LaunchAgents/$AUTOBACKUP_LABEL.plist"; }
+def run(cmd, **kw):
+    """Always a list, never shell=True.
 
-cmd_autobackup() {
-  local action="${1:-status}"
-  local plist; plist=$(_autobackup_plist)
+    On Windows a shell string needs different quoting rules, and shell=True is
+    an injection surface for anything derived from a tag name - which here is
+    user input that reaches a database name."""
+    return subprocess.run([str(c) for c in cmd], check=True, **kw)
 
-  case "$action" in
-    install)
-      [ "$(uname -s)" = Darwin ] || die "autobackup is launchd-only; on Linux use a systemd timer or cron"
-      mkdir -p "$HOME/Library/LaunchAgents" "$TP_ROOT/archive"
-      cat > "$plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
+
+def run_ok(cmd, **kw) -> bool:
+    try:
+        subprocess.run([str(c) for c in cmd], check=True,
+                       stdout=kw.pop("stdout", subprocess.DEVNULL),
+                       stderr=kw.pop("stderr", subprocess.DEVNULL), **kw)
+        return True
+    except Exception:
+        return False
+
+
+def git(*args, cwd=None, capture=True):
+    return subprocess.run(["git", "-C", str(cwd or REPO), *[str(a) for a in args]],
+                          capture_output=capture, text=True)
+
+
+def human_size(total: float) -> str:
+    for unit in ("B", "K", "M", "G", "T"):
+        if total < 1024 or unit == "T":
+            return f"{total:.0f}{unit}"
+        total /= 1024
+    return "-"
+
+
+def dir_size_h(path: Path) -> str:
+    """`du -sh` is not portable and is slow on a large tree. Walk it instead."""
+    try:
+        return human_size(sum(f.stat().st_size
+                              for f in Path(path).rglob("*") if f.is_file()))
+    except Exception:
+        return "-"
+
+
+def secure_delete(path: Path) -> None:
+    """Overwrite before unlinking. `rm -P` is BSD-only and this file holds a
+    brokerage password.
+
+    Stated honestly: on an SSD with wear levelling, or on any copy-on-write
+    filesystem (APFS, btrfs, ZFS), overwriting in place does not guarantee the
+    old blocks are gone. This is a meaningful improvement over a plain unlink,
+    not a guarantee - the real protection is that the secret is rotated."""
+    try:
+        size = path.stat().st_size
+        with open(path, "r+b") as f:
+            for _ in range(3):
+                f.seek(0)
+                f.write(os.urandom(size))
+                f.flush()
+                os.fsync(f.fileno())
+    except Exception as e:
+        note(f"(overwrite failed: {e} - unlinking anyway)")
+    path.unlink(missing_ok=True)
+
+
+# =============================================================================
+#  Registry: version -> port, database, install time
+# =============================================================================
+def registry_load() -> dict:
+    p = registry_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def registry_save(reg: dict) -> None:
+    p = registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(reg, indent=2))
+
+
+def registry_add(tag: str) -> dict:
+    reg = registry_load()
+    if tag not in reg:
+        used = {v["port"] for v in reg.values()}
+        port = next(p for p in range(BASE_PORT, BASE_PORT + 50) if p not in used)
+        reg[tag] = {
+            "port": port,
+            "db": "tp_" + tag.replace(".", "_").replace("-", "_"),
+            "installed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        registry_save(reg)
+    return reg[tag]
+
+
+def registry_get(tag: str) -> dict:
+    return registry_load().get(tag, {})
+
+
+# =============================================================================
+#  Secrets (§39.1, made portable by §44)
+# =============================================================================
+def _secrets_module():
+    from storage import secrets
+
+    return secrets
+
+
+def cmd_secrets_check(_args) -> int:
+    secrets = _secrets_module()
+    required = ("UI_AUTH_TOKEN", "RH_ACCOUNT_NUMBER")
+    missing = 0
+    for k in secrets.SECRET_KEYS:
+        val = secrets.get(k, required=False)
+        if val:
+            src = "env" if os.environ.get(k) else "keyring/.env"
+            print(f"  ok       {k:<24} ({src})")
+        elif k in required:
+            print(f"  MISSING  {k:<24} (REQUIRED)")
+            missing = 1
+        else:
+            print(f"  unset    {k:<24} (optional)")
+    print(f"  keyring backend: {secrets.keyring_backend_name()}")
+    return missing
+
+
+def cmd_secrets_set(args) -> int:
+    """Store one secret in whatever encrypted store this OS has (§44).
+
+    getpass, not input(): the value must not appear on screen, and must not
+    be passed as an argv element where `ps` would show it to every local
+    process."""
+    secrets = _secrets_module()
+    value = getpass.getpass(f"value for {args.key} (not echoed): ")
+    if not value:
+        die("empty value refused")
+    secrets.set_(args.key, value)
+    print(f"stored {args.key} in {secrets.keyring_backend_name()}")
+    return 0
+
+
+def cmd_secrets_import(args) -> int:
+    """Mirror a .env file into the OS keyring. Portable now: this used to
+    refuse to run anywhere but macOS."""
+    secrets = _secrets_module()
+    envfile = Path(args.file or (REPO / ".env"))
+    if not envfile.exists():
+        die(f"no {envfile}")
+    n = 0
+    for raw in envfile.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip().removeprefix("export ").strip()
+        v = v.strip().strip("\"'")
+        if not k or not v:
+            continue
+        try:
+            secrets.set_(k, v)
+            note(f"stored {k}")
+            n += 1
+        except Exception as e:
+            note(f"FAILED {k}: {e}")
+    print(f"imported {n} secret(s) into {secrets.keyring_backend_name()}")
+    if args.shred:
+        secure_delete(envfile)
+        print(f"shredded {envfile}")
+        print("NOTE: storage/secrets.py still reads .env first when present. With it")
+        print("      gone the keyring is the only source - which is the intent, but")
+        print("      means `tp secrets check` is now the only way to see what is set.")
+    return 0
+
+
+def cmd_secrets_export_env(args) -> int:
+    """Materialise the secrets to a 0600 file for `docker compose` (§44).
+
+    A container has no OS keyring, so secrets must be injected. This is the
+    bridge, and it is meant to be short-lived: scripts/tp_agent.py writes it
+    immediately before `compose up` and deletes it once the containers are
+    running. The values then live in the container environment, not on disk."""
+    secrets = _secrets_module()
+    p = secrets.export_env(args.out)
+    print(f"wrote {p}")
+    print("  This file is gitignored and mode 0600. Delete it once the containers")
+    print("  are up - scripts/tp_agent.py does that for you.")
+    return 0
+
+
+# =============================================================================
+#  install
+# =============================================================================
+def cmd_install(args) -> int:
+    tag = args.tag
+    if git("rev-parse", tag).returncode != 0:
+        die(f"no such tag: {tag}")
+
+    root = tp_root()
+    for sub in ("versions", "venvs", "data", "archive"):
+        (root / sub).mkdir(parents=True, exist_ok=True)
+
+    meta = registry_add(tag)
+    wt = root / "versions" / tag
+
+    # 1. Code: a detached worktree at the tag. Read-only by intent - patches
+    #    belong on a release branch (`tp patch`), never in a tag worktree.
+    if wt.exists():
+        note("(worktree exists)")
+    else:
+        run(["git", "-C", REPO, "worktree", "add", "--detach", wt, tag])
+
+    # 2. Dependencies: its own venv, from THAT version's pinned requirements.
+    #    This is why §13 is a prerequisite - without ==, two versions installed
+    #    a month apart get different pandas and compute different indicators
+    #    from identical bars.
+    py = venv_python(tag)
+    if py.exists():
+        note("(venv exists)")
+    else:
+        venv.create(root / "venvs" / tag, with_pip=True)
+        # run_ok, not run: an offline machine or a pip that cannot reach the
+        # index should not abort the install with a traceback before the venv
+        # has even been populated - the requirements install below reports the
+        # real problem in a form someone can act on.
+        if not run_ok([py, "-m", "pip", "install", "-q", "--upgrade", "pip"]):
+            note("(could not upgrade pip in the new venv - continuing)")
+        if not run_ok([py, "-m", "pip", "install", "-q", "-r", wt / "requirements.txt"]):
+            note("WARNING: some dependencies failed to install - run tp doctor")
+
+    # 3. Confirm the reference TA backend actually installed. Two versions
+    #    computing different indicators because one silently fell back to
+    #    engine/ta_fallback.py is the cross-platform form of the §13 problem,
+    #    and it is INVISIBLE unless checked right here. A comparison between
+    #    two versions where one used the fallback is not a comparison.
+    r = subprocess.run([str(py), "-c", "import pandas_ta; print(pandas_ta.__version__)"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        note(f"WARNING: pandas_ta unavailable in {tag}. Scores from this version will")
+        note("         NOT be comparable with a version that has it (§13).")
+    else:
+        note(f"pandas_ta {r.stdout.strip()}")
+
+    # 4. Data directory, outside the checkout.
+    for d in ("logs", "pending_prompts", "backtest_results", "archive"):
+        (root / "data" / tag / "output" / d).mkdir(parents=True, exist_ok=True)
+
+    # 5. Its own database, at that version's schema.
+    _create_database(meta["db"])
+    for m in sorted((wt / "migrations").glob("*.sql")):
+        if _psql_file(meta["db"], m):
+            note(f"applied {m.name}")
+        else:
+            note(f"(skipped {m.name} - tables not created yet; runs on first start)")
+
+    print(f"installed {tag}  port={meta['port']}  db={meta['db']}")
+    print(f"  data: {root / 'data' / tag / 'output'}")
+    print(f"  run:  tp run {tag} --ui")
+    return 0
+
+
+def _pg_conn_args() -> dict:
+    from storage import secrets
+
+    return {
+        "host": os.getenv("POSTGRES_HOST", "localhost"),
+        "port": int(os.getenv("POSTGRES_PORT", "5432")),
+        "user": secrets.get("POSTGRES_USER", required=False) or getpass.getuser(),
+        "password": secrets.get("POSTGRES_PASSWORD", required=False) or "",
+    }
+
+
+def _create_database(db: str) -> None:
+    """createdb if the client binaries are there, over the wire if not.
+
+    Windows installs of Postgres routinely do not put the client binaries on
+    PATH, and a container-only setup has no local client at all. Falling back
+    to psycopg2 means `tp install` does not depend on which installer someone
+    used."""
+    if shutil.which("createdb") and run_ok(["createdb", db]):
+        note(f"created database {db}")
+        return
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(dbname="postgres", **_pg_conn_args())
+        conn.autocommit = True
+        try:
+            conn.cursor().execute(f'CREATE DATABASE "{db}"')
+            note(f"created database {db}")
+        except psycopg2.errors.DuplicateDatabase:
+            note(f"(database {db} already exists)")
+        finally:
+            conn.close()
+    except Exception as e:
+        note(f"(could not create database {db}: {e})")
+
+
+def _psql_file(db: str, path: Path) -> bool:
+    if shutil.which("psql"):
+        return run_ok(["psql", "-q", "-d", db, "-f", path])
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(dbname=db, **_pg_conn_args())
+        conn.autocommit = True
+        conn.cursor().execute(path.read_text())
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+# =============================================================================
+#  run
+# =============================================================================
+def cmd_run(args) -> int:
+    tag = args.tag
+    meta = registry_get(tag)
+    if not meta:
+        die(f"not installed: {tag} (run: tp install {tag})")
+
+    root = tp_root()
+    py = venv_python(tag)
+    if not py.exists():
+        die(f"no venv for {tag} (run: tp install {tag})")
+
+    from storage import secrets
+
+    env = os.environ.copy()
+    # Secrets resolved at the moment of use, straight into the child's
+    # environment - never onto disk, never into argv.
+    for k in secrets.SECRET_KEYS + secrets.OPTIONAL_KEYS:
+        v = secrets.get(k, required=False)
+        if v:
+            env[k] = v
+
+    env.update({
+        "POSTGRES_DB": meta["db"],
+        "TP_OUTPUT_DIR": str(root / "data" / tag / "output"),
+        "TP_UI_PORT": str(meta["port"]),
+        "TP_UI_HOST": "127.0.0.1",
+        "TP_VERSION": tag,
+    })
+
+    # SAFETY (§38.4): only one version may ever be armed, and a non-primary
+    # version may not be armed at all. Two schedulers both believing they own
+    # the account is the worst outcome this arrangement could produce.
+    if tag != read_primary():
+        env["TP_FORCE_PAPER"] = "1"
+        print(f"note: {tag} is not the primary version - forcing paper mode")
+
+    wt = root / "versions" / tag
+
+    # argparse's REMAINDER swallows the leading `--ui` before any positional
+    # can see it, so the mode is read off the front of `rest` rather than
+    # being its own positional. Getting this wrong is not a usability
+    # nuisance: `tp run <tag> --ui` would silently start the SCHEDULER, which
+    # on the primary version is a second scheduler believing it owns the
+    # account - the exact collision §38.4 exists to prevent.
+    rest = list(args.rest)
+    mode = rest.pop(0) if rest else "--scheduler"
+
+    if mode == "--ui":
+        cmd = [py, "main.py", "--ui"]
+    elif mode == "--scheduler":
+        cmd = [py, "scheduler.py"]
+    elif mode == "--backtest":
+        cmd = [py, "run_backtest.py", *rest]
+    elif mode == "--shell":
+        cmd = [os.environ.get("COMSPEC", "cmd") if IS_WINDOWS
+               else os.environ.get("SHELL", "/bin/sh")]
+    else:
+        cmd = [py, mode, *rest]
+
+    # Not os.execve: Windows has no exec that replaces the process in the way
+    # a shell script would expect, and a subprocess here also lets Ctrl-C
+    # reach the child on every platform.
+    return subprocess.run([str(c) for c in cmd], cwd=wt, env=env).returncode
+
+
+# =============================================================================
+#  list / promote / patch / remove
+# =============================================================================
+def cmd_list(_args) -> int:
+    primary = read_primary() or "-"
+    reg = registry_load()
+    print(f"{'TAG':<12} {'PORT':<6} {'DATABASE':<16} {'DATA':<10} PRIMARY")
+    for tag, v in sorted(reg.items()):
+        size = dir_size_h(tp_root() / "data" / tag)
+        print(f"{tag:<12} {v['port']:<6} {v['db']:<16} {size:<10} "
+              f"{'*' if tag == primary else ''}")
+    if not reg:
+        print("  (nothing installed - tp install <tag>)")
+    return 0
+
+
+def _services(cwd: Path, action: str, env: dict) -> None:
+    """Drive scripts/services.py in the target version's worktree (§45).
+
+    The version's OWN copy is used, not this one: a promoted v1.0.0 must be
+    managed by the service definitions that shipped with v1.0.0."""
+    script = cwd / "scripts" / "services.py"
+    if not script.exists():
+        # An older tag predates §45 and still has service.sh.
+        legacy = cwd / "service.sh"
+        if legacy.exists():
+            subprocess.run(["bash", str(legacy), action], cwd=cwd,
+                           env={**os.environ, **env}, check=False)
+        return
+    subprocess.run([sys.executable, str(script), action], cwd=cwd,
+                   env={**os.environ, **env}, check=False)
+
+
+def cmd_promote(args) -> int:
+    tag = args.tag
+    if not registry_get(tag):
+        die(f"not installed: {tag}")
+    root = tp_root()
+    old = read_primary()
+    if old and old != tag:
+        _services(root / "versions" / old, "uninstall", {"TP_LABEL_SUFFIX": f".{old}"})
+        note(f"uninstalled services for {old}")
+
+    primary_path().parent.mkdir(parents=True, exist_ok=True)
+    primary_path().write_text(tag + "\n")
+
+    _services(root / "versions" / tag, "install", {
+        "TP_OUTPUT_DIR": str(root / "data" / tag / "output"),
+        "POSTGRES_DB": registry_get(tag)["db"],
+        "TP_VERSION": tag,
+        "TP_LABEL_SUFFIX": f".{tag}",
+    })
+    print(f"primary is now {tag}")
+    print("  it is the ONLY version permitted to arm live execution, and even then")
+    print("  only once the §32 re-arm gate passes.")
+    return 0
+
+
+def cmd_patch(args) -> int:
+    line = args.line
+    d = tp_root() / "versions" / f"release-{line}"
+    if git("worktree", "add", str(d), f"release/{line}").returncode != 0:
+        note("(worktree exists)")
+    print(f"edit in {d}, then:")
+    print(f"  cd {d} && ./scripts/release.sh patch     # -> v{line}.N")
+    return 0
+
+
+def cmd_remove(args) -> int:
+    tag = args.tag
+    if tag == read_primary():
+        die(f"{tag} is the primary version - promote another first")
+    cmd_backup(argparse.Namespace(tag=tag))
+    run_ok(["git", "-C", REPO, "worktree", "remove", "--force",
+            tp_root() / "versions" / tag])
+    shutil.rmtree(tp_root() / "venvs" / tag, ignore_errors=True)
+    shutil.rmtree(tp_root() / "data" / tag, ignore_errors=True)
+    db = registry_get(tag).get("db")
+    if db and shutil.which("dropdb"):
+        run_ok(["dropdb", db])
+    reg = registry_load()
+    reg.pop(tag, None)
+    registry_save(reg)
+    print(f"removed {tag} (a dump was written to {tp_root() / 'archive'} first)")
+    return 0
+
+
+# =============================================================================
+#  backup (§39.2)
+# =============================================================================
+def cmd_backup(args) -> int:
+    root = tp_root()
+    tag = getattr(args, "tag", None) or read_primary()
+    if tag:
+        db = registry_get(tag).get("db")
+        if not db:
+            die(f"unknown version: {tag}")
+    else:
+        # No version manager in use (S-3, 2026-07-25). `tp install` has never
+        # been run here, so there is no registry and no PRIMARY - and the old
+        # behaviour was to die, which meant the ONE command whose whole job is
+        # "make sure a restore point exists" refused to run on the setup that
+        # most needed it. The 2026-07-25 incident had no restore point for
+        # exactly this reason.
+        tag = "working"
+        db = os.getenv("POSTGRES_DB", "")
+        if not db:
+            from storage import secrets
+
+            db = secrets.get("POSTGRES_DB", required=False) or "trading_platform"
+        note(f"no PRIMARY set - backing up the working checkout's database ({db})")
+        note("run 'tp install <tag>' if you want per-version databases (§38)")
+
+    if not shutil.which("pg_dump"):
+        die("pg_dump not found on PATH.\n"
+            "  macOS:   brew install postgresql@16\n"
+            "  Linux:   sudo apt install postgresql-client\n"
+            "  Windows: winget install PostgreSQL.PostgreSQL")
+
+    archive = root / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = archive / f"{tag}_{ts}.sql.gz"
+
+    # gzip in Python rather than a shell pipe: `pg_dump | gzip` hides
+    # pg_dump's exit status behind gzip's on every shell, which is how a
+    # truncated dump gets written and believed.
+    proc = subprocess.Popen(["pg_dump", db], stdout=subprocess.PIPE)
+    with gzip.open(out, "wb") as gz:
+        shutil.copyfileobj(proc.stdout, gz)
+    proc.stdout.close()
+    if proc.wait() != 0:
+        out.unlink(missing_ok=True)
+        die(f"pg_dump failed for {db} - no backup written")
+
+    # sha256 in Python: `shasum` is macOS, `sha256sum` is Linux, Windows has
+    # neither.
+    digest = hashlib.sha256(out.read_bytes()).hexdigest()
+    Path(f"{out}.sha256").write_text(f"{digest}  {out.name}\n")
+
+    # Verify it is readable BEFORE trusting it. An unverified backup is a
+    # belief, not a backup.
+    try:
+        with gzip.open(out, "rb") as gz:
+            while gz.read(1 << 20):
+                pass
+    except Exception as e:
+        out.unlink(missing_ok=True)
+        Path(f"{out}.sha256").unlink(missing_ok=True)
+        die(f"FAIL: dump is corrupt ({e})")
+
+    # Keep 14; prune the rest.
+    dumps = sorted(archive.glob(f"{tag}_*.sql.gz"), key=lambda p: p.stat().st_mtime,
+                   reverse=True)
+    for old in dumps[14:]:
+        old.unlink(missing_ok=True)
+        Path(f"{old}.sha256").unlink(missing_ok=True)
+
+    print(f"backed up {db} -> {out} ({human_size(out.stat().st_size)})")
+    print("  For off-machine safety, sync the archive directory to an encrypted")
+    print("  destination - but NEVER to the git remote. A dump contains your")
+    print("  positions, account activity and entire signal history. It is more")
+    print("  sensitive than the code.")
+    return 0
+
+
+# =============================================================================
+#  autobackup (S-3)
+# =============================================================================
+def cmd_autobackup(args) -> int:
+    """`tp backup` only helps if something runs it. On 2026-07-25 a test suite
+    wiped the paper ledger and there was no restore point, because nothing ever
+    had. A daily scheduled job is the smallest permanent fix - deliberately NOT
+    tied to the scheduler, so backups keep happening on the days the scheduler
+    is stopped, which are exactly the days you are changing things.
+
+    Portable now: launchd on macOS, a systemd timer on Linux, schtasks on
+    Windows. The bash version was launchd-only and told Linux users to write
+    their own."""
+    action = args.action
+    if action == "install":
+        _autobackup_install()
+    elif action == "uninstall":
+        _autobackup_uninstall()
+    else:
+        _autobackup_status()
+    return 0
+
+
+AUTOBACKUP_LABEL = "com.tradingplatform.autobackup"
+
+
+def _autobackup_install() -> None:
+    root = tp_root()
+    (root / "archive").mkdir(parents=True, exist_ok=True)
+    log = root / "archive" / "autobackup.log"
+    tp = REPO / "scripts" / "tp"
+
+    if IS_MAC:
+        plist = Path.home() / "Library/LaunchAgents" / f"{AUTOBACKUP_LABEL}.plist"
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>$AUTOBACKUP_LABEL</string>
+  <key>Label</key><string>{AUTOBACKUP_LABEL}</string>
   <key>ProgramArguments</key>
-  <array>
-    <string>$REPO/scripts/tp</string>
-    <string>backup</string>
-  </array>
-  <key>WorkingDirectory</key><string>$REPO</string>
+  <array><string>{sys.executable}</string><string>{tp}</string><string>backup</string></array>
+  <key>WorkingDirectory</key><string>{REPO}</string>
   <!-- 02:30 local. After the close, before any morning work. -->
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>30</integer></dict>
@@ -385,166 +705,309 @@ cmd_autobackup() {
        classic way a scheduled backup turns out never to have run. -->
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>$TP_ROOT/archive/autobackup.log</string>
-  <key>StandardErrorPath</key><string>$TP_ROOT/archive/autobackup.log</string>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>$PATH</string>
-    <key>HOME</key><string>$HOME</string>
-    <key>TP_ROOT</key><string>$TP_ROOT</string>
+    <key>PATH</key><string>{os.environ.get('PATH', '')}</string>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>TP_ROOT</key><string>{root}</string>
   </dict>
 </dict>
 </plist>
-PLIST
-      launchctl bootout "gui/$(id -u)/$AUTOBACKUP_LABEL" 2>/dev/null || true
-      launchctl bootstrap "gui/$(id -u)" "$plist"
-      echo "installed $AUTOBACKUP_LABEL (daily 02:30, and once now)"
-      echo "  log: $TP_ROOT/archive/autobackup.log"
-      ;;
-    uninstall)
-      launchctl bootout "gui/$(id -u)/$AUTOBACKUP_LABEL" 2>/dev/null || true
-      rm -f "$plist"
-      echo "removed $AUTOBACKUP_LABEL"
-      ;;
-    status)
-      if launchctl list 2>/dev/null | grep -q "$AUTOBACKUP_LABEL"; then
-        note "ok: $AUTOBACKUP_LABEL is loaded"
-      else
-        note "NOT installed - run: tp autobackup install"
-      fi
-      local newest
-      newest=$(ls -t "$TP_ROOT/archive/"*.sql.gz 2>/dev/null | head -1 || true)
-      if [ -n "$newest" ]; then
-        echo "  newest dump: $newest ($(du -h "$newest" | cut -f1))"
-      else
-        echo "  no dumps in $TP_ROOT/archive"
-      fi
-      ;;
-    *) die "usage: tp autobackup install|uninstall|status" ;;
-  esac
-}
+""")
+        run_ok(["launchctl", "bootout", f"gui/{os.getuid()}/{AUTOBACKUP_LABEL}"])
+        run(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist])
+    elif IS_WINDOWS:
+        if not run_ok(["schtasks", "/Create", "/TN", "TradingPlatform_Autobackup",
+                       "/TR", f'"{sys.executable}" "{tp}" backup',
+                       "/SC", "DAILY", "/ST", "02:30", "/RL", "LIMITED", "/F"]):
+            note("FAILED to create the scheduled task - group policy may forbid it. "
+                 "Run `tp backup` from your own scheduled job instead.")
+            return
+    else:
+        unit_dir = Path.home() / ".config/systemd/user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        (unit_dir / "tp-autobackup.service").write_text(f"""[Unit]
+Description=Trading Platform database backup
 
-# ── doctor (§39.3) ──────────────────────────────────────────────────────────
-cmd_doctor() {
-  local fail=0
+[Service]
+Type=oneshot
+Environment=TP_ROOT={root}
+ExecStart={sys.executable} {tp} backup
+""")
+        (unit_dir / "tp-autobackup.timer").write_text("""[Unit]
+Description=Daily Trading Platform database backup
 
-  echo '== secrets are not in the tree =='
-  if [ -f "$REPO/.env" ]; then
-    if git -C "$REPO" check-ignore -q .env; then
-      note 'ok: .env exists and is ignored'
-    else
-      note 'FAIL: .env exists and is NOT gitignored'; fail=1
-    fi
-  else
-    note 'ok: no .env (secrets come from the Keychain)'
-  fi
-  if git -C "$REPO" ls-files | grep -Eiq '(^|/)\.env$|\.db$|\.pickle$'; then
-    note 'FAIL: a sensitive file is TRACKED'
-    git -C "$REPO" ls-files | grep -Ei '(^|/)\.env$|\.db$|\.pickle$' | sed 's/^/         /'
-    fail=1
-  else
-    note 'ok: nothing sensitive tracked'
-  fi
+[Timer]
+OnCalendar=*-*-* 02:30:00
+# The machine is usually off or asleep at 02:30. Persistent=true runs the
+# missed job on the next boot instead of skipping it silently, which is the
+# classic way a scheduled backup turns out never to have run.
+Persistent=true
 
-  echo '== history is clean =='
-  if git -C "$REPO" log --all --diff-filter=A --name-only --pretty=format: 2>/dev/null \
-     | sort -u | grep -Eq '^\.env$|\.db$|\.pickle$'; then
-    note 'FAIL: a secret is in the history - see §34.6 (git filter-repo), then ROTATE'
-    fail=1
-  else
-    note 'ok: no secret ever committed'
-  fi
+[Install]
+WantedBy=timers.target
+""")
+        run_ok(["systemctl", "--user", "daemon-reload"])
+        run_ok(["systemctl", "--user", "enable", "--now", "tp-autobackup.timer"])
 
-  echo '== config.yaml has no literal secrets =='
-  python3 "$REPO/scripts/check_config_secrets.py" | sed 's/^/  /' || fail=1
+    print(f"installed autobackup (daily 02:30)")
+    print(f"  log: {log}")
 
-  echo '== gitleaks =='
-  if command -v gitleaks >/dev/null; then
-    gitleaks detect --source "$REPO" --no-banner --redact 2>&1 | tail -3 | sed 's/^/  /' || fail=1
-  else
-    note 'skipped: gitleaks not installed (brew install gitleaks)'
-  fi
 
-  echo '== hooks installed =='
-  [ -e "$REPO/.git/hooks/pre-push" ] && note 'ok: pre-push' \
-    || { note 'FAIL: pre-push hook missing - ln -sf ../../scripts/hooks/pre-push .git/hooks/pre-push'; fail=1; }
-  [ -e "$REPO/.git/hooks/pre-commit" ] && note 'ok: pre-commit' \
-    || { note 'FAIL: pre-commit hook missing - run: pre-commit install'; fail=1; }
+def _autobackup_uninstall() -> None:
+    if IS_MAC:
+        run_ok(["launchctl", "bootout", f"gui/{os.getuid()}/{AUTOBACKUP_LABEL}"])
+        (Path.home() / "Library/LaunchAgents" / f"{AUTOBACKUP_LABEL}.plist").unlink(missing_ok=True)
+    elif IS_WINDOWS:
+        run_ok(["schtasks", "/Delete", "/TN", "TradingPlatform_Autobackup", "/F"])
+    else:
+        run_ok(["systemctl", "--user", "disable", "--now", "tp-autobackup.timer"])
+        for f in ("tp-autobackup.timer", "tp-autobackup.service"):
+            (Path.home() / ".config/systemd/user" / f).unlink(missing_ok=True)
+    print("removed autobackup")
 
-  echo '== credentials resolve =='
-  cmd_secrets_check || fail=1
 
-  echo '== dependencies match the pins =='
-  python3 "$REPO/scripts/check_deps.py" >/dev/null 2>&1 && note 'ok: no drift' \
-    || { note 'FAIL: dependency drift - python3 scripts/check_deps.py'; fail=1; }
+def _autobackup_status() -> None:
+    installed = False
+    if IS_MAC:
+        r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+        installed = AUTOBACKUP_LABEL in r.stdout
+    elif IS_WINDOWS:
+        installed = subprocess.run(
+            ["schtasks", "/Query", "/TN", "TradingPlatform_Autobackup"],
+            capture_output=True).returncode == 0
+    else:
+        installed = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "tp-autobackup.timer"],
+            capture_output=True).returncode == 0
+    note("ok: autobackup is installed" if installed
+         else "NOT installed - run: tp autobackup install")
 
-  echo '== live execution is disarmed =='
-  local live
-  live=$(cd "$REPO" && python3 -c "
-import yaml
-t = (yaml.safe_load(open('config.yaml')) or {}).get('trading', {}) or {}
-print(bool(t.get('live_execution_enabled')) and
-      str(t.get('watch_execute','WATCH')).upper()=='EXECUTE' and
-      bool(t.get('auto_trade')))" 2>/dev/null || echo unknown)
-  [ "$live" = "False" ] && note 'ok: config.yaml is disarmed' \
-    || { note "FAIL: config.yaml reports live mode = $live (§2)"; fail=1; }
+    dumps = sorted((tp_root() / "archive").glob("*.sql.gz"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    if dumps:
+        print(f"  newest dump: {dumps[0]} ({dumps[0].stat().st_size // 1024}K)")
+    else:
+        print(f"  no dumps in {tp_root() / 'archive'}")
 
-  echo '== backups exist and are recent =='
-  if find "$TP_ROOT/archive" -name '*.sql.gz' -mtime -2 2>/dev/null | grep -q .; then
-    note 'ok: a dump from the last 48h'
-  else
-    note 'FAIL: no recent backup - run: tp backup'; fail=1
-  fi
 
-  echo
-  if [ "$fail" = 0 ]; then echo 'ALL CLEAR'; else echo 'ISSUES FOUND'; return 1; fi
-}
+# =============================================================================
+#  doctor (§39.3)
+# =============================================================================
+def cmd_doctor(_args) -> int:
+    fail = 0
 
-usage() {
-  cat <<'USAGE'
-tp - trading_platform version manager (§38, §39)
+    print("== platform ==")
+    try:
+        from storage import platform_support
 
-  tp install <tag>            worktree + venv + database + data dir for a tag
-  tp run <tag> [--ui|--scheduler|--backtest|--shell]
-  tp list                     versions, ports, databases, sizes
-  tp promote <tag>            make this the launchd-managed (and only armable) version
-  tp patch <line>             worktree on release/<line> to cut a patch
-  tp remove <tag>             worktree + venv + database, after a dump to archive/
+        for k, v in platform_support.describe().items():
+            note(f"{k}: {v}")
+    except Exception as e:
+        note(f"could not describe platform: {e}")
 
-  tp secrets check            what resolves, and from where
-  tp secrets set <KEY>        store one secret in the Keychain (prompts, no echo)
-  tp secrets import [file] [--shred]
-                              mirror .env into the Keychain
-  tp backup [tag]             verified, pruned pg_dump into ~/tp/archive
-  tp autobackup install|uninstall|status
-                              daily launchd job that runs `tp backup`
-  tp doctor                   standing audit - run before any push, and monthly
+    print("== secrets are not in the tree ==")
+    envfile = REPO / ".env"
+    if envfile.exists():
+        if git("check-ignore", "-q", ".env").returncode == 0:
+            note("ok: .env exists and is ignored")
+        else:
+            note("FAIL: .env exists and is NOT gitignored")
+            fail = 1
+    else:
+        note("ok: no .env (secrets come from the keyring)")
 
+    tracked = git("ls-files").stdout.splitlines()
+    bad = [f for f in tracked
+           if f.endswith((".db", ".pickle")) or f == ".env" or f.endswith("/.env")]
+    if bad:
+        note("FAIL: a sensitive file is TRACKED")
+        for f in bad:
+            print(f"         {f}")
+        fail = 1
+    else:
+        note("ok: nothing sensitive tracked")
+
+    print("== history is clean ==")
+    hist = git("log", "--all", "--diff-filter=A", "--name-only", "--pretty=format:").stdout
+    if any(line.strip() == ".env" or line.endswith((".db", ".pickle"))
+           for line in hist.splitlines() if line.strip()):
+        note("FAIL: a secret is in the history - see §34.6 (git filter-repo), then ROTATE")
+        fail = 1
+    else:
+        note("ok: no secret ever committed")
+
+    print("== config.yaml has no literal secrets ==")
+    if not run_ok([sys.executable, REPO / "scripts" / "check_config_secrets.py"]):
+        fail = 1
+        note("FAIL: python3 scripts/check_config_secrets.py")
+    else:
+        note("ok")
+
+    print("== gitleaks ==")
+    if shutil.which("gitleaks"):
+        r = subprocess.run(["gitleaks", "detect", "--source", str(REPO),
+                            "--no-banner", "--redact"], capture_output=True, text=True)
+        for line in (r.stdout + r.stderr).splitlines()[-3:]:
+            print(f"  {line}")
+        fail = fail or (1 if r.returncode else 0)
+    else:
+        note("skipped: gitleaks not installed (brew install gitleaks)")
+
+    print("== hooks installed ==")
+    for hook in ("pre-push", "pre-commit"):
+        if (REPO / ".git" / "hooks" / hook).exists():
+            note(f"ok: {hook}")
+        else:
+            note(f"FAIL: {hook} hook missing")
+            fail = 1
+
+    print("== credentials resolve ==")
+    if cmd_secrets_check(None):
+        fail = 1
+
+    print("== dependencies match the pins ==")
+    if run_ok([sys.executable, REPO / "scripts" / "check_deps.py"]):
+        note("ok: no drift")
+    else:
+        note("FAIL: dependency drift - python3 scripts/check_deps.py")
+        fail = 1
+
+    print("== the reference TA backend is active ==")
+    # §13 and §41. A machine that fell back to the hand-rolled engine produces
+    # scores that cannot be compared with any other machine's, and nothing
+    # else in this audit would notice.
+    try:
+        from engine.ticker_analyzer import TA_BACKEND
+
+        if "pandas_ta" in TA_BACKEND:
+            note(f"ok: {TA_BACKEND}")
+        else:
+            note(f"FAIL: {TA_BACKEND} - scores are NOT comparable with other machines")
+            fail = 1
+    except Exception as e:
+        note(f"FAIL: could not import ticker_analyzer ({e})")
+        fail = 1
+
+    print("== live execution is disarmed ==")
+    try:
+        import yaml
+
+        t = (yaml.safe_load((REPO / "config.yaml").read_text()) or {}).get("trading", {}) or {}
+        armed = (bool(t.get("live_execution_enabled"))
+                 and str(t.get("watch_execute", "WATCH")).upper() == "EXECUTE"
+                 and bool(t.get("auto_trade")))
+        if armed:
+            note("FAIL: config.yaml reports live mode (§2)")
+            fail = 1
+        else:
+            note("ok: config.yaml is disarmed")
+    except Exception as e:
+        note(f"FAIL: could not read config.yaml ({e})")
+        fail = 1
+
+    print("== backups exist and are recent ==")
+    cutoff = datetime.datetime.now().timestamp() - 2 * 86400
+    recent = [p for p in (tp_root() / "archive").glob("*.sql.gz")
+              if p.stat().st_mtime > cutoff]
+    if recent:
+        note("ok: a dump from the last 48h")
+    else:
+        note("FAIL: no recent backup - run: tp backup")
+        fail = 1
+
+    print()
+    print("ALL CLEAR" if not fail else "ISSUES FOUND")
+    return fail
+
+
+# =============================================================================
+#  CLI
+# =============================================================================
+EPILOG = """
 Everyday use:
   tp install v1.0.0           baseline, reproducible, forced paper
   tp run v1.0.0 --backtest    reproduce the 0-trade result on the old code
-  tp promote v1.1.0           launchd now runs 1.1.0 in the background
-USAGE
-}
+  tp promote v1.4.0           the background services now run 1.4.0
+  tp bootstrap                what is missing on this machine, and how to fix it
+"""
 
-case "${1:-}" in
-  install) shift; cmd_install "$@" ;;
-  run)     shift; cmd_run "$@" ;;
-  list)    shift; cmd_list "$@" ;;
-  promote) shift; cmd_promote "$@" ;;
-  patch)   shift; cmd_patch "$@" ;;
-  remove)  shift; cmd_remove "$@" ;;
-  backup)  shift; cmd_backup "$@" ;;
-  autobackup) shift; cmd_autobackup "$@" ;;
-  doctor)  shift; cmd_doctor "$@" ;;
-  secrets)
-    shift
-    case "${1:-}" in
-      check)  shift; cmd_secrets_check ;;
-      set)    shift; cmd_secrets_set "$@" ;;
-      import) shift; cmd_secrets_import "$@" ;;
-      *) die "usage: tp secrets check|set <KEY>|import [file] [--shred]" ;;
-    esac ;;
-  ''|-h|--help|help) usage ;;
-  *) die "unknown command: $1 (try: tp --help)" ;;
-esac
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="tp", description=__doc__, epilog=EPILOG,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("install", help="worktree + venv + database + data dir for a tag")
+    p.add_argument("tag")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("run", help="run a version (--ui|--scheduler|--backtest|--shell)")
+    p.add_argument("tag")
+    # REMAINDER captures the mode AND anything after it. A separate `mode`
+    # positional would never match: REMAINDER takes everything from the first
+    # unrecognised token onward, including the leading `--ui`.
+    p.add_argument("rest", nargs=argparse.REMAINDER,
+                   help="--ui | --scheduler | --backtest [args] | --shell")
+    p.set_defaults(func=cmd_run)
+
+    sub.add_parser("list", help="versions, ports, databases, sizes").set_defaults(func=cmd_list)
+
+    p = sub.add_parser("promote", help="make this the managed (and only armable) version")
+    p.add_argument("tag")
+    p.set_defaults(func=cmd_promote)
+
+    p = sub.add_parser("patch", help="worktree on release/<line> to cut a patch")
+    p.add_argument("line")
+    p.set_defaults(func=cmd_patch)
+
+    p = sub.add_parser("remove", help="worktree + venv + database, after a dump")
+    p.add_argument("tag")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("backup", help="verified, pruned pg_dump into the archive")
+    p.add_argument("tag", nargs="?")
+    p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("autobackup", help="daily scheduled job that runs `tp backup`")
+    p.add_argument("action", nargs="?", default="status",
+                   choices=["install", "uninstall", "status"])
+    p.set_defaults(func=cmd_autobackup)
+
+    sub.add_parser("doctor", help="standing audit - before any push, and monthly")\
+        .set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("bootstrap", help="check this machine's prerequisites (§46.2)")
+    p.set_defaults(func=lambda a: subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "bootstrap.py")]).returncode)
+
+    p = sub.add_parser("secrets", help="check|set|import|export-env")
+    ssub = p.add_subparsers(dest="secrets_cmd")
+    ssub.add_parser("check").set_defaults(func=cmd_secrets_check)
+    q = ssub.add_parser("set")
+    q.add_argument("key")
+    q.set_defaults(func=cmd_secrets_set)
+    q = ssub.add_parser("import")
+    q.add_argument("file", nargs="?")
+    q.add_argument("--shred", action="store_true")
+    q.set_defaults(func=cmd_secrets_import)
+    q = ssub.add_parser("export-env")
+    q.add_argument("--out", default=".env.runtime")
+    q.set_defaults(func=cmd_secrets_export_env)
+
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return 0
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

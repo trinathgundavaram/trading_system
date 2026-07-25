@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  §47.6 (Phase 3) - start-at-login for the containerised architecture.
+
+  WHAT CHANGED. launchd's job used to be "run python3 scheduler.py, wrapped in
+  caffeinate". It now shrinks to two things: bring the Docker stack up, and
+  keep the host agent alive. It no longer knows anything about Python, venvs
+  or scheduler.py - which is precisely why the same shape works as a systemd
+  unit or a Windows scheduled task with only the paths changed.
+
+  THE WAIT-FOR-DOCKER LOOP IS NOT DEFENSIVE PADDING. Docker Desktop takes
+  20-40 seconds to become usable after login. A `docker compose` issued before
+  then fails, and it fails in a way that looks exactly like the 22 July
+  "scheduler stopped firing" incident - no scheduler, no error anyone sees -
+  which would send you hunting in entirely the wrong place. It is capped so a
+  Docker that never starts produces a visible failure rather than a login that
+  hangs forever.
+
+  THE .env.runtime LIFECYCLE. The agent writes it (reading the Keychain, which
+  Docker cannot), compose consumes it, and it is deleted immediately after.
+  The secrets then live in the container environment, not on disk.
+
+  INSTALL:
+    cp deploy/com.tradingplatform.stack.plist ~/Library/LaunchAgents/
+    # edit TP_HOME and TP_VERSION below to match your checkout
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tradingplatform.stack.plist
+
+  UNINSTALL:
+    launchctl bootout gui/$(id -u)/com.tradingplatform.stack
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.tradingplatform.stack</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>
+      set -euo pipefail
+      cd "$TP_HOME"
+
+      open -ga Docker
+
+      # Cap the wait at 120s. A Docker that is never coming up should fail
+      # loudly here, not leave launchd retrying an invisible compose command.
+      for i in $(seq 1 60); do
+        docker info &gt;/dev/null 2&gt;&amp;1 &amp;&amp; break
+        sleep 2
+      done
+      docker info &gt;/dev/null 2&gt;&amp;1 || {
+        echo "docker did not become usable within 120s - not starting the stack" &gt;&amp;2
+        exit 1
+      }
+
+      # Keychain -> 0600 file, for containers that cannot read a Keychain.
+      python3 scripts/tp_agent.py --write-env
+
+      # --env-file is REQUIRED, not tidiness. `env_file:` inside the compose
+      # file supplies variables to the CONTAINER; it does not supply them to
+      # compose's own ${...} interpolation. docker-compose.yml uses
+      # ${POSTGRES_PASSWORD:?...}, which is read from the shell environment or
+      # a file named exactly `.env` - so without this flag compose aborts
+      # before starting anything, at login, where nobody is watching.
+      docker compose --env-file .env.runtime -p "tp-${TP_VERSION//./-}" up -d
+
+      # The values are in the container environment now; the file is not
+      # needed and should not outlive the command that consumed it.
+      rm -f .env.runtime
+
+      # Becomes the long-running process launchd supervises. If the agent
+      # dies, KeepAlive restarts it and the popups resume; the engine in the
+      # containers is untouched either way, which is the failure mode §47
+      # deliberately designed for.
+      exec python3 scripts/tp_agent.py
+    </string>
+  </array>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+
+  <key>StandardOutPath</key><string>/tmp/tp-stack.log</string>
+  <key>StandardErrorPath</key><string>/tmp/tp-stack.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- EDIT THESE TWO. -->
+    <key>TP_HOME</key><string>/Users/CHANGEME/trading_platform</string>
+    <key>TP_VERSION</key><string>v1.4.0</string>
+
+    <!-- launchd gives a service a minimal PATH; docker and python3 are not
+         on it. Homebrew on Apple silicon is /opt/homebrew/bin. -->
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>TP_UI_PORT</key><string>8080</string>
+    <!-- Fail closed, same rule as everywhere else: a stack brought up by
+         login is not automatically an armed stack (§38.4). -->
+    <key>TP_FORCE_PAPER</key><string>1</string>
+  </dict>
+</dict>
+</plist>

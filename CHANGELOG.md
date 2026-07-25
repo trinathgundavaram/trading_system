@@ -20,7 +20,127 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
-Nothing. Phase 3 (§41–§47) is on the `phase3` branch and ships as v2.1.0.
+Nothing.
+
+## [2.1] — v2.1.0 — 2026-07-25
+
+### Phase 3 (§41–§47) — portability and reproducibility
+
+**Decision function: UNCHANGED.** Nothing here touches scoring, sizing, entry
+or exit logic. `config.yaml` gains three keys
+(`trading.max_clock_skew_seconds`, `notifications.transports`,
+`notifications.webhook_url`); none is read by a rule. `classify_change.py` will
+report MAJOR because `scheduler.py` and `storage/database.py` sit in
+`DECISION_PATHS` — the changes in both are a pre-cycle clock guard and a
+`pg_notify` next to an existing INSERT. `config_fingerprint` is **unchanged at
+`cc9a149613427f56`**: the three new keys are notification and clock settings,
+and the fingerprint deliberately covers only values that alter a decision.
+
+**The point of this phase is a property, not a feature.** §41 inventoried
+eleven macOS-locked places, three of them safety-critical, and a fourth,
+subtler problem: three operating systems × several Python versions × unpinned
+numeric libraries is a matrix in which the same bars can produce different
+indicator values, therefore different scores, therefore different trades, with
+no error and no log line. Phase 4 is a large change to the decision function
+whose entire justification is a measured before-and-after — and that
+measurement is only trustworthy if both versions compute indicators
+identically. This is what makes Phase 4 provable rather than hopeful.
+
+#### The three that were safety-critical
+
+- hang protection now works off macOS — `engine/cycle_supervisor.py` — §43.2
+
+  `os.killpg`, `os.getpgid` and `signal.SIGKILL` do not exist on Windows, so
+  the module raised `AttributeError` at import and the platform had **no hang
+  protection at all** there. POSIX keeps the process-group path, which is
+  atomic; Windows gets a psutil tree walk, which is racier and is the only
+  mechanism the OS offers.
+
+- secrets no longer fall back to plaintext off macOS — `storage/secrets.py` — §44
+
+  The `security` binary exists only on macOS. Everywhere else the keychain tier
+  silently returned `''` and the system fell back to the environment, which in
+  practice means a file — the exact thing §3 and §39 exist to eliminate. Now
+  `keyring`: Keychain, Credential Locker, Secret Service, or an encrypted file
+  on headless Linux. Environment stays FIRST, deliberately, because that is
+  what makes containers and CI possible.
+
+- background services exist on every OS — `scripts/services.py`, `service.sh` — §45
+
+  `service.sh` was 100% launchd. Elsewhere the scheduler ran in a foreground
+  terminal and died with the window — the failure `service.sh` was written to
+  fix, reintroduced everywhere else. `service.sh` is now a shim; the original
+  is kept as `service.launchd.sh.bak`.
+
+#### The container (§42)
+
+- `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `scripts/healthcheck.py`,
+  `scripts/build_version.sh`
+
+  The image pins the OS, the Python build, every wheel and the timezone
+  database, and **asserts `pandas_ta` at build time** — failing the build is
+  infinitely better than discovering at runtime that this image fell back to
+  `ta_fallback.py` and computed scores comparable with nothing (§13). The UI
+  publishes on `127.0.0.1` only; `TP_FORCE_PAPER` defaults to 1; container logs
+  are capped so E-10 cannot recur.
+
+- a skewed clock refuses to trade — `scheduler.py` — §42.4
+
+  Docker Desktop's VM clock can lag the host badly after a laptop sleeps, and
+  every market-hours and stop decision is a function of the local clock. Above
+  120s of skew the cycle aborts and is RECORDED. Compared against an HTTP
+  `Date` header — no NTP client in the image, cached for five minutes. "Cannot
+  tell" (no network) proceeds: turning a network blip into a trading outage
+  would be the worse trade.
+
+#### The split (§47)
+
+- the engine states events, the host delivers them — `scheduler.py`,
+  `storage/database.py`, `scripts/tp_agent.py` — §47.3, §47.4
+
+  `log_ui_event()` was already a cross-process outbox with two consumers. The
+  host agent is a third. A transactional `pg_notify` alongside the INSERT means
+  it listens rather than polls, removing a one-second latency floor on the
+  kill-switch alert — and NOTIFY fires only if the INSERT commits, so the agent
+  can never be told about an event that was rolled back. The agent is ~150
+  lines and is now the **entire OS-specific surface** of the platform. It
+  contains no trading logic: if it dies, the engine keeps running and you stop
+  getting popups.
+
+- clipboard and file-open moved into the browser — `server.py`, `ui/index.html` — §47.5
+
+  `/api/prompt/copy` shelled out to `pbcopy` on the SERVER, which assumed the
+  server and the human were the same machine. That was already false over an
+  SSH tunnel. Replaced by `navigator.clipboard` and `/api/prompt/raw` — two
+  features improved, two shell-outs removed, and both now work from a phone.
+
+- `deploy/com.tradingplatform.stack.plist` — §47.6
+
+  launchd's job shrinks to "bring the stack up, keep the agent alive". The
+  wait-for-Docker loop is not padding: Docker Desktop takes 20–40s after login,
+  and a compose command issued before then fails in a way that looks exactly
+  like the 22 July incident.
+
+#### Everything else
+
+- one place for OS-specific calls — `storage/platform_support.py`, `main.py` — §43.1
+- notifications are a transport chain, and `log` is last and always succeeds,
+  so a notification is never silently dropped — `engine/notifications.py` — §43.3
+- `scripts/tp` rewritten in Python; `rm -P`, `shasum` and `sed -i ''` were all
+  BSD-only — `scripts/tp` (bash kept as `scripts/tp.sh.bak`) — §46.1
+- `scripts/bootstrap.py` reports what is missing with the install command for
+  *this* OS — §46.2
+- `psutil`, `keyring`, `keyrings.cryptfile`, `tzdata` pinned — `requirements.txt`
+- `tests/test_phase3_portability.py`, including a lint that fails the build if
+  a macOS-only binary appears in the engine
+
+#### Not done, and deliberately
+
+The Phase 3 **exit criterion** is not a code change and cannot be claimed by
+this entry: build images from two tags, run the same backtest window in both,
+and confirm the shared code paths produce identical numbers. Until that has
+been run, the reproducibility claim above is a design intention rather than a
+measured fact. `scripts/build_version.sh` exists to make it a short exercise.
 
 ## [2.0] — v2.0.0 — 2026-07-25
 

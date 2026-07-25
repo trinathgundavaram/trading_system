@@ -18,6 +18,14 @@ trading:
   cycle_max_parallel_tickers: 6
   max_cycle_duration_minutes: 12
   hard_kill_minutes: 15
+  # §42.4 (Phase 3). A cycle aborts if the local clock is more than this far
+  # from an HTTP Date reference. 120s is well inside any tolerance that
+  # matters for market-hours and stop timing, and well outside normal NTP
+  # jitter. Raise it only if you understand that every stop timestamp and
+  # every market-open decision is being made against a clock you have just
+  # declared untrustworthy. Docker Desktop's VM clock after a laptop sleep is
+  # the case this exists for.
+  max_clock_skew_seconds: 120
   day_eod_flatten_enabled: true
   day_eod_flatten_time_et: '15:55'
   max_day_positions: 5
@@ -764,7 +772,23 @@ backtest:
 #   python3 -c 'import secrets; print(secrets.token_urlsafe(32))' | \
 #     xargs -I{} security add-generic-password -a $USER -s tp_UI_AUTH_TOKEN -w {} -U
 # storage/secrets.py resolves environment -> .env -> Keychain.
+# Notifications (§43.3, Phase 3). Transports are tried IN THIS ORDER until one
+# succeeds. `log` is last and always succeeds, so a notification is never
+# silently lost - the pre-Phase-3 code dropped it with a warning when
+# osascript failed, which on a headless box or inside a container was always.
+#
+# On a container-only or headless install, put webhook first and drop desktop:
+# the desktop attempt cannot work there and only costs a subprocess spawn.
 notifications:
   enabled: true
   desktop_enabled: true
+  transports: [desktop, webhook, log]
+  # Any endpoint that accepts a POST: https://ntfy.sh/your-topic, a Slack or
+  # Discord incoming webhook, Pushover. This is the transport that reaches you
+  # when you are not at the machine, and the only one that works from inside a
+  # container - which under §47 is where the engine runs. Resolved from the
+  # environment so the URL is not committed.
+  # `:-` default is required, not stylistic: config_loader hard-fails on an
+  # unset ${VAR} with no fallback, and a webhook is genuinely optional.
+  webhook_url: ${NOTIFY_WEBHOOK_URL:-}
   high_conviction_buy_pct: 80

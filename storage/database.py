@@ -1300,12 +1300,39 @@ class Database:
         import json
         from datetime import timedelta
         cutoff = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        body = json.dumps(payload, default=str)
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO ui_events (created_at, event_type, payload) VALUES (?,?,?)",
-                (datetime.utcnow().isoformat(), event_type, json.dumps(payload, default=str)),
+                (datetime.utcnow().isoformat(), event_type, body),
             )
             conn.execute("DELETE FROM ui_events WHERE created_at < ?", (cutoff,))
+
+            # §47.3 (Phase 3): push, alongside the poll.
+            #
+            # This outbox already had two consumers - scheduler.py writes,
+            # server.py polls with get_ui_events_since(). The host agent
+            # (scripts/tp_agent.py) is simply a third, and it is the process
+            # that owns everything the containerised engine cannot reach: the
+            # notification centre, the wakelock, the keyring. No new
+            # transport, no new protocol, no change to the scheduler.
+            #
+            # NOTIFY rather than another poller because a one-second polling
+            # floor on a kill-switch alert is a second too many. It is also
+            # TRANSACTIONAL: the notification fires only if this INSERT
+            # commits, so the agent can never be told about an event that was
+            # rolled back - which a side-channel like a file or a socket
+            # could not promise.
+            #
+            # Best-effort by design. A missing LISTENer, a payload above
+            # Postgres's 8000-byte NOTIFY limit, or a SQLite-backed test
+            # database must not fail the write that matters.
+            try:
+                conn.execute("SELECT pg_notify('tp_events', ?)",
+                             (json.dumps({"type": event_type, "payload": payload},
+                                         default=str)[:7900],))
+            except Exception as e:
+                logger.debug(f"pg_notify skipped for {event_type}: {e}")
 
     def get_ui_events_since(self, last_id: int, limit: int = 100) -> list:
         import json

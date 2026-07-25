@@ -1,0 +1,106 @@
+# =============================================================================
+#  §42.2 (Phase 3) - one version of the stack.
+#
+#  Run several versions side by side by giving each its own compose PROJECT
+#  (see §42.3 and scripts/build_version.sh):
+#
+#    TP_VERSION=v1.3.1 TP_UI_PORT=8080 \
+#      docker compose --env-file .env.runtime -p tp-v1-3-1 up -d
+#    TP_VERSION=v1.4.0 TP_UI_PORT=8081 \
+#      docker compose --env-file .env.runtime -p tp-v1-4-0 up -d
+#
+#  --env-file is not optional. `env_file:` below supplies variables to the
+#  CONTAINER; compose's own ${...} interpolation (POSTGRES_PASSWORD, below)
+#  reads only the shell environment or a file named exactly `.env`. Without
+#  the flag compose refuses to start, which is the right behaviour but an
+#  extremely confusing one if you have just written .env.runtime and expect
+#  it to be found.
+#
+#  Separate project = separate network, separate volumes, separate database.
+#  Collisions become impossible rather than merely unlikely, which is what
+#  makes the Phase 3 exit criterion (same backtest, two images, identical
+#  numbers) something you can actually run.
+# =============================================================================
+
+# Cap container logs. E-10 was 77 MB of unrotated log; the json-file driver
+# with no options is how that happens again.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  db:
+    image: postgres:16-alpine
+    <<: *logging
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading_platform}
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      # No default, deliberately: `:?` makes compose refuse to start rather
+      # than silently bringing up a database with a guessable password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.runtime}
+    volumes:
+      - tp-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-trader}"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  scheduler:
+    image: trading-platform:${TP_VERSION:-dev}
+    <<: *logging
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      TP_OUTPUT_DIR: /data/output
+      TP_VERSION: ${TP_VERSION:-dev}
+      # FAIL CLOSED. A version that has not been explicitly promoted to
+      # primary cannot arm live execution, whatever its committed config
+      # says (§38.4). Overriding this is a deliberate act, not a default.
+      TP_FORCE_PAPER: ${TP_FORCE_PAPER:-1}
+    env_file:
+      - .env.runtime          # written by `tp secrets export-env`; NEVER committed
+    volumes:
+      - tp-data:/data
+      - tp-tokens:/home/trader/.tokens   # robin_stocks session cache - see below
+    restart: unless-stopped
+
+  ui:
+    image: trading-platform:${TP_VERSION:-dev}
+    <<: *logging
+    command: ["main.py", "--ui"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      TP_OUTPUT_DIR: /data/output
+      TP_VERSION: ${TP_VERSION:-dev}
+      # 0.0.0.0 INSIDE the container does not contradict §4. The bind that
+      # matters is the one on the left of the port mapping below: the host
+      # publishes on 127.0.0.1 only, so the UI is reachable from this machine
+      # and from nowhere else. Writing "8080:8080" instead would publish it to
+      # the entire network - and on Docker that also bypasses most host
+      # firewalls, which is the trap this comment exists to stop.
+      TP_UI_HOST: 0.0.0.0
+    env_file:
+      - .env.runtime
+    ports:
+      - "127.0.0.1:${TP_UI_PORT:-8080}:8080"
+    volumes:
+      - tp-data:/data
+    restart: unless-stopped
+
+volumes:
+  tp-db: {}
+  tp-data: {}
+  # robin_stocks writes ~/.tokens/robinhood.pickle with store_session=True.
+  # Without this volume every container restart is a fresh login, which on a
+  # 2FA account means a push approval on your phone every time and eventually
+  # rate-limiting.
+  tp-tokens: {}
