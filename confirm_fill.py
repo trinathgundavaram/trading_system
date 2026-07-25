@@ -144,6 +144,14 @@ def cmd_buy(ticker: str, price: float, shares: float):
         "entry_regime": entry_regime,
         "setup_type": setup_type,
         "high_watermark_price": price,
+        # §53 (Phase 2.5): ATR as a % of price at entry, so this manually
+        # confirmed fill counts toward portfolio_risk's high-volatility cap in
+        # the same units as everything else. _atr comes from the linked
+        # pattern's recorded features - the same source risk_per_share above
+        # already uses - so no extra fetch. None when there is no linked
+        # pattern, which is honest: _position_atr_pct() then falls back to the
+        # stop-distance proxy and says so in the log.
+        "entry_atr_pct": (_atr / price * 100) if (_atr and price) else None,
         "risk_per_share": risk_per_share,
         "current_stop_price": price - risk_per_share,
         "current_target_price": price + (risk_per_share * 3),
@@ -261,7 +269,12 @@ def cmd_sell(ticker: str, price: float):
     # other path. pattern_database.hold_hours has to mean one thing, since
     # engine/ev_engine.py averages it across rows from all three.
     hold_hours = closed.get("hold_hours", 0.0)
-    pattern_db.close_trade(pattern_id, closed["pnl_pct"], hold_hours, exit_reason="manual_fill_confirmed")
+    # §50: exit_kind="manual" is stated here rather than derived. A
+    # human-confirmed fill is the one exit whose kind no market condition
+    # implies - it is a fact about who closed it, which only this path knows.
+    pattern_db.close_trade(pattern_id, closed["pnl_pct"], hold_hours,
+                            exit_reason="manual_fill_confirmed",
+                            exit_kind="manual")
     print(f"  Closed pattern #{pattern_id} with your REAL outcome ({closed['pnl_pct']:+.2f}%, "
           f"{hold_hours:.1f}h held) - this is what the learning backend will use.")
 

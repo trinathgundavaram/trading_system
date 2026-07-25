@@ -44,10 +44,13 @@ book.
 Every refusal is written to rejected_signals, so the counterfactual is
 recorded rather than lost.
 """
+import logging
 from dataclasses import dataclass, field
 
 from engine.cache import cache
 from storage.database import Database
+
+logger = logging.getLogger("trading")
 
 TTL_CORRELATION = 3600  # 60 min - correlation structure moves slowly; no need to refetch every scan cycle
 
@@ -146,19 +149,61 @@ def _scale_for_cap(pre_value: float, post_value_at_full: float, cap: float) -> f
 
 
 def _position_risk_band_pct(pos: dict) -> float:
-    """Proxy for a position's own volatility: how far its current stop sits
-    from entry, as a % of entry price. Real ATR isn't persisted on the
-    positions table (only computed live from a fresh ticker_data fetch), so
-    this reuses data that's ALREADY on every position row instead of
-    re-fetching ATR for every open position every cycle. Wider stops
-    generally track wider ATR (rules/risk_rules.py-adjacent stop logic sizes
-    off ATR to begin with), so this is a genuine, if indirect, proxy - not a
-    fabricated placeholder."""
+    """FALLBACK ONLY as of §53 - see _position_atr_pct(), which is what the
+    high-volatility count now calls.
+
+    How far this position's current stop sits from entry, as a % of entry
+    price. Kept because rows opened before migrations/011 have no
+    entry_atr_pct and something has to be said about them; kept SEPARATE from
+    _position_atr_pct() so that "we are using the proxy" remains a visible
+    fact rather than an implementation detail of one function."""
     entry = pos.get("entry_price") or 0
     stop = pos.get("current_stop_price")
     if not entry or not stop:
         return 0.0
     return abs(entry - stop) / entry * 100.0
+
+
+def _position_atr_pct(pos: dict) -> float:
+    """This position's volatility in the SAME UNITS as the candidate's (§53).
+
+    THE BUG THIS FIXES. The high-volatility count compared
+    _position_risk_band_pct(p) - stop distance as a % of entry - against
+    high_vol_atr_pct_threshold, while the candidate side passed a true ATR
+    percentage (scheduler.py: atr / price * 100). One threshold, two
+    quantities.
+
+    The proxy's own defence was that wider stops track wider ATR, and that is
+    true as far as it goes. Where it stops going is the clamp: scheduler.py
+    seeds risk_per_share = min(max(1.2*ATR, price*1.5%), price*stop_loss_pct),
+    so past a certain volatility the stop stops widening with ATR and the proxy
+    saturates. A 7%-ATR name behind a 5%-clamped stop reads as 5.0 - at the
+    threshold rather than clearly past it. Worse, the stop RATCHETS as a
+    position moves in favour, so |entry - stop| shrinks and a position's proxy
+    volatility falls over its life. The count was therefore biased low, and
+    max_simultaneous_high_vol_positions was looser than it read.
+
+    Recalibrating the threshold - which the 2026-07-25 review asked for - could
+    not have fixed this. Two different quantities do not share a threshold no
+    matter where the threshold is put.
+
+    Returns the persisted entry ATR% when present, else the proxy. The fallback
+    is logged at debug rather than being silent: a book that is still mostly
+    pre-migration rows is being counted the old way, and that is worth being
+    able to see when the recalibration in §52/§53 is done.
+    """
+    atr_pct = pos.get("entry_atr_pct")
+    if atr_pct is not None:
+        try:
+            return float(atr_pct)
+        except (TypeError, ValueError):
+            pass
+    proxy = _position_risk_band_pct(pos)
+    logger.debug(
+        f"portfolio_risk: {pos.get('ticker')} has no entry_atr_pct (opened "
+        f"before migrations/011) - counting it with the stop-distance proxy "
+        f"at {proxy:.2f}%, which reads LOW for a volatile name.")
+    return proxy
 
 
 def _fetch_closes(ticker: str, lookback_days: int) -> list:
@@ -366,7 +411,10 @@ class PortfolioRiskEngine:
         # ---- 5. Simultaneous high-volatility positions ----
         vol_threshold = float(rcfg.get("high_vol_atr_pct_threshold", 5.0))
         max_high_vol = int(rcfg.get("max_simultaneous_high_vol_positions", 4))
-        existing_high_vol = sum(1 for p in positions if _position_risk_band_pct(p) >= vol_threshold)
+        # §53: _position_atr_pct, not _position_risk_band_pct. The threshold is
+        # denominated in ATR and the candidate side has always passed ATR; this
+        # side was passing stop distance.
+        existing_high_vol = sum(1 for p in positions if _position_atr_pct(p) >= vol_threshold)
         candidate_is_high_vol = (candidate_atr_pct or 0.0) >= vol_threshold
         mult_vol = 1.0
         if candidate_is_high_vol and existing_high_vol >= max_high_vol:

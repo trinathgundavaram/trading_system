@@ -85,6 +85,11 @@ def main() -> int:
         ("trades", "timestamp"),
         ("positions", "entry_time"),
         ("pattern_database", "recorded_at"),
+        # §49 (Phase 2.5). Added late, and that is the finding: the 2026-07-25
+        # cleanup ran against a version of this list that did not include the
+        # excursion table, so it was never inspected and never repaired. See
+        # the dedicated section further down for what was still in there.
+        ("mae_mfe_data", "recorded_at"),
         ("rotation_log", "executed_at"),
         ("monitoring_alerts", "created_at"),
         ("signals", "timestamp"),
@@ -136,6 +141,89 @@ def main() -> int:
     print("\n  The failing test output showed trades_placed=8 and realized_pnl=-259.9111")
     print("  at the moment the suite ran. If these still look like that, they are")
     print("  test residue: the suite placed 8 mocked 'live' buys and closed BMY/ORCL.")
+
+    section("MAE/MFE EXCURSIONS  (§49 - the table the 2026-07-25 cleanup missed)")
+    print("  reset_paper_account() does NOT touch mae_mfe_data either, and unlike")
+    print("  pattern_database that is not a mercy: this table has no provenance")
+    print("  columns, no app_version, no config_fingerprint. Contaminated rows are")
+    print("  indistinguishable from real ones except by the three tests below.\n")
+    try:
+        total_mae = _scalar(db, "SELECT COUNT(*) FROM mae_mfe_data") or 0
+        print(f"  {total_mae} row(s) total")
+
+        # 1. Test fixture tickers.
+        placeholders = ",".join("?" * len(TEST_TICKERS))
+        by_ticker = _rows(db, f"SELECT ticker, COUNT(*) n FROM mae_mfe_data "
+                              f"WHERE UPPER(ticker) IN ({placeholders}) "
+                              f"GROUP BY ticker ORDER BY n DESC", tuple(TEST_TICKERS))
+        if by_ticker:
+            print(f"\n  [1] TEST-FIXTURE TICKERS - {sum(r['n'] for r in by_ticker)} row(s)")
+            for r in by_ticker:
+                synth = "  [SYNTHETIC - cannot be a real holding]" if r["ticker"] in OBVIOUSLY_SYNTHETIC else ""
+                print(f"        {r['ticker']:<6} {r['n']:>4}{synth}")
+            print("      Ticker alone is not proof - ORCL/NVDA/MU/BMY are real names.")
+            print("      Cross-check against test [2] and [3] below and the window above.")
+
+        # 2. Both excursions exactly zero.
+        #
+        # A real trade moves. MAE and MFE are both measured from entry across
+        # the life of the position, so both being exactly 0.0 means no price
+        # was ever recorded against it - which is what a fixture that inserts a
+        # row without running update_live() looks like.
+        zeroed = _scalar(db, "SELECT COUNT(*) FROM mae_mfe_data "
+                             "WHERE COALESCE(mae_pct,0) = 0 AND COALESCE(mfe_pct,0) = 0") or 0
+        if zeroed:
+            print(f"\n  [2] mae_pct = mfe_pct = 0.0 EXACTLY - {zeroed} row(s)")
+            print("      A position that was ever priced has a non-zero excursion on at")
+            print("      least one side. These are rows inserted without update_live()")
+            print("      ever running - i.e. inserted by a test, not by a trade.")
+
+        # 3. trade_id does not resolve, or resolves to a different ticker.
+        #
+        # The one that matters most for §51: a colliding trade_id does not
+        # merely add a junk row, it makes a JOIN attach that row to somebody
+        # else's pattern. Unrepairable by construction - there is no way to
+        # learn which trade an excursion row with the wrong id belonged to.
+        mismatched = _rows(db, """
+            SELECT m.trade_id, m.ticker AS mae_ticker, p.ticker AS position_ticker,
+                   COUNT(*) AS n
+              FROM mae_mfe_data m
+              LEFT JOIN positions p ON CAST(p.id AS TEXT) = CAST(m.trade_id AS TEXT)
+             WHERE m.trade_id IS NOT NULL
+               AND (p.id IS NULL OR UPPER(p.ticker) <> UPPER(m.ticker))
+             GROUP BY m.trade_id, m.ticker, p.ticker
+             ORDER BY n DESC""")
+        if mismatched:
+            print(f"\n  [3] trade_id DOES NOT RESOLVE TO A MATCHING POSITION - "
+                  f"{sum(r['n'] for r in mismatched)} row(s)")
+            print(f"        {'trade_id':<10} {'mae row':<8} {'position':<10} rows")
+            for r in mismatched[:20]:
+                print(f"        {str(r['trade_id']):<10} {str(r['mae_ticker']):<8} "
+                      f"{str(r['position_ticker'] or 'MISSING'):<10} {r['n']:>4}")
+            if len(mismatched) > 20:
+                print(f"        ... and {len(mismatched) - 20} more")
+            print("      These are the dangerous ones. §51's get_pattern_excursions()")
+            print("      refuses them at query time, but migrations/010's unique index")
+            print("      will REFUSE TO APPLY while duplicates remain - which is the")
+            print("      intended gate. Purge before migrating.")
+
+        # 4. Duplicate trade_id - what actually blocks migrations/010.
+        dupes = _rows(db, "SELECT trade_id, COUNT(*) n FROM mae_mfe_data "
+                          "WHERE trade_id IS NOT NULL GROUP BY trade_id "
+                          "HAVING COUNT(*) > 1 ORDER BY n DESC")
+        if dupes:
+            print(f"\n  [4] DUPLICATE trade_id - {len(dupes)} id(s), "
+                  f"{sum(r['n'] for r in dupes)} row(s)")
+            for r in dupes[:10]:
+                print(f"        trade_id={str(r['trade_id']):<10} {r['n']} rows")
+            print("      migrations/010_mae_mfe_integrity.sql will fail until these are")
+            print("      gone. Do not drop the constraint - finish the purge.")
+
+        if not (by_ticker or zeroed or mismatched or dupes):
+            print("\n  Clean: no fixture tickers, no all-zero excursions, no unresolved")
+            print("  or duplicated trade_ids. migrations/010 will apply.")
+    except Exception as e:
+        print(f"  could not read mae_mfe_data: {e}")
 
     section("ALERTS created in the window (account_sync writes sync_missing_*)")
     try:

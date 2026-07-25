@@ -239,6 +239,18 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
                         {"ticker": ticker, "reason": "lost_open_race"})
         return {}
 
+    # §51 (Phase 2.5): the pattern learns which position it became.
+    #
+    # This is the only line in the codebase where both ids exist at once.
+    # PatternDatabase.record_entry() runs back in scheduler.py at SIGNAL time,
+    # before any position row exists, which is why pattern_database.trade_id
+    # was NULL on every row it had ever written. Without it the only path from
+    # a pattern to its true intraday excursion runs transitively through
+    # positions.pattern_id, and mae_mfe_data.trade_id collides badly enough
+    # that the transitive join mixes tickers - see get_pattern_excursions().
+    if pattern_id:
+        db.link_pattern_to_trade(pattern_id, opened.get("id"))
+
     if entry_seed:
         seed = dict(entry_seed)
         rps = seed.get("risk_per_share") or 0

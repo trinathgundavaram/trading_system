@@ -441,9 +441,10 @@ def execute_buy_live(db, cfg: dict, ticker: str, price: float, position_size=Non
         # of what the positions table says. Alert rather than continue
         # silently; the seeding below would otherwise write this fill's stop
         # onto the pre-existing row, which is the §16 failure in a new place.
-        if db.open_position(ticker, fill_price, qty, round(fill_price * qty, 2),
-                            pattern_id=pattern_id, simulated=False,
-                            trade_mode=trade_mode) is None:
+        opened_id = db.open_position(ticker, fill_price, qty, round(fill_price * qty, 2),
+                                      pattern_id=pattern_id, simulated=False,
+                                      trade_mode=trade_mode)
+        if opened_id is None:
             try:
                 from engine.notifications import send_critical
                 send_critical(
@@ -455,6 +456,14 @@ def execute_buy_live(db, cfg: dict, ticker: str, price: float, position_size=Non
             except Exception as e:
                 logger.error(f"could not send the unrecorded-fill alert: {e}")
             return {}
+
+        # §51 (Phase 2.5): mirror of the same call in engine/paper_trader.py -
+        # the pattern records which position it became, at the one moment both
+        # ids are in scope. See db.get_pattern_excursions() for why the
+        # transitive route through positions.pattern_id is not good enough.
+        if pattern_id:
+            db.link_pattern_to_trade(pattern_id, opened_id)
+
         if entry_seed:
             # 2026-07-20: same entry-context seeding confirm_fill.py already
             # does for the manual live-confirm path (entry_signal_score/

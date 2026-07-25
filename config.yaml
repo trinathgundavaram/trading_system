@@ -145,9 +145,15 @@ risk:
   max_position_size_usd: 500
   max_portfolio_risk_pct: 5.0
   min_confidence: 75
+  # The manual halt. Set true (or let trip_kill_switch_if_needed set it) to
+  # stop all trading; clearing it is a deliberate human act - edit and restart.
   kill_switch_triggered: false
-  daily_loss_limit_triggered: false
-  daily_profit_lock_triggered: false
+  # daily_loss_limit_triggered / daily_profit_lock_triggered REMOVED (§54,
+  # Phase 2.5). Nothing in the codebase ever wrote them, while three readers
+  # treated them as live controls - one of which (position_management.py) used
+  # daily_loss_limit_triggered as a priority-1 exit-everything trigger. The
+  # daily-loss control that is real lives in rules/risk_rules.py and trips
+  # kill_switch_triggered above.
   CONSERVATIVE:
     buy_score_threshold_pct: 68
     buy_score_threshold_day_pct: 73

@@ -80,6 +80,58 @@ PURGE = [
     ("pattern_database", "recorded_at", "the tests' BMY and FIX patterns"),
     ("paper_equity_history", "timestamp", "equity point written during the run"),
     ("trades", "timestamp", "mocked broker fills"),
+    # §49 (Phase 2.5). This entry is the finding: mae_mfe_data was absent from
+    # PURGE when this script ran on 2026-07-25, so the excursion table kept its
+    # test rows while every neighbouring table was cleaned. It is also the one
+    # table where the window alone is not enough - see PURGE_MAE_PREDICATES.
+    ("mae_mfe_data", "recorded_at", "test excursion rows inside the window"),
+]
+
+# §49: mae_mfe_data needs predicate-based deletion ON TOP of the time window.
+#
+# Every other table in PURGE is cleaned by timestamp because the incident was
+# bounded in time. mae_mfe_data is not: engine/mae_mfe_engine.record_completed()
+# only started running on the WATCH path on 2026-07-17, and rows written by the
+# test suite before the window carry no marker distinguishing them from real
+# ones - no app_version, no config_fingerprint, no simulated flag. The table has
+# no provenance columns at all.
+#
+# So it is cleaned by evidence instead, and the evidence has to be strong enough
+# to delete on. These three predicates are:
+#
+#   ticker_synthetic  AAA/BBB/CCC/NEW cannot be holdings. Note this uses
+#                     OBVIOUSLY_SYNTHETIC, not the wider TEST_TICKERS list -
+#                     ORCL, NVDA, MU and BMY are real names and deleting a real
+#                     excursion is not recoverable.
+#   flat_excursion    mae_pct = mfe_pct = 0.0 EXACTLY. A position that was ever
+#                     priced moved in one direction or the other; both sides
+#                     exactly zero means update_live() never ran for it, which
+#                     is a fixture inserting a row directly.
+#   ticker_collision  trade_id resolves to a positions row for a DIFFERENT
+#                     ticker (or to no row at all). Unrepairable by
+#                     construction: nothing records which trade an excursion
+#                     with the wrong id belonged to. This is the predicate that
+#                     matters for §51 - a collision does not merely add a junk
+#                     row, it makes any join attach that row to another trade's
+#                     pattern.
+#
+# Deliberately NOT included: "ticker in TEST_TICKERS" on its own. That would
+# delete real ORCL/NVDA/BMY excursions, and a false positive here is permanent.
+OBVIOUSLY_SYNTHETIC = ("AAA", "BBB", "CCC", "NEW")
+
+PURGE_MAE_PREDICATES = [
+    ("ticker_synthetic",
+     "UPPER(ticker) IN ('AAA','BBB','CCC','NEW')",
+     "synthetic tickers that cannot be real holdings"),
+    ("flat_excursion",
+     "COALESCE(mae_pct,0) = 0 AND COALESCE(mfe_pct,0) = 0",
+     "mae = mfe = 0.0 exactly - update_live() never ran"),
+    ("ticker_collision",
+     """trade_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM positions p
+             WHERE CAST(p.id AS TEXT) = CAST(mae_mfe_data.trade_id AS TEXT)
+               AND UPPER(p.ticker) = UPPER(mae_mfe_data.ticker))""",
+     "trade_id resolves to a different ticker, or to nothing"),
 ]
 
 # The two closes the suite performed against the real book, both winners.
@@ -129,6 +181,21 @@ def main() -> int:
         total += n
         print(f"  {table:<22} {n:>4} rows   {note}")
     print(f"  {'':<22} {total:>4} total\n")
+
+    # §49: the predicate-based mae_mfe_data pass, reported separately because it
+    # is not bounded by the window and therefore deserves its own line-by-line
+    # confirmation before --apply.
+    print("  mae_mfe_data, by evidence rather than by window (§49):")
+    mae_total = 0
+    for name, predicate, note in PURGE_MAE_PREDICATES:
+        try:
+            n = _count(db, f"SELECT COUNT(*) FROM mae_mfe_data WHERE {predicate}")
+        except Exception as e:
+            print(f"    {name:<20} SKIPPED ({e})")
+            continue
+        mae_total += n
+        print(f"    {name:<20} {n:>4} rows   {note}")
+    print(f"    {'(overlaps counted once at delete time)':<20} {mae_total:>4} raw\n")
 
     # Safety: refuse if the cut would take rows that predate the incident.
     stray = _rows(db, "SELECT ticker, entry_time FROM positions "
@@ -186,6 +253,15 @@ def main() -> int:
                 conn.execute(f"DELETE FROM {table} WHERE {tscol} >= ?", (args.window_start,))
             except Exception as e:
                 print(f"  {table}: delete failed - {e}")
+        # §49: the evidence-based pass. Runs in the same transaction as the
+        # window pass, so a failure anywhere leaves the table as it was rather
+        # than half-cleaned - a partially purged excursion table is harder to
+        # reason about than an untouched one.
+        for name, predicate, _ in PURGE_MAE_PREDICATES:
+            try:
+                conn.execute(f"DELETE FROM mae_mfe_data WHERE {predicate}")
+            except Exception as e:
+                print(f"  mae_mfe_data [{name}]: delete failed - {e}")
         conn.execute("DELETE FROM paper_account")
         conn.execute(
             "UPDATE daily_stats SET realized_pnl = realized_pnl - ?, "

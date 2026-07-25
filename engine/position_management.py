@@ -270,9 +270,12 @@ def _evaluate_priority(exit_result, health, new_stop, cfg: dict, eod_flatten: di
     if risk_cfg.get("kill_switch_triggered"):
         return {"priority": 1, "action": "exit_full", "urgent": True,
                 "label": "RISK CONTROL — KILL SWITCH", "reason": "Kill switch is active"}
-    if risk_cfg.get("daily_loss_limit_triggered"):
-        return {"priority": 1, "action": "exit_full", "urgent": True,
-                "label": "RISK CONTROL — DAILY LOSS LIMIT", "reason": "Daily loss limit reached"}
+    # §54 (Phase 2.5): the daily_loss_limit_triggered branch is gone. Nothing
+    # in this repository ever set that flag, so this priority-1 liquidation
+    # could only be reached by hand-editing config.yaml - a lot of consequence
+    # for a key with no writer. The daily-loss breach that IS real trips the
+    # kill switch above (rules/risk_rules.trip_kill_switch_if_needed, called
+    # after every close and every cycle), which reaches this same branch.
 
     # PRIORITY 1B: EOD flatten (2026-07-22, full DAY/SWING/HYBRID separation)
     # - a DAY position past its session cutoff (see _check_eod_flatten) is

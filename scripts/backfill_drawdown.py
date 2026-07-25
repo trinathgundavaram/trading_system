@@ -107,9 +107,23 @@ def main() -> int:
         print(f"  - above {worst:.2f}% has never bound and would not have "
               f"halted anything yet.")
         if len(s) < 5:
+            # §54: read the configured value rather than naming a literal. This
+            # said "the configured 3.0%" while config.yaml said 2.0 - the same
+            # drift engine/rules_catalog.py had, in the one place an operator
+            # is most likely to be reading it as authoritative.
+            try:
+                from config_loader import load_config_dict
+                _cap = float((load_config_dict().get("risk", {}) or {})
+                             .get("max_intraday_drawdown_pct", 0) or 0)
+                _cap_str = f"{_cap:.2f}%"
+            except Exception:
+                _cap_str = "configured"
             print(f"  - {len(s)} day(s) is not a distribution. Treat the "
-                  f"configured 3.0% as provisional and revisit it once the "
-                  f"curve has a few weeks in it.")
+                  f"configured {_cap_str} as provisional and revisit it once "
+                  f"the curve has a few weeks in it.")
+        print("\n  scripts/calibrate_risk_caps.py (§52) turns this distribution "
+              "into a\n  recommendation, and checks it against "
+              "risk.max_daily_loss_pct.")
     else:
         print("\nNo day had more than one equity point, so no drawdown could "
               "be computed. The configured cap is unvalidated - it is a guess "

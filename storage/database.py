@@ -380,7 +380,13 @@ CREATE TABLE IF NOT EXISTS pattern_database (
     features TEXT NOT NULL,          -- JSON dict of the 25 features (raw, pre-encoding)
     outcome_pct REAL,                -- NULL until the trade closes
     hold_hours REAL,
-    exit_reason TEXT,
+    exit_reason TEXT,                -- human-readable sentence, shown in the UI
+    -- §50 (Phase 2.5, migrations/009). The COUNTABLE companion to exit_reason:
+    -- one of rules/common.py's EXIT_KINDS, or NULL for "not determinable".
+    -- exit_reason interpolates prices into itself, so every stop-loss exit is
+    -- its own distinct string and the column cannot be grouped on. NULL here
+    -- means unclassified, not unclosed - filter `exit_kind IS NOT NULL`.
+    exit_kind TEXT,
     is_closed INTEGER DEFAULT 0,
     -- Provenance (§17, migrations/001 + 003). Which build and which scoring
     -- configuration produced this row. Two rows with different
@@ -1076,6 +1082,15 @@ class Database:
             "setup_type": "TEXT",
             "entry_rs_percentile": "REAL",
             "entry_ad_ratio": "REAL",
+            # §53 (Phase 2.5, migrations/011). ATR as a % of price at entry.
+            # engine/portfolio_risk.py counts "how many high-volatility
+            # positions are already open" against
+            # portfolio_risk.high_vol_atr_pct_threshold, and had nothing to
+            # count with: ATR was computed live per cycle and never persisted,
+            # so it substituted stop distance as a proxy - a DIFFERENT
+            # QUANTITY compared against a threshold expressed in ATR units.
+            # See _position_atr_pct() for what that cost.
+            "entry_atr_pct": "REAL",
             "risk_per_share": "REAL",
             "position_health_score": "REAL",
             "prev_cycle_pnl_pct": "REAL",
@@ -2944,11 +2959,32 @@ class Database:
             )
 
     def reset_paper_account(self):
-        """Wipes the purse, ledger, and every simulated position (open or
-        closed) - a clean slate for the next WATCH session. Real book untouched."""
+        """Wipes the purse, ledger, equity curve and every simulated position
+        (open or closed) - a clean slate for the next WATCH session. Real book
+        and pattern_database untouched.
+
+        §48 (Phase 2.5) added paper_equity_history to this list. It was left
+        behind, which meant a "clean slate" account inherited the PREVIOUS
+        account's equity curve - and that curve is the input to every drawdown
+        figure. v1.3.1 exists because of what a mid-day re-seed did to exactly
+        that arithmetic: a 1491 -> 1000 step read as a 33% intraday drawdown
+        and, against the 2.0% cap, blocked entries for the rest of the day for
+        an accounting event. The epoch guard added there is still correct and
+        still needed for a re-SEED that is not a reset; this makes a RESET
+        genuinely start from nothing, so the guard is belt-and-braces rather
+        than load-bearing.
+
+        Deliberately NOT deleted: pattern_database (the learning record,
+        including closed outcomes) and mae_mfe_data. Those survive a reset by
+        design - see scripts/assess_test_damage.py, which is the required step
+        before running this. Note that mae_mfe_data surviving is a
+        double-edged property: §49 found it still holding test residue
+        precisely because nothing routinely clears it.
+        """
         with self._conn() as conn:
             conn.execute("DELETE FROM paper_account")
             conn.execute("DELETE FROM paper_trades")
+            conn.execute("DELETE FROM paper_equity_history")
             conn.execute("DELETE FROM positions WHERE COALESCE(simulated, 0) = 1")
 
     def remove_seed_positions(self) -> dict:
@@ -3148,9 +3184,13 @@ class Database:
             # whole table (2026-07-25, found by running the backfill against
             # real data).
             #
-            # reset_paper_account() and robinhood_sync's re-seed replace the
-            # purse but paper_equity_history survives, so the curve can step
-            # discontinuously: on this machine it ran at ~984 for eight days
+            # A re-seed replaces the purse while paper_equity_history survives,
+            # so the curve can step discontinuously. (§48, Phase 2.5 narrowed
+            # this: reset_paper_account() now clears the curve too, so a full
+            # RESET no longer produces a discontinuity. A RE-SEED still does -
+            # robinhood_sync can change the balance without a reset - so this
+            # guard stays load-bearing for that case and belt-and-braces for
+            # the other.) On this machine the curve ran at ~984 for eight days
             # and then jumped to 1491.54 when the account was re-seeded at a
             # higher balance. An all-table MAX makes that jump the all-time
             # high, so every subsequent day reads a ~34% running drawdown
@@ -3208,8 +3248,14 @@ class Database:
         The boundary for running drawdown (§11). paper_account is a single row
         that reset_paper_account() deletes and the next seed recreates, so
         created_at marks the start of the equity series that is actually
-        comparable to today. paper_equity_history is NOT cleared by that reset,
-        which is why the boundary has to be consulted rather than assumed.
+        comparable to today.
+
+        §48 (Phase 2.5) made reset_paper_account() clear paper_equity_history
+        as well, so after a RESET the boundary and the table agree and this is
+        a no-op. It remains necessary for a RE-SEED - robinhood_sync can change
+        the balance without deleting the account - and for any database that
+        predates §48. Consulting the boundary rather than assuming the table is
+        clean is the cheaper of the two mistakes.
 
         Returns None when there is no account or no created_at, in which case
         callers fall back to the whole table - a missing boundary should widen
@@ -3699,6 +3745,127 @@ class Database:
             )
             return cur.lastrowid
 
+    def link_pattern_to_trade(self, pattern_id: int, position_id) -> bool:
+        """§51 (Phase 2.5): stamp the position a pattern actually became.
+
+        pattern_database.trade_id has existed since the table was created and
+        was NULL on every row, because the only writer - add_pattern(), via
+        PatternDatabase.record_entry() - runs at SIGNAL time, and at signal time
+        no position exists. There is exactly one moment when both ids are in
+        scope: immediately after try_open_position()/open_position() returns.
+        This is the call for that moment.
+
+        Why it matters. engine/mae_mfe_engine.record_completed() writes
+        mae_mfe_data.trade_id = the POSITION id, so the only route from a
+        pattern to its true intraday excursion was the transitive one through
+        positions.pattern_id - and that route is unsafe today, see
+        get_pattern_excursions(). A direct, indexed link makes the join one hop
+        and lets the integrity constraint live on the column being joined.
+
+        Idempotent and non-fatal. A missing link costs one row of excursion
+        analysis; raising here would cost a recorded fill. Returns True when a
+        row was updated.
+        """
+        if pattern_id is None or position_id is None:
+            return False
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "UPDATE pattern_database SET trade_id = ? WHERE id = ?",
+                    (str(position_id), pattern_id))
+            return True
+        except Exception as e:
+            logger.warning(
+                f"link_pattern_to_trade(pattern={pattern_id}, "
+                f"position={position_id}) failed: {e}. The position and the "
+                f"pattern are both recorded; only the join between them is "
+                f"missing, so this trade will be absent from excursion "
+                f"analysis rather than wrong in it.")
+            return False
+
+    def get_pattern_excursions(self, mode: str = None, since: str = None) -> list:
+        """§51: the ONE sanctioned join from closed patterns to their MAE/MFE
+        rows. Everything wanting true intraday excursions goes through here.
+
+        THIS EXISTS BECAUSE THE OBVIOUS QUERY IS WRONG. mae_mfe_data.trade_id is
+        TEXT, holds a stringified positions.id, and until migrations/010 had no
+        unique constraint, no foreign key and no book scope. On the 2026-07-25
+        snapshot, trade_id = '1' appeared fifteen times across five different
+        tickers - test-suite residue that scripts/repair_test_damage.py never
+        covered (§49). Joining pattern_database -> positions -> mae_mfe_data on
+        it returned 37 rows for 23 closed patterns, and the surplus was not
+        duplicate records of one trade: it was NVDA's excursion row attaching
+        itself to ADPT's pattern. An AVG(mae_pct) over that join is wrong in a
+        way nothing about the query looks wrong.
+
+        Three defences, because the data cannot be trusted to be clean forever:
+
+          1. Join on pattern_database.trade_id directly (one hop, indexed by
+             migrations/010) rather than transitively through positions.
+          2. Require ticker agreement. A row that claims a trade belonging to a
+             different symbol is not a near-miss to be repaired, it is a
+             collision, and it is dropped.
+          3. Return at most one excursion per pattern. migrations/010 adds the
+             unique index that should make this impossible to need; it is kept
+             because a constraint added later is only as good as the last time
+             someone re-applied it to a restored database.
+
+        On top of those, §15's quarantine applies to BOTH sides. Migration 007
+        marked contaminated mae_mfe_data rows rather than deleting them, so the
+        evidence survived; a reader that ignores the mark gets the evidence
+        back in its averages. get_recent_mae_mfe() already filters this way and
+        this method must agree with it, or the same table reports two different
+        populations depending on which accessor you happened to call.
+
+        Rows with NULL trade_id (every pattern recorded before §51) are simply
+        absent, which is the honest answer - not zero excursion.
+        """
+        sql = """
+            SELECT p.id            AS pattern_id,
+                   p.ticker        AS ticker,
+                   p.mode          AS mode,
+                   p.outcome_pct   AS outcome_pct,
+                   p.hold_hours    AS hold_hours,
+                   p.exit_kind     AS exit_kind,
+                   p.recorded_at   AS recorded_at,
+                   m.mae_pct       AS mae_pct,
+                   m.mfe_pct       AS mfe_pct
+              FROM pattern_database p
+              JOIN mae_mfe_data m
+                ON CAST(m.trade_id AS TEXT) = CAST(p.trade_id AS TEXT)
+               AND UPPER(m.ticker) = UPPER(p.ticker)
+             WHERE p.is_closed = 1
+               AND p.trade_id IS NOT NULL
+               AND COALESCE(m.data_quality, 'ok') = 'ok'
+               AND COALESCE(p.data_quality, 'ok') = 'ok'
+        """
+        params = []
+        if mode:
+            sql += " AND p.mode = ?"
+            params.append(mode)
+        if since:
+            sql += " AND p.recorded_at >= ?"
+            params.append(since)
+        sql += " ORDER BY p.recorded_at DESC"
+
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+        seen, out = set(), []
+        for r in rows:
+            if r["pattern_id"] in seen:
+                logger.warning(
+                    f"get_pattern_excursions: pattern #{r['pattern_id']} "
+                    f"({r['ticker']}) matched more than one mae_mfe_data row. "
+                    f"Keeping the first and dropping the rest - the unique "
+                    f"index from migrations/010 is missing or was lost in a "
+                    f"restore. Re-apply it before trusting excursion stats.")
+                continue
+            seen.add(r["pattern_id"])
+            out.append(r)
+        return out
+
     def get_pattern_by_id(self, pattern_id: int):
         import json
         with self._conn() as conn:
@@ -3710,12 +3877,42 @@ class Database:
             row["features"] = json.loads(row["features"])
             return row
 
-    def close_pattern(self, pattern_id: int, outcome_pct: float, hold_hours: float, exit_reason: str):
+    def close_pattern(self, pattern_id: int, outcome_pct: float, hold_hours: float,
+                       exit_reason: str, exit_kind: str = None):
+        """§50 (Phase 2.5): writes the countable `exit_kind` alongside the
+        human-readable `exit_reason`.
+
+        `exit_kind` defaults to None and is then derived by
+        rules/common.classify_exit(), which returns None for anything it cannot
+        determine from a structured token. Callers that hold the structured
+        value directly should pass it rather than relying on the derivation -
+        the derivation exists so that the namespaced reasons already generated
+        from fixed vocabularies (price_watch:, rotation:, time_based_close,
+        manual_fill_confirmed) do not each need a second argument threaded
+        through their call chain to say what their own string already says.
+
+        An unrecognised exit_kind is rejected rather than stored. The column is
+        only worth having if its domain is closed; one typo'd value that never
+        appears again reintroduces exactly the ungroupable-column problem this
+        was written to fix.
+        """
+        from rules.common import EXIT_KINDS, classify_exit
+        kind = exit_kind if exit_kind is not None else classify_exit(exit_reason)
+        if kind is not None and kind not in EXIT_KINDS:
+            logger.error(
+                f"close_pattern({pattern_id}): exit_kind {kind!r} is not in "
+                f"EXIT_KINDS - storing NULL. The exit_reason is unaffected and "
+                f"is still {exit_reason!r}; only the countable column is "
+                f"dropped, because a value outside the closed set makes the "
+                f"column uncountable again.")
+            kind = None
         with self._conn() as conn:
             conn.execute(
-                """UPDATE pattern_database SET outcome_pct = ?, hold_hours = ?, exit_reason = ?, is_closed = 1
+                """UPDATE pattern_database
+                      SET outcome_pct = ?, hold_hours = ?, exit_reason = ?,
+                          exit_kind = ?, is_closed = 1
                 WHERE id = ?""",
-                (outcome_pct, hold_hours, exit_reason, pattern_id),
+                (outcome_pct, hold_hours, exit_reason, kind, pattern_id),
             )
 
     def get_patterns(self, mode: str = None, ticker: str = None, closed_only: bool = True,

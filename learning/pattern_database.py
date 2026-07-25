@@ -157,8 +157,15 @@ class PatternDatabase:
         return self.db.add_pattern(ticker, mode, features, trade_id=trade_id,
                                     config_fingerprint=fingerprint)
 
-    def close_trade(self, pattern_id: int, outcome_pct: float, hold_hours: float, exit_reason: str):
-        self.db.close_pattern(pattern_id, outcome_pct, hold_hours, exit_reason)
+    def close_trade(self, pattern_id: int, outcome_pct: float, hold_hours: float,
+                     exit_reason: str, exit_kind: str = None):
+        """§50 (Phase 2.5): `exit_kind` is the countable companion to
+        `exit_reason` - one of rules/common.py's EXIT_KINDS. Left None it is
+        derived from the reason string where that string is a structured token
+        (see classify_exit), and stays NULL where it is prose. Pass it
+        explicitly from any caller that holds the structured value."""
+        self.db.close_pattern(pattern_id, outcome_pct, hold_hours, exit_reason,
+                               exit_kind=exit_kind)
 
     def find_similar_trades(
         self,

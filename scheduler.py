@@ -748,6 +748,30 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
             veto = check_vetoes(ticker, ticker_dict, market_dict, cfg, mode=trading_mode)
             if veto.vetoed:
                 logger.info(f"{ticker}: VETOED - {veto.reason}")
+                # §55 (Phase 2.5): instrument the stale-data circuit breaker.
+                #
+                # data_quality.stale_indicator_veto_threshold is 3-of-5 and was
+                # chosen a priori. Nothing counted how often it fired, on which
+                # indicators, or at what time of day, so "is 3 right?" had no
+                # evidence behind it and changing it would have been swapping
+                # one guess for another.
+                #
+                # The reason string already names the offending indicators
+                # (hard_vetoes builds it from the stale list), and the row
+                # carries a UTC timestamp, so one week of these answers both
+                # halves of the question: which indicators default, and whether
+                # this is overwhelmingly a first-N-minutes-after-the-open
+                # effect - which is what engine/rules_catalog.py claims and
+                # what would make the right fix a longer
+                # trading.market_open_buffer_minutes rather than a looser cap.
+                #
+                # Only this one veto code is instrumented. The others are
+                # decisions about the NAME (spread, volume, earnings); this one
+                # is a decision about our own DATA, and it is the only one
+                # whose threshold is up for calibration.
+                if veto.veto_code == "STALE_DATA_CIRCUIT_BREAKER":
+                    _log_rejected(db, ticker, "data_quality", veto.reason,
+                                  price=getattr(td, "price", None))
                 buy_result = swing_buy_rules.from_veto(veto)
                 # RESEARCH-MODE SCORING (2026-07-15g): for EXECUTION-quality
                 # vetoes (spread/volume/price/earnings/timing) the underlying
@@ -1033,6 +1057,14 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                         "entry_regime": getattr(regime, "dominant_regime", None),
                         "setup_type": (_features.get("setup_type") if _features else None) or "unknown",
                         "risk_per_share": _risk_per_share,
+                        # §53 (Phase 2.5): the SAME quantity the portfolio-risk
+                        # candidate check uses one screen up
+                        # (atr_pct = atr / price * 100), persisted so that the
+                        # count of already-open high-volatility positions is
+                        # measured in ATR units too. Before this, that count
+                        # substituted stop distance and read systematically
+                        # low - see engine/portfolio_risk._position_atr_pct.
+                        "entry_atr_pct": (_entry_atr / td.price * 100) if td.price else None,
                     }
                     # ── §18 (Phase 2): portfolio risk BINDS ────────────────
                     #
@@ -1569,7 +1601,14 @@ def _close_due_patterns(ticker: str, current_price: float, cfg: dict):
         if not entry_price:
             continue
         outcome_pct = (current_price - entry_price) / entry_price * 100
-        pattern_db.close_trade(p["id"], outcome_pct, age_days * 24, exit_reason="time_based_close")
+        # §50: exit_kind passed explicitly rather than left to classify_exit's
+        # derivation. This close is not a market event at all - the horizon
+        # simply expired - so the caller is the only place that knows, and
+        # saying so here keeps the classification independent of the literal
+        # spelling of the reason string.
+        pattern_db.close_trade(p["id"], outcome_pct, age_days * 24,
+                                exit_reason="time_based_close",
+                                exit_kind="time_stop")
         logger.info(f"{ticker}: pattern #{p['id']} auto-closed after {age_days:.1f}d, outcome {outcome_pct:+.2f}%")
 
 
@@ -1811,7 +1850,6 @@ def start():
         id="trading_cycle", max_instances=1, coalesce=True,
     )
 
-    
     def _record_next_run(event=None):
         job = scheduler.get_job("trading_cycle")
         if job and job.next_run_time:

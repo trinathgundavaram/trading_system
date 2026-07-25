@@ -1,81 +1,43 @@
-"""Risk guardrails + kill switch. Used by engine/executor.py's safety chain -
-these are per-trade / per-day account-level checks, distinct from market_filters.py
-(which are market-wide) and buy/sell_rules.py (which are per-ticker signal rules)."""
+"""Risk guardrails + kill switch: per-trade / per-day ACCOUNT-level checks,
+distinct from market_filters.py (which are market-wide) and buy/sell_rules.py
+(which are per-ticker signal rules).
+
+§54 (Phase 2.5) removed a second, parallel implementation of these limits from
+this file: six module-level `check_*(cfg, ...)` helpers returning RuleResult,
+and a `LegacyRiskEngine` class written against the dot-access SimpleNamespace
+config. All seven had ZERO call sites - not in the engine, not in the
+scheduler, not in the tests - while the limits they described were, and are,
+genuinely enforced elsewhere:
+
+    max_position_size_usd  -> engine/position_sizing.py (clamp) and
+                              engine/live_trader.py (clamp)
+    max_positions          -> engine/paper_trader.py and engine/live_trader.py
+    max_trades_per_day     -> RiskEngine.check(), below
+    max_daily_loss         -> RiskEngine.check() + trip_kill_switch_if_needed()
+    kill_switch            -> RiskEngine.check() + rules/hard_vetoes.py
+    buying_power           -> the paper purse check in engine/paper_trader.py;
+                              real buying power is Robinhood's to enforce
+
+Two implementations of one limit is not redundancy, it is a coin flip about
+which one a future edit lands in - and they had already diverged. The dead copy
+compared trades_today with `>=` where the live one uses `>`, and read
+`max_daily_loss_usd` raw where the live path uses §8's daily_loss_limit(),
+which is the tighter of the absolute cap and a percentage of equity. Anyone
+reviving engine/executor.py against the dead copy would have been reviving the
+pre-§8 limits while believing otherwise. Git has them if that path ever comes
+back; rewriting against the live definitions is the correct way to do it.
+"""
 import json
 import logging
 import re
 import os
-from dataclasses import dataclass
 from datetime import datetime
 
 import yaml
 
 from config_loader import CONFIG_PATH
-from rules.common import RuleResult
 
 logger = logging.getLogger("trading")
-
-
-def check_kill_switch(cfg) -> RuleResult:
-    ok = not cfg.risk.kill_switch_triggered
-    return RuleResult("kill_switch", ok, detail="ACTIVE - trading halted" if not ok else "off")
-
-
-def check_max_trades_per_day(cfg, trades_today: int) -> RuleResult:
-    ok = trades_today < cfg.risk.max_trades_per_day
-    return RuleResult("max_trades_per_day", ok, value=trades_today,
-                       detail=f"{trades_today}/{cfg.risk.max_trades_per_day} trades today")
-
-
-def check_max_daily_loss(cfg, realized_pnl_today: float) -> RuleResult:
-    ok = realized_pnl_today > -abs(cfg.risk.max_daily_loss_usd)
-    return RuleResult("max_daily_loss", ok, value=realized_pnl_today,
-                       detail=f"today P&L ${realized_pnl_today:.2f} vs -${cfg.risk.max_daily_loss_usd}")
-
-
-def check_buying_power(dollar_amount: float, buying_power: float) -> RuleResult:
-    ok = buying_power is not None and buying_power >= dollar_amount
-    return RuleResult("sufficient_buying_power", ok, value=buying_power,
-                       detail=f"buying power ${buying_power} vs needed ${dollar_amount}")
-
-
-def check_position_limits(cfg, open_positions_count: int) -> RuleResult:
-    ok = open_positions_count < cfg.trading.max_positions
-    return RuleResult("max_positions", ok, value=open_positions_count,
-                       detail=f"{open_positions_count}/{cfg.trading.max_positions} positions open")
-
-
-def check_position_size_limit(cfg, dollar_amount: float) -> RuleResult:
-    ok = dollar_amount <= cfg.risk.max_position_size_usd
-    return RuleResult("max_position_size", ok, value=dollar_amount,
-                       detail=f"${dollar_amount} <= ${cfg.risk.max_position_size_usd}")
-
-
-@dataclass
-class RiskCheckResult:
-    can_trade: bool
-    reason: str = "OK"
-
-
-class LegacyRiskEngine:
-    """Dot-access (SimpleNamespace cfg) version used only by the legacy
-    engine/executor.py automated-order-placement path, which is not part of the
-    active free/MCP-SDK flow (Robinhood is never called from Python there -
-    see README.md). Kept for anyone who wires that path back in."""
-
-    def check(self, daily_stats: dict, cfg) -> RiskCheckResult:
-        if cfg.risk.kill_switch_triggered:
-            return RiskCheckResult(False, "kill switch active")
-
-        trades_today = daily_stats.get("trades_placed", 0)
-        if trades_today >= cfg.risk.max_trades_per_day:
-            return RiskCheckResult(False, f"{trades_today}/{cfg.risk.max_trades_per_day} trades today")
-
-        realized = daily_stats.get("realized_pnl", 0.0)
-        if realized <= -abs(cfg.risk.max_daily_loss_usd):
-            return RiskCheckResult(False, f"daily loss ${realized:.2f} breached -${cfg.risk.max_daily_loss_usd}")
-
-        return RiskCheckResult(True, "OK")
 
 
 def _default_simulated(cfg: dict) -> bool:

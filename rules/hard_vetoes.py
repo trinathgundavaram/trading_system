@@ -109,13 +109,30 @@ def check(ticker: str, ticker_data: dict, market_data: dict,
     if config.get("risk", {}).get("kill_switch_triggered"):
         return VetoResult(True, "Kill switch active", "KILL_SWITCH")
 
-    # 10. Daily loss limit
-    if config.get("risk", {}).get("daily_loss_limit_triggered"):
-        return VetoResult(True, "Daily loss limit reached", "DAILY_LOSS")
-
-    # 11. Daily profit lock
-    if config.get("risk", {}).get("daily_profit_lock_triggered"):
-        return VetoResult(True, "Daily profit lock triggered", "PROFIT_LOCK")
+    # 10/11. DAILY_LOSS and PROFIT_LOCK vetoes REMOVED (§54, Phase 2.5).
+    #
+    # They read risk.daily_loss_limit_triggered and
+    # risk.daily_profit_lock_triggered, and no code path in this repository
+    # ever set either flag. They could only fire if a human hand-edited
+    # config.yaml, while engine/rules_catalog.py advertised both to the
+    # operator as live vetoes. That is §9's original finding one layer over: a
+    # control that is documented, catalogued and readable, and that cannot
+    # fire.
+    #
+    # No capability is lost. The real daily-loss control is
+    # rules/risk_rules.py's RiskEngine.check() plus
+    # trip_kill_switch_if_needed(), which use §8's equity-scaled limit rather
+    # than a raw dollar cap and route a breach through the kill switch above -
+    # a control with a writer, a persist step, a notification and a test. The
+    # manual halt is `kill_switch_triggered`, which is the flag actually
+    # documented for that purpose.
+    #
+    # The removal also closes a sharper edge: engine/position_management.py
+    # read daily_loss_limit_triggered as a PRIORITY-1 exit-everything trigger,
+    # so hand-setting a key nothing writes would liquidate the book. If a
+    # deliberate manual flatten is wanted, it should be built as one - with a
+    # writer, a test and a UI confirmation - not left as a config key that
+    # reads like a limit.
 
     # 12. Pending cooldown (post-stop-loss)
     from storage.database import Database  # avoid circular imports

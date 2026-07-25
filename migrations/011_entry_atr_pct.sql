@@ -1,0 +1,77 @@
+-- 011_entry_atr_pct.sql  (Phase 2.5 step 2.5.6, §53)
+--
+-- WHAT WAS WRONG
+--
+-- engine/portfolio_risk.py's fifth check caps how many high-volatility
+-- positions may be open at once. It compared two different quantities against
+-- one threshold:
+--
+--   candidate side   scheduler.py:895  atr_pct = atr / price * 100
+--                    -> a true ATR percentage
+--   existing side    _position_risk_band_pct(p) = |entry - stop| / entry * 100
+--                    -> the distance to the CURRENT STOP, as a % of entry
+--
+-- both against portfolio_risk.high_vol_atr_pct_threshold (5.0).
+--
+-- The proxy was honest about being a proxy and its docstring defended itself
+-- reasonably: wider stops do track wider ATR, because the stop is sized off
+-- ATR to begin with. That defence holds for RANKING positions against each
+-- other. It does not hold for comparing against a threshold denominated in
+-- ATR, and the bias is one-directional: scheduler.py seeds
+-- risk_per_share = min(max(1.2*ATR, price*1.5%), price*stop_loss_pct), so on a
+-- volatile name the stop is CLAMPED by stop_loss_swing_pct (5% at MODERATE)
+-- while ATR keeps going. A 7%-ATR position sits behind a 5%-wide stop and
+-- scores 5.0 on the proxy - right at the threshold rather than well past it.
+-- Then the stop ratchets up as the position moves in favour, and the same
+-- position's proxy value FALLS, so a winner quietly stops counting as
+-- high-volatility at all.
+--
+-- Net effect: existing positions were systematically under-counted, and
+-- max_simultaneous_high_vol_positions (4) was looser in practice than it read.
+-- Calibrating the threshold - which the 2026-07-25 review asked for, correctly
+-- - could not have helped while the two sides were in different units.
+--
+-- THE FIX
+--
+-- Persist ATR at entry, the same way the other entry context is persisted.
+-- positions already carries entry_signal_score, entry_p_win, entry_ev,
+-- entry_regime, entry_rs_percentile and entry_ad_ratio; §16 fixed that
+-- persistence and this is one more field of it. The candidate side needs no
+-- change - it was already correct.
+--
+-- ENTRY ATR, not live ATR, deliberately. Live ATR would need a fresh fetch for
+-- every open position on every cycle - the exact cost _position_risk_band_pct
+-- existed to avoid. Entry ATR is a statement about what the position was when
+-- it was taken, which is what a concentration cap is asking about: how many
+-- volatile things did I choose to hold at once.
+--
+-- Purely additive, nullable. rollback_safe: true.
+--
+-- Apply:    ./scripts/apply_migration.sh migrations/011_entry_atr_pct.sql
+--           (NOT `psql "$POSTGRES_DB" -f ...` - POSTGRES_DB is unset in
+--            this project's .env, so that expands to an empty database
+--            name and psql silently falls back to $USER. See the script.)
+-- Rollback: see the commented block at the bottom.
+
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_atr_pct REAL;
+
+-- ── No backfill ─────────────────────────────────────────────────────────────
+-- ATR at the moment each existing position was opened is not recoverable. It
+-- could be approximated from history, but an approximated risk input that
+-- looks like a measured one is precisely what this migration exists to stop.
+--
+-- _position_atr_pct() therefore keeps the stop-distance proxy as an EXPLICIT
+-- fallback for rows with NULL entry_atr_pct, and logs when it uses it. Old
+-- positions keep the old (biased) treatment, new ones get the real number, and
+-- the mixture is visible in the logs rather than silent. As the book turns
+-- over the fallback stops being reached.
+
+-- ── BACKWARD ────────────────────────────────────────────────────────────────
+-- ALTER TABLE positions DROP COLUMN IF EXISTS entry_atr_pct;
+--
+-- Safe: _position_atr_pct() falls back to the proxy for every row when the
+-- column is absent, which is the pre-§53 behaviour exactly. Note that rolling
+-- back reinstates the under-counting, so if high_vol_atr_pct_threshold has
+-- been recalibrated against real ATR by then, roll that back too - a threshold
+-- tuned for ATR units applied to stop-distance units is worse than either
+-- consistent pairing.
