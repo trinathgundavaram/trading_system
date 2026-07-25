@@ -214,7 +214,14 @@ def main() -> int:
 
         new_findings += 1
         if not args.json:
-            print(f"[FAIL ] {name}  ({len(new_rows)} NEW"
+            # During an accept run every finding is "new" by construction -
+            # the baseline is deliberately ignored so the file is rebuilt from
+            # scratch. Printing FAIL there and then "Accepted 146 findings"
+            # two lines later reads as a contradiction, so say what is
+            # actually happening.
+            tag = "RECORD" if args.accept_baseline else "FAIL "
+            print(f"[{tag}] {name}  ({len(new_rows)}"
+                  + ("" if args.accept_baseline else " NEW")
                   + (f", {known_n} known" if known_n else "") + ")")
             print(f"         {why}")
             for r in new_rows[:args.limit]:
