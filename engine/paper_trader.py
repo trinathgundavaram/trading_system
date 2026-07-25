@@ -247,7 +247,11 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
             seed["current_target_price"] = price + rps * 3
         seed["stop_state"] = "INITIAL_RISK"
         seed["high_watermark_price"] = price
-        db.update_position_by_ticker(ticker, seed)
+        # §16: simulated=True is load-bearing, not decoration. Without the
+        # book scope this UPDATE matched an open position in EITHER book, so
+        # this line - a $100 paper entry - could write its stop onto a real
+        # SYNC holding of the same ticker.
+        db.update_position_by_ticker(ticker, seed, simulated=True)
     db.log_paper_trade(ticker, "buy", price, shares, amount,
                         reason="buy_signal", pattern_id=pattern_id, trade_mode=trade_mode)
     # §7 (Phase 2): the paper book now consumes the daily budget. Placed AFTER

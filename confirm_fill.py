@@ -149,7 +149,13 @@ def cmd_buy(ticker: str, price: float, shares: float):
         "current_target_price": price + (risk_per_share * 3),
         "stop_state": "INITIAL_RISK",
         "exit_stage_reached": 0,
-    })
+    # §16: the REAL book. This command confirms a real fill, and the
+    # open_position() call above wrote simulated=0 (its default) - so the
+    # seeding has to target the same row. Unscoped, it could land on the paper
+    # mirror of the same ticker and leave the real position with the NULL
+    # risk_per_share that meant no R-multiple target and zero take-profit
+    # exits across 29 trades.
+    }, simulated=False)
 
     print(f"Recorded BUY fill: {ticker} {shares} shares @ ${price:.2f} (${dollar_amount:.2f})")
     if pattern_id:

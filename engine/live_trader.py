@@ -469,7 +469,11 @@ def execute_buy_live(db, cfg: dict, ticker: str, price: float, position_size=Non
                 seed["current_target_price"] = fill_price + rps * 3
             seed["stop_state"] = "INITIAL_RISK"
             seed["high_watermark_price"] = fill_price
-            db.update_position_by_ticker(ticker, seed)
+            # §16: scoped to the REAL book. Unscoped, this seeding wrote to
+            # whichever open row matched the ticker first - so a live fill
+            # could seed the paper mirror instead of the position it just
+            # opened, which is the same bug pointing the other way.
+            db.update_position_by_ticker(ticker, seed, simulated=False)
         db.log_trade(ticker, "buy", round(fill_price * qty, 2), shares=qty,
                       fill_price=fill_price, order_id=order_id, status="filled")
         logger.info(f"{ticker}: [LIVE] FILLED buy {qty:.4f} sh @ ${fill_price:.2f} [{trade_mode}]")

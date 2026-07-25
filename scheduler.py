@@ -1031,11 +1031,17 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
             except Exception as e:
                 logger.error(f"{ticker}: paper sell (mode-independent check) failed: {e}", exc_info=True)
 
+        # §16: these two lines are the clearest illustration of the cross-book
+        # bug. Same ticker, two different rows, two different highs - and
+        # until the book scope was added, each of these statements wrote to
+        # BOTH rows, so the second call silently overwrote the first with the
+        # other book's number. trail_high feeds the trailing stop, so the real
+        # holding's stop was tracking the paper position's price history.
         if paper_position and td.price > paper_position.get("trail_high", paper_position["entry_price"]):
-            db.update_trail_high(ticker, td.price)
+            db.update_trail_high(ticker, td.price, simulated=True)
 
         if position and td.price > position.get("trail_high", position["entry_price"]):
-            db.update_trail_high(ticker, td.price)
+            db.update_trail_high(ticker, td.price, simulated=False)
 
         # Full decision-context snapshot, persisted alongside the signal so
         # analytics/decision_replay.py can reconstruct "why did the system
@@ -1621,7 +1627,11 @@ def _price_watch_loop():
                         continue
                     db.upsert_ticker_info(ticker, last_price=price)
                     if price > (p.get("trail_high") or p.get("entry_price") or 0):
-                        db.update_trail_high(ticker, price)
+                        # §16: scoped to the book THIS position is in. The
+                        # loop above mixes both books (paper positions plus
+                        # live ones when `live`), so an unscoped ratchet here
+                        # crossed them on every price tick.
+                        db.update_trail_high(ticker, price, simulated=not is_real)
                     reason = paper_trader.check_exit_triggers(p, price, cfg)
                     if reason:
                         logger.info(f"{ticker}: [PRICE WATCH] exit trigger between cycles - {reason}")

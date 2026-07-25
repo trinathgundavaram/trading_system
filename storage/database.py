@@ -2793,11 +2793,36 @@ class Database:
                 "trade_mode": row.get("trade_mode"),
             }
 
-    def update_trail_high(self, ticker: str, new_high: float):
+    def update_trail_high(self, ticker: str, new_high: float,
+                          simulated: bool = None):
+        """Ratchet the trailing high for the open position in `ticker`.
+
+        §16, found while migrating update_position_by_ticker: this method had
+        exactly the same defect and it was arguably the worse of the two,
+        because it fires on EVERY cycle rather than once at entry. Unscoped,
+        the paper book's trail_high was written onto the real row of the same
+        ticker and vice versa - and trail_high is what the trailing stop is
+        computed from, so the consequence is a real holding whose stop tracks
+        a paper position's price history.
+
+        scheduler.py made this concrete: it updates `paper_position` and
+        `position` on consecutive lines, for the same ticker, through this
+        same unscoped statement. Both writes hit both rows.
+
+        Raises on simulated=None for the same reason as
+        update_position_by_ticker: a silent default would leave an unmigrated
+        caller writing to the real book, invisibly.
+        """
+        if simulated is None:
+            raise ValueError(
+                "update_trail_high requires simulated=True/False - an unscoped "
+                "ratchet writes one book's high onto the other's trailing "
+                "stop (§16).")
         with self._conn() as conn:
             conn.execute(
-                "UPDATE positions SET trail_high = GREATEST(COALESCE(trail_high, 0), ?) WHERE ticker = ? AND status = 'open'",
-                (new_high, ticker),
+                "UPDATE positions SET trail_high = GREATEST(COALESCE(trail_high, 0), ?) "
+                "WHERE ticker = ? AND status = 'open' AND COALESCE(simulated, 0) = ?",
+                (new_high, ticker, 1 if simulated else 0),
             )
 
     def get_all_positions(self, simulated: bool = None):
@@ -3191,14 +3216,42 @@ class Database:
             conn.execute(f"UPDATE positions SET {set_clause} WHERE id = ?",
                          (*updates.values(), position_id))
 
-    def update_position_by_ticker(self, ticker: str, updates: dict):
+    def update_position_by_ticker(self, ticker: str, updates: dict,
+                                   simulated: bool = None):
+        """Book-scoped update of the open position in `ticker`.
+
+        `simulated` is REQUIRED in practice (§16, E-9). Without it this
+        statement matched an open position in EITHER book, so a paper entry's
+        stop could land on a real SYNC holding of the same ticker. That is not
+        hypothetical: HCA was in the live watchlist and simultaneously an
+        $8,553 SYNC position, so a $100 paper entry in HCA would have
+        overwritten the real row's current_stop_price with a stop computed for
+        a hundred-dollar trade.
+
+        The default is None and None RAISES, rather than defaulting to False.
+        A silent default would leave any unmigrated call site writing to the
+        REAL book, which is the more dangerous of the two directions - the
+        failure would be invisible and would cost real money. Raising makes an
+        unmigrated caller fail loudly on its first execution instead.
+
+        Kept as a keyword rather than made positional so the migration could be
+        done call site by call site; all three (paper_trader, live_trader,
+        confirm_fill) now pass it explicitly.
+        """
+        if simulated is None:
+            raise ValueError(
+                "update_position_by_ticker requires simulated=True/False - an "
+                "unscoped update matches an open position in EITHER book and "
+                "can write a paper entry's stop onto a real holding (§16).")
         if not updates:
             return
         with self._conn() as conn:
             set_clause = ", ".join(f"{k} = ?" for k in updates)
             conn.execute(
-                f"UPDATE positions SET {set_clause} WHERE ticker = ? AND status = 'open'",
-                (*updates.values(), ticker),
+                f"""UPDATE positions SET {set_clause}
+                     WHERE ticker = ? AND status = 'open'
+                       AND COALESCE(simulated, 0) = ?""",
+                (*updates.values(), ticker, 1 if simulated else 0),
             )
 
     # ---------- MAE/MFE learning ----------
