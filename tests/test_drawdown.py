@@ -197,13 +197,36 @@ def test_running_breach_on_the_other_book_does_not_trip(cfg_file):
 # ── The arithmetic (needs a real database) ──────────────────────────────────
 
 def _equity(db, points, day_offset=0):
-    """Write equity points onto a given local day, oldest first."""
-    local_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    """Write equity points onto a given local day, oldest first.
+
+    Today's points are written a few seconds AGO rather than at a fixed hour,
+    and that detail is load-bearing. init_paper_account stamps created_at with
+    utcnow(), and update_drawdown treats that as the epoch boundary - so a
+    fixed 10:00 wrote points that were, depending on what time the suite ran,
+    BEFORE the account existed. They were then correctly excluded, the peak
+    query returned NULL, and the test read 0% drawdown while asserting 1.6%.
+    That was the test being wrong about the clock, not the code being wrong
+    about drawdown, and pinning the points relative to now removes the
+    dependency on when you happen to run the suite.
+
+    Historical days (day_offset < 0) still hang off local midnight, since
+    they only need to land on the right calendar day.
+    """
     offset = datetime.utcnow() - datetime.now()
     with db._conn() as conn:
         for i, value in enumerate(points):
-            ts = (local_midnight + timedelta(days=day_offset, hours=10, minutes=i)
-                  + offset).isoformat()
+            if day_offset == 0:
+                # NOW, ascending by milliseconds. Forward rather than backward
+                # so that a point is always at or after an account created
+                # immediately before this call - a few seconds AGO would race
+                # the epoch whenever the two calls landed close together, which
+                # is the flake this whole docstring is about.
+                ts = (datetime.utcnow() + timedelta(milliseconds=i)).isoformat()
+            else:
+                local_midnight = datetime.now().replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+                ts = (local_midnight + timedelta(days=day_offset, hours=10, minutes=i)
+                      + offset).isoformat()
             conn.execute(
                 "INSERT INTO paper_equity_history (timestamp, total_value) VALUES (?, ?)",
                 (ts, float(value)))
@@ -311,6 +334,29 @@ def test_running_drawdown_ignores_a_pre_reset_peak(db):
     dd = db.get_daily_stats()["paper_running_drawdown"]
     assert dd == pytest.approx(1.6, abs=0.1)      # 984 off a 1000 peak
     assert dd < 15.0                              # would NOT trip the breaker
+
+
+def test_intraday_ignores_a_mid_day_reset(db):
+    """The other half of the same bug, and it had no test until the running
+    half failed and sent me looking.
+
+    Scoping only the PEAK left a mid-day reset inside today's intraday window,
+    so the peak-to-trough scan ran straight across the discontinuity. A
+    re-seed DOWNWARD - 1491 back to a 1000 starting_cash - reads as a 33%
+    intraday drawdown and blocks entries for the rest of the day, for an
+    accounting event.
+
+    The 2026-07-25 re-seed on the live database happened to step UP, which
+    produces no drawdown, so the real data never exposed this direction.
+    """
+    _equity(db, [1491.54, 1491.54], day_offset=-1)
+    db.init_paper_account(1000.0)          # epoch: the reset, downward
+    _equity(db, [1000.0, 998.0])           # today, post-reset
+
+    db.update_drawdown(simulated=True)
+    stats = db.get_daily_stats()
+    assert stats["paper_max_drawdown"] == pytest.approx(0.2, abs=0.05)
+    assert stats["paper_max_drawdown"] < 2.0    # would NOT block the day
 
 
 def test_backfill_resets_the_running_peak_at_the_epoch(db):

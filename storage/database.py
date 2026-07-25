@@ -3109,6 +3109,22 @@ class Database:
         today = date.today().isoformat()
         start_utc, end_utc = _local_day_window_utc()
 
+        # The epoch bounds the INTRADAY window too, not just the peak below.
+        #
+        # Fixing only the peak left half the bug in place: a reset that happens
+        # MID-DAY puts the discontinuity inside today's window, so the
+        # peak-to-trough scan runs straight across it. A re-seed downward - say
+        # 1491 back to a 1000 starting_cash - would read as a 33% intraday
+        # drawdown and block entries for the rest of the day, for an accounting
+        # event. The 2026-07-25 re-seed happened to step UP, which produces no
+        # drawdown, so the live data did not expose this.
+        #
+        # max() rather than replacing the window: on any ordinary day the epoch
+        # is older than midnight and the day window is what binds.
+        epoch = self._paper_epoch_start()
+        if epoch and epoch > start_utc:
+            start_utc = epoch
+
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT total_value FROM paper_equity_history
@@ -3148,7 +3164,6 @@ class Database:
             # equity bug: a number that is arithmetically derived, obviously
             # wrong to a human, and completely invisible to the control that
             # consumes it.
-            epoch = self._paper_epoch_start()
             if epoch:
                 peak_row = conn.execute(
                     "SELECT MAX(total_value) FROM paper_equity_history "
@@ -3242,6 +3257,18 @@ class Database:
             try:
                 local_day = (datetime.fromisoformat(r["timestamp"]) - offset).date().isoformat()
             except (TypeError, ValueError):
+                continue
+            # On the epoch DAY itself, drop points from before the reset. That
+            # day is the only one whose points span two different accounts, so
+            # scanning it whole would run the peak-to-trough calculation across
+            # the discontinuity - a re-seed downward reading as a large
+            # intraday drawdown that never happened.
+            #
+            # Earlier days keep all their points. They belong to the previous
+            # account, and their intraday figures are self-contained and true
+            # for it; dropping them would discard real history to fix a
+            # boundary problem that only exists at the boundary.
+            if epoch and local_day == epoch_day and r["timestamp"] < epoch:
                 continue
             by_day.setdefault(local_day, []).append(float(r["total_value"]))
 
