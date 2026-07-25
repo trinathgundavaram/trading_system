@@ -33,6 +33,19 @@ output/
 *.sql.gz
 *.sql.gz.sha256
 
+# ── Reports and generated documents ────────────────────────────────────────
+# The evaluation and remediation reports quote config.yaml verbatim, which as
+# of the pre-remediation tree included the Robinhood account number and the UI
+# auth token. A .docx is a zip - a scanner reading the repo as text sees
+# nothing, so this must be excluded by path, not by content scan. These
+# documents are deliverables, not source: keep them locally, back them up with
+# `tp backup`, but do not put them in a git remote.
+*.docx
+*.doc
+*.pdf
+*.pptx
+*.xlsx
+
 # ── Version-manager scratch (§38) ──────────────────────────────────────────
 .tp/
 venv/
