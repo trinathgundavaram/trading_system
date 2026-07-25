@@ -20,6 +20,36 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+## [1.1] — v1.1.0 — 2026-07-25
+
+### Decision function: unchanged — v1.0.x trade data remains poolable
+
+`scripts/classify_change.py` reports MAJOR because
+`engine/stop_state_machine.py` is on its file list. All four consumers of
+`stop_state` were enumerated and none can change a trade; the stop *price* is
+untouched. The reasoning is set out in full in
+[docs/releases/v1.1.0.md](docs/releases/v1.1.0.md) — that argument, not the
+file path, is what the field records.
+
+### Fixed
+
+- **S-1** — a stop stage a trade has reached no longer reverts. `calculate()`
+  re-derived its stage from the current `profit_r` every cycle with no memory,
+  so a pullback below `breakeven_r` flipped a breakeven-protected position back
+  to `INITIAL_RISK` while `should_advance()` correctly held the stop price
+  where it was. State and price then described different positions. Found on
+  AES (entry 14.8050, stop 14.8095, state `INITIAL_RISK`) by
+  `scripts/audit_stops.py` on the day it shipped.
+
+### Added
+
+- `_calculate_raw()` / `_apply_stage_ratchet()` split in
+  `engine/stop_state_machine.py`, so the ratchet is testable independently of
+  the stage arithmetic it floors.
+- `tests/test_stop_state_ratchet.py` — 13 tests, including a control that
+  asserts the raw calculation *still* regresses. If that ever passes, the stage
+  maths moved and the rest of the file stops proving anything.
+
 ## [1.01] — v1.0.1 — 2026-07-24
 
 ### Decision function: unchanged — v1.0.0 trade data remains poolable

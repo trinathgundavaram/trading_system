@@ -87,7 +87,84 @@ def _atr_spike_cfg(config: dict) -> dict:
     return merged
 
 
+# ── Stage ratchet (S-1, v1.1.0, found by scripts/audit_stops.py 2026-07-24) ──
+# The stages below are ordered by how much the trade has proved itself. A
+# position that has REACHED a stage never reports an earlier one, because the
+# stop price it earned there never widens (see should_advance).
+#
+# Before this, _calculate_raw's state was re-derived from the CURRENT profit_r
+# every cycle with no memory. The moment price fell back below breakeven_r, the
+# state reverted to INITIAL_RISK while current_stop_price stayed locked at
+# entry + risk_per_share x breakeven_lock_r. State and price then described
+# different things - AES was found at entry 14.8050 with stop 14.8095 and state
+# INITIAL_RISK, which reads as "no protection yet" on a position that was in
+# fact breakeven-protected.
+#
+# THESIS_BROKEN is deliberately absent from the ranking: it is an emergency
+# that must be able to fire from any stage, so it is never suppressed and never
+# treated as a stage that can be regressed FROM.
+_STAGE_RANK = {
+    StopState.INITIAL_RISK: 0,
+    StopState.TRADE_CONFIRMING: 1,
+    StopState.BREAKEVEN: 2,
+    StopState.PROFIT_PROTECT: 3,
+    StopState.TREND_FOLLOWING: 4,
+}
+
+
+def _reached_stage(position: dict):
+    """The furthest stage this position has previously reached, or None when it
+    has no history (a fresh entry) or its last state was THESIS_BROKEN."""
+    name = str(position.get("stop_state") or "").upper()
+    try:
+        return StopState(name)
+    except ValueError:
+        return None
+
+
+def _apply_stage_ratchet(candidate: StopLevel, position: dict) -> StopLevel:
+    """Floor `candidate` at the stage this position already reached.
+
+    Only the LABEL and the floor are affected. The stop price returned is
+    max(candidate, current) - which is what engine/position_management.py's
+    should_advance() already enforced independently, so this changes no exit
+    that was not already going to happen. It makes the recorded state agree
+    with the recorded price.
+    """
+    if candidate.state is StopState.THESIS_BROKEN:
+        return candidate
+
+    previous = _reached_stage(position)
+    if previous is None or previous not in _STAGE_RANK:
+        return candidate
+    if _STAGE_RANK[candidate.state] >= _STAGE_RANK[previous]:
+        return candidate
+
+    held_price = max(float(candidate.stop_price),
+                     float(position.get("current_stop_price") or 0))
+    return StopLevel(
+        previous,
+        held_price,
+        (f"{previous.value} held (stage ratchet): the current reading would imply "
+         f"{candidate.state.value}, but a stage a trade has reached does not revert "
+         f"while its stop stands. Underlying: {candidate.stop_reason}"),
+        candidate.trail_from,
+        candidate.calculated_at,
+    )
+
+
 def calculate(position: dict, ticker_data: dict, exit_score: float, config: dict) -> StopLevel:
+    """Public entry point: the raw per-cycle stage, floored by the ratchet."""
+    return _apply_stage_ratchet(
+        _calculate_raw(position, ticker_data, exit_score, config), position)
+
+
+def _calculate_raw(position: dict, ticker_data: dict, exit_score: float, config: dict) -> StopLevel:
+    """The stage implied by THIS cycle's numbers alone, with no memory.
+
+    Kept separate and importable so tests can prove the ratchet is what fixes
+    the regression rather than some incidental change in the stage maths.
+    """
     entry = position["entry_price"]
     current = ticker_data.get("price", entry)
     atr = ticker_data.get("atr") or entry * 0.015
