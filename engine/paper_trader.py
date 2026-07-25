@@ -176,8 +176,12 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
         if not victim:
             logger.info(f"{ticker}: [PAPER] buy skipped - {open_count}/{max_positions} positions open")
             return {}
+        # §D: this position is not being closed on its own merits at all - it
+        # is being closed to make room. Recording that as anything else would
+        # put a forced exit into the same bucket as a decided one.
         closed = execute_sell(db, victim["ticker"], victim_price,
-                               reason=victim["reason"], pattern_db=pattern_db, cfg=cfg)
+                               reason=victim["reason"], pattern_db=pattern_db, cfg=cfg,
+                               exit_kind="rotation")
         if not closed:
             logger.warning(f"{ticker}: [PAPER] rotation sell of {victim['ticker']} "
                            f"failed - buy skipped")
@@ -288,7 +292,7 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
 
 
 def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None,
-                  cfg: dict = None) -> dict:
+                  cfg: dict = None, exit_kind: str = None) -> dict:
     """Closes the simulated position at the current price and settles the
     purse. Closes the linked pattern with the rule-driven outcome so the
     learning loop trains on realistic exits. Returns {} if nothing to sell.
@@ -330,9 +334,14 @@ def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None,
         # is how ADPT ended up recorded as 6.34h in one table and 5.0h in
         # another. Three computations, three answers.
         try:
+            # §D: exit_kind passed through when the caller holds it (the sell
+            # rules decide it at the trigger). Left None, close_pattern falls
+            # back to classify_exit(), which is correct for the structured
+            # reasons and returns NULL for prose - the pre-§D behaviour.
             pattern_db.close_trade(closed["pattern_id"], closed["pnl_pct"],
                                     closed.get("hold_hours", 0.0),
-                                    exit_reason=f"paper_{reason}")
+                                    exit_reason=f"paper_{reason}",
+                                    exit_kind=exit_kind)
         except Exception as e:
             logger.error(f"{ticker}: [PAPER] pattern close failed: {e}", exc_info=True)
 

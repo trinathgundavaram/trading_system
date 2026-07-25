@@ -412,8 +412,13 @@ async def paper_sell(body: dict, _: bool = Depends(require_token)):
         raise HTTPException(502, f"No current price available for {ticker} - try again")
     from engine.paper_trader import execute_sell
     from learning.pattern_database import PatternDatabase
+    # §D: exit_kind="manual". classify_exit() recognises "manual_fill_confirmed"
+    # (confirm_fill.py's string) but never recognised "manual_ui", so every
+    # Sell-button close was landing as NULL despite being the one exit whose
+    # kind is least ambiguous - a human pressed a button.
     closed = execute_sell(db, ticker, float(price), reason="manual_ui",
-                           pattern_db=PatternDatabase(db), cfg=_load_config())
+                           pattern_db=PatternDatabase(db), cfg=_load_config(),
+                           exit_kind="manual")
     if not closed:
         raise HTTPException(500, "Sell failed - see server log")
     return closed
@@ -464,7 +469,7 @@ async def real_sell(body: dict, _: bool = Depends(require_token)):
     from learning.pattern_database import PatternDatabase
     closed = live_trader.execute_sell_live(
         db, cfg, ticker, reason="manual_ui", pattern_db=PatternDatabase(db),
-        require_auto_trade=False)
+        require_auto_trade=False, exit_kind="manual")   # §D - see the paper path
     if not closed:
         raise HTTPException(500, "Sell failed, was rejected, or didn't fill within the "
                                   "wait window - see server log for the exact error")

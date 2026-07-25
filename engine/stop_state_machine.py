@@ -44,6 +44,23 @@ class StopState(Enum):
     TREND_FOLLOWING = "TREND_FOLLOWING"
     THESIS_BROKEN = "THESIS_BROKEN"
 
+    @property
+    def exit_kind(self) -> str:
+        """§D: which EXIT_KINDS member an exit IN THIS STATE represents.
+
+        Lives here rather than being inferred downstream because this file is
+        the only place that knows what its own states mean. A stop in
+        INITIAL_RISK is capping a loss; the identical mechanism in
+        TREND_FOLLOWING is protecting a profit, and folding the two together
+        is how p_stop_loss would end up counting winners as stop-outs.
+
+        The table itself is in rules/common.py alongside EXIT_KINDS, so that
+        the vocabulary and its mappings stay in one file and cannot drift into
+        two half-agreeing copies.
+        """
+        from rules.common import exit_kind_for_stop_state
+        return exit_kind_for_stop_state(self.value)
+
 
 @dataclass
 class StopLevel:
@@ -52,6 +69,13 @@ class StopLevel:
     stop_reason: str
     trail_from: Optional[float]
     calculated_at: str
+
+    @property
+    def exit_kind(self) -> str:
+        """Convenience passthrough so a caller holding a StopLevel does not
+        have to reach through to .state.exit_kind. Records only - nothing in
+        this file's stop ARITHMETIC reads it."""
+        return self.state.exit_kind
 
 
 # Reproduces the pre-2026-07-22 hardcoded behavior exactly - used as a

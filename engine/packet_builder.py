@@ -201,6 +201,34 @@ def build_position_action_packet(action: dict) -> str:
     return "\n".join(lines)
 
 
+def high_vol_line(pr) -> str:
+    """§C3: the high-volatility count, WITH the unit it was measured in.
+
+    Pre-§53 this count meant "positions whose STOP DISTANCE was >= threshold";
+    post-§53 it means "positions whose ATR AT ENTRY was >= threshold". Same
+    label, different quantity - and the old one read systematically low (the
+    stop is clamped on volatile names, and it ratchets as a position moves in
+    favour, so a winner's measured volatility FELL the better it did). An
+    operator comparing today's packet against last week's had no way to know
+    the two numbers are not comparable. engine/rules_catalog.py already says
+    ATR; this makes the packet agree with the catalogue.
+
+    A module-level function rather than three lines inline so that the wording
+    can be tested without constructing a full ticker packet - the label IS the
+    deliverable here, and a label nothing asserts on drifts.
+    """
+    n = pr.high_vol_position_count
+    line = f"High-vol positions open (by entry ATR%): {n}"
+    proxy_n = getattr(pr, "high_vol_proxy_count", 0)
+    if proxy_n:
+        # On the line itself rather than in a warning below it. A mixture
+        # reported as a plain integer is the failure mode - the number looks
+        # measured whichever way it was arrived at.
+        line += (f" [{proxy_n} of {n or 'n'} est. from stop distance "
+                 f"— pre-migration rows, reads LOW]")
+    return line
+
+
 def build_ticker_packet(pkt: dict) -> str:
     td = pkt["td"]
     br = pkt["buy_result"]
@@ -419,13 +447,14 @@ def build_ticker_packet(pkt: dict) -> str:
 
     pr = pkt.get("portfolio_risk")
     if pr is not None:
+        _hv = high_vol_line(pr)
         lines += [
             "",
             "### PORTFOLIO RISK",
             f"Sector: {pr.sector} ({pr.sector_exposure_pct:.0f}% exposure if added) | "
             f"Themes: {', '.join(pr.themes) or 'none'} ({pr.theme_exposure_pct:.0f}% exposure)",
             f"Portfolio beta if added: {pr.portfolio_beta:.2f} | Max pairwise correlation: {pr.max_pairwise_correlation:.2f} | "
-            f"High-vol positions open: {pr.high_vol_position_count}",
+            + _hv,
             f"Size multiplier: x{pr.size_multiplier:.2f}" + (" — BLOCKED" if not pr.allowed else ""),
         ]
         for r in pr.reasons:

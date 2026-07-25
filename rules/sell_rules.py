@@ -47,6 +47,13 @@ with each stock's own volatility instead of every stock sharing a flat 10%.
 """
 from dataclasses import dataclass, field
 
+# rules/common.py is stdlib-only (dataclasses + typing), so importing it here
+# does not break this module's "no dependency beyond the stdlib" property - see
+# the note on UNMANAGED_TRADE_MODES below. The exit vocabulary lives there
+# because storage/database.py validates against the same frozenset, and two
+# copies of a closed set is how a closed set stops being closed.
+from rules.common import exit_kind_for_stop_state
+
 # ── Unmanaged position modes (§5, Phase 1, 2026-07-24 audit) ────────────────
 # Mirrors storage.database.MANAGED_EXCLUDED_MODES. Deliberately duplicated as
 # a literal rather than imported: this module has no dependency beyond the
@@ -62,6 +69,22 @@ class SellResult:
     triggered_rule: str = ""
     reason: str = ""
     urgency: str = "normal"
+    # §D: the countable companion to `reason`, decided HERE - at the point
+    # where we know why we are selling - rather than reverse-engineered from
+    # the sentence afterwards.
+    #
+    # rules/common.py's classify_exit() deliberately refuses to classify
+    # `sell_rules:` strings, because they are free text assembled per-trade
+    # with prices interpolated into them, and prefix-matching "Dynamic stop
+    # hit" would be a string-matching table that silently drifts from this
+    # file. That refusal was correct and left exit_kind NULL on the MOST
+    # COMMON exit path - so the fix is this field, not a smarter parser.
+    #
+    # One of rules/common.py's EXIT_KINDS, or "" when should_sell is False.
+    # Threaded through scheduler.py -> paper_trader/live_trader ->
+    # pattern_db.close_trade() -> close_pattern(exit_kind=...), which validates
+    # it against EXIT_KINDS and stores NULL rather than an unrecognised value.
+    exit_kind: str = ""
     # Legacy fields, kept at their neutral default for callers that still
     # read them (none in the live pipeline as of this change - see
     # engine/packet_builder.py/scheduler.py, which only read should_sell/
@@ -121,6 +144,12 @@ class SellRulesEngine:
             stop_reason = (f"Dynamic stop hit ({stop_state or 'ATR-based'}): "
                             f"price ${price:.2f} <= stop ${dynamic_stop:.2f}")
             stop_urgency = "urgent" if stop_state in ("INITIAL_RISK", "TRADE_CONFIRMING", "THESIS_BROKEN") else "normal"
+            # §D: the state is what distinguishes a loss-capping stop from a
+            # profit-protecting trail, and it is right here in the position
+            # row. Note this is the ONLY place the distinction is recoverable
+            # at all - by the time close_pattern() sees the sentence, the state
+            # is inside a parenthesis in free text.
+            stop_exit_kind = exit_kind_for_stop_state(stop_state)
         else:
             # No dynamic stop yet (first cycle after entry) - fall back to
             # the original flat stop_loss/trailing_stop % checks so a
@@ -177,6 +206,12 @@ class SellRulesEngine:
                                 f"from high ${trail_high:.2f} (no dynamic stop yet"
                                 f"{', ATR-capped' if effective_trail_pct < configured_trail_pct else ''})")
             stop_urgency = "urgent"
+            # §D: the fallback path has no stop machine yet, so there is no
+            # state to consult - but there IS an unambiguous distinction
+            # between the two flat rules, and stop_rule_name already carries
+            # it. stop_loss is anchored to entry (capping a loss);
+            # trailing_stop is measured off trail_high (giving back a gain).
+            stop_exit_kind = "stop_loss" if stop_loss_hit else "trailing_stop"
 
         # Dynamic take-profit: R-multiple target off the same ATR*1.5
         # risk-per-share convention stop_state_machine.py uses, so the
@@ -194,10 +229,14 @@ class SellRulesEngine:
             target_triggered = tp_cfg.get("enabled") and pnl_pct >= tp_cfg.get("pct", 10.0)
             target_reason = f"Take profit hit: +{pnl_pct:.2f}% (no ATR yet, static target)"
 
+        # §D: each tuple now carries its own exit_kind as a fifth element. The
+        # kinds are assigned where the trigger is defined, so adding a rule
+        # without deciding its kind is a visible omission at the point of
+        # writing rather than a NULL discovered months later in an analysis.
         hard_checks = [
-            (stop_triggered, stop_rule_name, stop_reason, stop_urgency),
+            (stop_triggered, stop_rule_name, stop_reason, stop_urgency, stop_exit_kind),
 
-            (target_triggered, "take_profit", target_reason, "normal"),
+            (target_triggered, "take_profit", target_reason, "normal", "take_profit"),
 
             # 0 <= guard (2026-07-16): days_to_earnings went negative when
             # finviz reported a PAST earnings date ("Earnings in -72 days"
@@ -206,14 +245,21 @@ class SellRulesEngine:
             # only an actually-upcoming earnings date may force an exit.
             (rules.get("earnings_approaching", {}).get("enabled") and
              0 <= td.days_to_earnings <= rules["earnings_approaching"].get("days_before", 2),
-             "earnings_approaching", f"Earnings in {td.days_to_earnings} days", "normal"),
+             "earnings_approaching", f"Earnings in {td.days_to_earnings} days", "normal",
+             # Event avoidance, not a stop and not a target. "rule_exit" is
+             # EXIT_KINDS' bucket for a sell_rules signal that is neither, and
+             # it is the honest one: inventing an "earnings" kind would give
+             # this rule its own row in every future GROUP BY on the strength
+             # of one config flag.
+             "rule_exit"),
 
             (rules.get("vix_spike", {}).get("enabled") and mkt.vix_level >= rules["vix_spike"]["threshold"],
-             "vix_spike", f"VIX spike: {mkt.vix_level:.1f}", "urgent"),
+             "vix_spike", f"VIX spike: {mkt.vix_level:.1f}", "urgent", "rule_exit"),
         ]
-        for triggered, rule_name, reason, urgency in hard_checks:
+        for triggered, rule_name, reason, urgency, exit_kind in hard_checks:
             if triggered:
-                return SellResult(True, rule_name, reason, urgency, exit_score=100.0)
+                return SellResult(True, rule_name, reason, urgency,
+                                   exit_score=100.0, exit_kind=exit_kind)
 
         # No hard exit triggered. The graduated hold/monitor/tighten/reduce/
         # exit decision now lives entirely in Loop B (rules/exit_scorer.py's

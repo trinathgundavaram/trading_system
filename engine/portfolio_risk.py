@@ -68,6 +68,13 @@ class PortfolioRiskResult:
     portfolio_beta: float
     max_pairwise_correlation: float
     high_vol_position_count: int
+    # §C3: how many OPEN positions were measured by the stop-distance proxy
+    # rather than by persisted entry ATR, because they predate migrations/011.
+    # Not a count of high-vol positions - a count of positions whose
+    # high-vol-ness is an estimate. Falls to zero as the book turns over, at
+    # which point high_vol_position_count is entirely measured and
+    # high_vol_atr_pct_threshold can be recalibrated against it (§B6).
+    high_vol_proxy_count: int = 0
     reasons: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     # §18: which caps were breached severely, and by how much. Kept separate
@@ -192,10 +199,24 @@ def _position_atr_pct(pos: dict) -> float:
     pre-migration rows is being counted the old way, and that is worth being
     able to see when the recalibration in §52/§53 is done.
     """
+    return _position_atr_pct_measured(pos)[0]
+
+
+def _position_atr_pct_measured(pos: dict) -> tuple:
+    """(volatility_pct, used_proxy). The two-value form of _position_atr_pct().
+
+    §C3: the count that reaches the operator is a MIXTURE while any position
+    predates migrations/011 - some rows measured by real entry ATR, some by the
+    stop-distance proxy that reads low. That mixture was visible only in a
+    debug log, i.e. nowhere the person reading the packet would look. Callers
+    that report the count to a human should report the proxy share beside it,
+    so "3 high-vol positions" cannot be read as three measured facts when one
+    of them is an estimate biased in a known direction.
+    """
     atr_pct = pos.get("entry_atr_pct")
     if atr_pct is not None:
         try:
-            return float(atr_pct)
+            return float(atr_pct), False
         except (TypeError, ValueError):
             pass
     proxy = _position_risk_band_pct(pos)
@@ -203,7 +224,7 @@ def _position_atr_pct(pos: dict) -> float:
         f"portfolio_risk: {pos.get('ticker')} has no entry_atr_pct (opened "
         f"before migrations/011) - counting it with the stop-distance proxy "
         f"at {proxy:.2f}%, which reads LOW for a volatile name.")
-    return proxy
+    return proxy, True
 
 
 def _fetch_closes(ticker: str, lookback_days: int) -> list:
@@ -414,7 +435,13 @@ class PortfolioRiskEngine:
         # §53: _position_atr_pct, not _position_risk_band_pct. The threshold is
         # denominated in ATR and the candidate side has always passed ATR; this
         # side was passing stop distance.
-        existing_high_vol = sum(1 for p in positions if _position_atr_pct(p) >= vol_threshold)
+        _measured = [_position_atr_pct_measured(p) for p in positions]
+        existing_high_vol = sum(1 for v, _ in _measured if v >= vol_threshold)
+        # §C3: not filtered to the high-vol ones deliberately. A proxy-measured
+        # position that reads BELOW the threshold is exactly the case the bias
+        # would hide, so the honest denominator is every position we had to
+        # estimate, not just the ones the estimate happened to flag.
+        existing_high_vol_proxy = sum(1 for _, used_proxy in _measured if used_proxy)
         candidate_is_high_vol = (candidate_atr_pct or 0.0) >= vol_threshold
         mult_vol = 1.0
         if candidate_is_high_vol and existing_high_vol >= max_high_vol:
@@ -515,5 +542,6 @@ class PortfolioRiskEngine:
             themes=candidate_themes, sector_exposure_pct=round(post_sector_pct, 1),
             theme_exposure_pct=round(worst_theme_post_pct, 1), portfolio_beta=round(post_beta, 2),
             max_pairwise_correlation=round(max_corr, 2), high_vol_position_count=existing_high_vol,
+            high_vol_proxy_count=existing_high_vol_proxy,
             reasons=reasons, warnings=warnings, severe_breaches=severe_breaches,
         )

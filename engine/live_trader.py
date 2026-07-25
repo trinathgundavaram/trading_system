@@ -386,8 +386,11 @@ def execute_buy_live(db, cfg: dict, ticker: str, price: float, position_size=Non
         if not victim:
             logger.info(f"{ticker}: [LIVE] buy skipped - {open_count}/{max_positions} real positions open")
             return {}
+        # §D: closed to make room, not on its own merits - see the matching
+        # note in paper_trader.
         closed = execute_sell_live(db, cfg, victim["ticker"],
-                                    reason=victim["reason"], pattern_db=pattern_db)
+                                    reason=victim["reason"], pattern_db=pattern_db,
+                                    exit_kind="rotation")
         if not closed:
             logger.warning(f"{ticker}: [LIVE] rotation sell of {victim['ticker']} "
                            f"did not fill - buy skipped, book unchanged")
@@ -496,7 +499,8 @@ def execute_buy_live(db, cfg: dict, ticker: str, price: float, position_size=Non
 
 
 def execute_sell_live(db, cfg: dict, ticker: str, reason: str, pattern_db=None,
-                       require_auto_trade: bool = True) -> dict:
+                       require_auto_trade: bool = True,
+                       exit_kind: str = None) -> dict:
     """Closes the REAL position with a fractional market sell. The kill
     switch deliberately does NOT block sells - being unable to exit risk is
     worse than being unable to add it.
@@ -587,9 +591,11 @@ def execute_sell_live(db, cfg: dict, ticker: str, reason: str, pattern_db=None,
                 # computed. Re-deriving it here against a fresh clock reading
                 # is how the same trade came to be recorded with two different
                 # hold times in two different tables.
+                # §D: see the matching note in paper_trader.execute_sell.
                 pattern_db.close_trade(closed["pattern_id"], closed["pnl_pct"],
                                         closed.get("hold_hours", 0.0),
-                                        exit_reason=f"live_{reason}")
+                                        exit_reason=f"live_{reason}",
+                                        exit_kind=exit_kind)
             except Exception as e:
                 logger.error(f"{ticker}: [LIVE] pattern close failed: {e}")
         logger.info(f"{ticker}: [LIVE] SOLD @ ${fill_price:.2f} ({reason}) - "

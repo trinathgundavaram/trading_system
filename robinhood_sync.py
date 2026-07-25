@@ -24,10 +24,71 @@ actual sell fill price, and guessing one would poison P&L learning. For those
 it prints the exact confirm_fill.py command to run instead.
 """
 import argparse
+import os
+import subprocess
 import sys
+from pathlib import Path
 
 from mcp_clients.robinhood_mcp import RobinhoodMCP
 from storage.database import Database
+
+# §C2: `seed-paper` calls reset_paper_account(), which unconditionally deletes
+# the purse, the ledger, every simulated position and - since §48 - the equity
+# curve. That is the single most destructive operation reachable from a CLI in
+# this repository, and until now it ran on the statement AFTER the one that
+# printed what it was about to destroy.
+#
+# The confirmation phrase mirrors engine/live_trader.py's
+# LIVE_EXECUTION_CONFIRM_PHRASE, and for the same reason: a y/n prompt is
+# answered reflexively, a phrase you have to read and type is not. The two
+# phrases are deliberately different so that muscle memory from one cannot
+# satisfy the other.
+SEED_PAPER_CONFIRM_PHRASE = "RESET PAPER ACCOUNT"
+
+
+def _require_backup(db: Database, skip: bool = False) -> None:
+    """Take a verified backup before a destructive paper-book operation, or
+    refuse to proceed.
+
+    scripts/tp backup already does the hard part - it dumps, then reads the
+    dump back before reporting success, because an unverified backup is a
+    belief rather than a backup. This just makes it non-optional on the path
+    that needs it most.
+
+    --skip-backup exists for the test suite and for the case where you have
+    just taken one by hand. It prints loudly, because the whole point is that
+    skipping is a decision someone made rather than a default nobody noticed.
+    """
+    if skip:
+        print("  [--skip-backup] Proceeding WITHOUT a backup. This is "
+              "unrecoverable if it goes wrong.")
+        return
+
+    tp = Path(__file__).resolve().parent / "scripts" / "tp"
+    if not tp.exists():
+        print(f"  Cannot find {tp} - refusing to run a destructive reset "
+              f"without a backup. Take a pg_dump by hand and re-run with "
+              f"--skip-backup.")
+        sys.exit(1)
+
+    print("  Taking a verified backup first (scripts/tp backup)...")
+    try:
+        r = subprocess.run([str(tp), "backup", "pre-seed-paper"],
+                           capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  Backup command failed to run: {e}\n"
+              f"  Refusing to reset. Take a pg_dump by hand and re-run with "
+              f"--skip-backup.")
+        sys.exit(1)
+
+    if r.returncode != 0:
+        # Deliberately NOT offering to continue anyway. A backup that failed
+        # is the one condition under which this operation must not proceed,
+        # and prompting here would just relocate the mistake.
+        print(f"  Backup FAILED (exit {r.returncode}):\n{r.stdout}\n{r.stderr}\n"
+              f"  Refusing to reset.")
+        sys.exit(1)
+    print("  Backup verified.")
 
 
 def _norm_positions(raw) -> list[dict]:
@@ -101,7 +162,8 @@ def cmd_positions(rh: RobinhoodMCP):
               f"{p['current_price']:>10.2f} {p['equity']:>12.2f}")
 
 
-def cmd_seed_paper(rh: RobinhoodMCP):
+def cmd_seed_paper(rh: RobinhoodMCP, assume_yes: bool = False,
+                   skip_backup: bool = False):
     """Resets the WATCH-mode paper account and reseeds it to MIRROR the real
     Robinhood account (2026-07-16, Akhil's ask - 'my actual portfolio doesn't
     show correctly for watch'): purse cash = real buying power, and every
@@ -110,7 +172,16 @@ def cmd_seed_paper(rh: RobinhoodMCP):
     (real `positions` rows from confirm_fill are untouched - use `reconcile`
     for those). Destructive to the PAPER book: existing paper positions,
     ledger, and equity history are wiped first, so run this to start a fresh
-    mirror, not mid-experiment."""
+    mirror, not mid-experiment.
+
+    §C2 (2026-07-25 review): now gated on a verified backup and a typed
+    confirmation phrase. It previously printed what it was about to destroy
+    and destroyed it on the next statement, with no way to stop in between -
+    every other destructive path in this repo (repair_test_damage.py's
+    --apply, live_trader's confirm phrase, tp backup's read-back check) has a
+    gate, and this one wipes the equity curve that every drawdown figure is
+    computed from.
+    """
     pf = rh.get_portfolio()
     if not pf:
         print("Robinhood portfolio fetch failed - refusing to seed from unknown state.")
@@ -135,12 +206,56 @@ def cmd_seed_paper(rh: RobinhoodMCP):
 
     db = Database()
     old = db.get_paper_account()
+
+    # ── The gate ────────────────────────────────────────────────────────────
+    # Everything above this point is read-only (Robinhood fetches and
+    # arithmetic). Everything below it is irreversible. Say plainly what goes.
+    print("\n" + "=" * 68)
+    print("DESTRUCTIVE: reset_paper_account() is about to delete, permanently:")
     if old:
-        print(f"Wiping existing paper account (cash ${old['cash']:.2f}, "
-              f"started ${old['starting_cash']:.2f}) + paper positions/ledger/history...")
+        print(f"  - the paper purse            cash ${old['cash']:.2f}, "
+              f"started ${old['starting_cash']:.2f}")
+    else:
+        print("  - the paper purse            (none currently)")
+    _sim = db.get_all_positions(simulated=True) or []
+    n_open = sum(1 for p in _sim if p.get("status") == "open")
+    n_curve = len(db.get_paper_equity_history(limit=100000) or [])
+    print(f"  - every simulated position   {n_open} open, {len(_sim)} total")
+    print(f"  - the whole paper ledger     (paper_trades)")
+    print(f"  - the equity curve           {n_curve} point(s)")
+    print("")
+    print("The equity curve is the input to every drawdown figure. Deleting it")
+    print("is correct HERE - a mirror of a different account is a new epoch and")
+    print("should not inherit the old curve - but it is not recoverable without")
+    print("the backup below.")
+    print("")
+    print("NOT touched: pattern_database (the learning record), mae_mfe_data,")
+    print("and every real (non-simulated) position from confirm_fill.py.")
+    print("=" * 68)
+
+    if assume_yes:
+        print(f"  [--yes] Confirmation phrase skipped.")
+    else:
+        try:
+            typed = input(f"\nType {SEED_PAPER_CONFIRM_PHRASE!r} to proceed "
+                          f"(anything else aborts): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted - nothing was changed.")
+            sys.exit(1)
+        if typed != SEED_PAPER_CONFIRM_PHRASE:
+            print("Phrase did not match. Aborted - nothing was changed.")
+            sys.exit(1)
+
+    _require_backup(db, skip=skip_backup)
+
+    print("  Resetting...")
+    # §48 made reset_paper_account() clear paper_equity_history itself, so the
+    # separate DELETE that used to sit here (reaching into db._lock/db._conn -
+    # private API, from a top-level script) is gone. It was harmless but
+    # actively misleading: a reader seeing it here would reasonably conclude
+    # the reset does NOT clear the curve, and add the same compensating delete
+    # somewhere else too.
     db.reset_paper_account()
-    with db._lock, db._conn() as conn:
-        conn.execute("DELETE FROM paper_equity_history")
 
     total_cost = sum(p["avg_cost"] * p["shares"] for p in positions if p["avg_cost"])
     # starting_cash records the full account value (cash + cost basis) so
@@ -283,9 +398,17 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     sub.add_parser("positions")
-    sub.add_parser("seed-paper",
-                   help="reset + reseed the WATCH-mode paper account to mirror "
-                        "the real Robinhood account (buying power + holdings)")
+    seed = sub.add_parser("seed-paper",
+                          help="DESTRUCTIVE: reset + reseed the WATCH-mode paper "
+                               "account to mirror the real Robinhood account "
+                               "(buying power + holdings). Wipes the purse, "
+                               "ledger, simulated positions and equity curve.")
+    seed.add_argument("--yes", action="store_true",
+                      help="skip the typed confirmation phrase (for scripted use "
+                           "- the backup is still taken)")
+    seed.add_argument("--skip-backup", action="store_true",
+                      help="skip the automatic `tp backup`. Only if you have "
+                           "just taken one by hand.")
     sub.add_parser("clear-seed",
                    help="remove SEED positions left over from a previous seed-paper run "
                         "(doesn't touch Robinhood or real confirm_fill.py positions)")
@@ -319,7 +442,7 @@ def main():
     elif args.command == "positions":
         cmd_positions(rh)
     elif args.command == "seed-paper":
-        cmd_seed_paper(rh)
+        cmd_seed_paper(rh, assume_yes=args.yes, skip_backup=args.skip_backup)
     elif args.command == "reconcile":
         cmd_reconcile(rh, apply=args.apply)
 

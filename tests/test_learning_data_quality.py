@@ -102,13 +102,19 @@ def test_one_trade_one_answer(db):
 # ── The quarantine filter ───────────────────────────────────────────────────
 
 def _mae_row(db, ticker, quality, outcome=5.0, setup="pullback", regime="bull"):
+    """§C1: no explicit id. It was `f"id-{ticker}-{quality}"`, which is a TEXT
+    value, and mae_mfe_data.id is a BIGINT identity column as of
+    migrations/012 - nothing referenced the old uuid4 strings, so the column
+    stopped being the caller's to supply. trade_id is left NULL here on
+    purpose: these tests are about the data_quality filter, and none of them
+    joins back to a pattern."""
     with db._conn() as conn:
         conn.execute(
             """INSERT INTO mae_mfe_data
-               (id, ticker, setup_type, regime, mae_pct, mfe_pct, outcome_pct,
+               (ticker, setup_type, regime, mae_pct, mfe_pct, outcome_pct,
                 hold_hours, recorded_at, data_quality)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (f"id-{ticker}-{quality}", ticker, setup, regime, 1.0, 2.0, outcome,
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (ticker, setup, regime, 1.0, 2.0, outcome,
              5.0, datetime.utcnow().isoformat(), quality))
 
 

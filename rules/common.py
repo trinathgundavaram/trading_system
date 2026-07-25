@@ -78,9 +78,81 @@ def classify_exit(exit_reason: str) -> str | None:
     if r == "manual_fill_confirmed":
         return "manual"
 
-    # sell_rules:, loop_b_urgent: (other labels), seeded_from_real_portfolio,
-    # and anything a future caller invents. Unclassified on purpose.
+    # §D: `sell_rules:` reasons are no longer classified HERE either, but they
+    # are no longer unclassified overall - rules/sell_rules.py now emits an
+    # exit_kind at the point of decision and it is threaded to close_pattern()
+    # as an explicit argument, which beats this derivation. This branch is
+    # reached only for a sell_rules close that came from somewhere that did not
+    # carry the token through, and returning None for it remains correct: the
+    # string genuinely does not say.
+    #
+    # loop_b_urgent: (other labels), seeded_from_real_portfolio, and anything a
+    # future caller invents. Unclassified on purpose.
     return None
+
+
+# ── Stop state -> exit kind (§D) ────────────────────────────────────────────
+#
+# engine/stop_state_machine.py's six states are not six kinds of exit. Three
+# of them are a stop that has never moved off the entry-anchored initial risk,
+# two are a stop that has ratcheted above entry and is therefore protecting
+# profit rather than capping loss, and one is an emergency.
+#
+# The distinction matters precisely because it is the one ev_engine will want:
+# "how often does this setup stop out" is a question about INITIAL_RISK and
+# TRADE_CONFIRMING. Counting a TREND_FOLLOWING trail-out among them would fold
+# the winners that gave some back into the losers, and the resulting p_stop_loss
+# would be biased high in a way that looks like evidence.
+#
+# THESIS_BROKEN maps to rule_exit, not stop_loss: it fires on the thesis
+# failing rather than on price reaching a risk limit, and stop_state_machine.py
+# already treats it as outside the ordinary progression (it is deliberately
+# absent from that file's state ranking).
+STOP_STATE_EXIT_KINDS = {
+    "INITIAL_RISK":     "stop_loss",
+    "TRADE_CONFIRMING": "stop_loss",
+    "BREAKEVEN":        "trailing_stop",
+    "PROFIT_PROTECT":   "trailing_stop",
+    "TREND_FOLLOWING":  "trailing_stop",
+    "THESIS_BROKEN":    "rule_exit",
+}
+
+
+def exit_kind_for_loop_b_label(label) -> str:
+    """§D: which EXIT_KINDS member a Loop B urgent exit represents.
+
+    engine/position_management.py's decide() returns a `label` naming the
+    branch it took. Only one of those branches is a distinct kind of exit -
+    the end-of-day flatten, which is a clock event and nothing to do with the
+    position's merits. Everything else (THESIS BROKEN, EXIT, REDUCE POSITION,
+    and the kill switch) is the unified Exit Score acting, and "rule_exit" is
+    EXIT_KINDS' bucket for exactly that.
+
+    Resisting the urge to give each label its own kind is the point. Six
+    labels would become six buckets, most with a handful of rows each, and the
+    question anyone actually asks of this column - stop vs target vs time vs
+    rule - would need them re-merged before it could be answered.
+    """
+    text = str(label or "").strip().upper()
+    if text.startswith("EOD FLATTEN"):
+        return "eod_flatten"
+    return "rule_exit"
+
+
+def exit_kind_for_stop_state(stop_state) -> str:
+    """Which EXIT_KINDS member a dynamic-stop hit in this state represents.
+
+    Falls back to "stop_loss" for an unknown or empty state rather than to
+    None, and that asymmetry with classify_exit() is deliberate. Here we
+    already KNOW a stop was hit - that fact came from the trigger, not from
+    parsing a sentence - so the only open question is which flavour, and
+    "stop_loss" is both the conservative answer and the correct one for a
+    position whose stop machine has not run yet (the fallback path in
+    sell_rules.py, where current_stop_price is still 0). classify_exit() returns
+    None because it does not know THAT much; this knows more.
+    """
+    key = getattr(stop_state, "value", stop_state)
+    return STOP_STATE_EXIT_KINDS.get(str(key or "").strip().upper(), "stop_loss")
 
 
 @dataclass

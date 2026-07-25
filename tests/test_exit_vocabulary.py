@@ -152,15 +152,47 @@ def test_invalid_exit_kind_is_refused_not_stored(db):
 
 # ── §51: the pattern <-> excursion join ─────────────────────────────────────
 
+def _position(conn, position_id, ticker):
+    """A minimal closed position row with an EXPLICIT id.
+
+    §C1: mae_mfe_data.trade_id is a real FK to positions(id) as of
+    migrations/012, so an excursion row can no longer name a trade that does
+    not exist - which means these tests have to create the trade. That is the
+    constraint doing its job: the 2026-07-25 contamination was 22 rows naming
+    positions that had been deleted out from under them, and a test suite able
+    to write that shape is a test suite that cannot notice it.
+
+    positions.id is SERIAL, and Postgres permits an explicit insert into one
+    (it just does not advance the sequence). Fine here - nothing in these tests
+    inserts a position any other way, so there is no collision to worry about.
+    """
+    conn.execute(
+        "INSERT INTO positions (id, ticker, entry_price, entry_time, shares, "
+        "dollar_amount, status, simulated) VALUES (?,?,?,?,?,?,?,?) "
+        "ON CONFLICT (id) DO NOTHING",
+        # simulated is 1, not True. The column is INTEGER (a SQLite-era
+        # convention the Postgres migration preserved), and psycopg2 adapts a
+        # Python bool to a real boolean literal, which Postgres will not
+        # coerce. The rest of the suite writes positions through
+        # db.open_position(); this is the only place that inserts one by hand,
+        # which is why nothing else trips on it.
+        (position_id, ticker, 10.0, "2026-07-25T09:00:00", 1.0, 10.0,
+         "closed", 1))
+
+
 def _closed_pattern_with_excursion(db, ticker, trade_id, mae, mfe,
                                     mae_ticker=None):
     """Write a closed pattern and an excursion row that claims `trade_id`.
 
     `mae_ticker` defaults to `ticker`; pass a different one to reproduce the
     collision found in the 2026-07-25 data, where mae_mfe_data.trade_id = '1'
-    was claimed by five different symbols at once.
+    was claimed by five different symbols at once. Note that this collision is
+    STILL constructible after migrations/012 - the FK proves the position
+    exists, not that the ticker agrees - which is exactly why
+    get_pattern_excursions() keeps its own ticker-agreement check.
     """
     with db._conn() as conn:
+        _position(conn, trade_id, ticker)
         row = conn.execute(
             """INSERT INTO pattern_database
                  (trade_id, ticker, mode, recorded_at, features, outcome_pct,
@@ -170,12 +202,14 @@ def _closed_pattern_with_excursion(db, ticker, trade_id, mae, mfe,
              json.dumps({"_entry_price": 10.0}), 2.0, 5.0,
              "paper_price_watch:stop_loss", "stop_loss")).fetchone()
         pid = row["id"] if hasattr(row, "keys") else row[0]
+        # §C1: no explicit id - it is a BIGINT identity column now, not a uuid4
+        # string minted by the caller. trade_id is INTEGER, not TEXT.
         conn.execute(
             """INSERT INTO mae_mfe_data
-                 (id, trade_id, ticker, setup_type, regime, mae_pct, mfe_pct,
+                 (trade_id, ticker, setup_type, regime, mae_pct, mfe_pct,
                   outcome_pct, hold_hours, recorded_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (f"{ticker}-{trade_id}-{mae}", str(trade_id), mae_ticker or ticker,
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (trade_id, mae_ticker or ticker,
              "breakout", "BULL", mae, mfe, 2.0, 5.0, "2026-07-25T12:00:00"))
     return pid
 
@@ -196,14 +230,20 @@ def test_colliding_trade_id_does_not_attach_to_another_ticker(db):
     returned 37 rows for 23 patterns because of exactly this. A row that claims
     a trade belonging to a different symbol is a collision, not a near miss."""
     _closed_pattern_with_excursion(db, "ADPT", 1, mae=4.14, mfe=1.26)
-    # Same trade_id, different symbol - the junk row.
+    # Same trade_id, different symbol - the junk row. Note this is STILL
+    # writable after migrations/012: position 1 exists (the line above created
+    # it), so the FK is satisfied, and the schema has no opinion about whether
+    # the excursion's ticker matches the position's. The FK closed the
+    # "trade_id names nothing" hole; the ticker-agreement check in
+    # get_pattern_excursions() is what closes this one, and this test is why it
+    # stays even though the constraint landed.
     with db._conn() as conn:
         conn.execute(
             """INSERT INTO mae_mfe_data
-                 (id, trade_id, ticker, setup_type, regime, mae_pct, mfe_pct,
+                 (trade_id, ticker, setup_type, regime, mae_pct, mfe_pct,
                   outcome_pct, hold_hours, recorded_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            ("nvda-collision", "1", "NVDA", "breakout", "BULL",
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (1, "NVDA", "breakout", "BULL",
              0.0, 0.0, 6.67, 0.1, "2026-07-25T12:00:00"))
 
     rows = db.get_pattern_excursions()

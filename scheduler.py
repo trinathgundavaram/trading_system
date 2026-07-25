@@ -24,6 +24,7 @@ from engine import paper_trader
 from engine import live_trader
 from engine.regime_engine import calculate as calc_regime, current_state as get_regime
 from engine.ticker_analyzer import TickerAnalyzer
+from rules.common import exit_kind_for_loop_b_label   # §D
 from engine.ticker_data_adapter import ticker_to_dict, market_to_dict
 from learning.pattern_database import PatternDatabase
 from rules import swing_buy_rules
@@ -966,7 +967,12 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                 try:
                     paper_trader.execute_sell(db, ticker, td.price,
                                                reason=f"sell_rules:{sell_result.reason}",
-                                               pattern_db=pattern_db, cfg=cfg)
+                                               pattern_db=pattern_db, cfg=cfg,
+                                               # §D: the sell rules decided this
+                                               # at the trigger; do not make
+                                               # close_pattern re-derive it from
+                                               # the sentence, which cannot.
+                                               exit_kind=sell_result.exit_kind or None)
                 except Exception as e:
                     logger.error(f"{ticker}: paper sell failed: {e}", exc_info=True)
             elif live_mode and position and not position.get("simulated"):
@@ -974,7 +980,8 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                 try:
                     live_trader.execute_sell_live(db, cfg, ticker,
                                                    reason=f"sell_rules:{sell_result.reason}",
-                                                   pattern_db=pattern_db)
+                                                   pattern_db=pattern_db,
+                                                   exit_kind=sell_result.exit_kind or None)
                 except Exception as e:
                     logger.error(f"{ticker}: live sell failed: {e}", exc_info=True)
         elif buy_result.should_buy:
@@ -1141,7 +1148,8 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
             try:
                 paper_trader.execute_sell(db, ticker, td.price,
                                            reason=f"sell_rules:{paper_sell_result.reason}",
-                                           pattern_db=pattern_db, cfg=cfg)
+                                           pattern_db=pattern_db, cfg=cfg,
+                                           exit_kind=paper_sell_result.exit_kind or None)
             except Exception as e:
                 logger.error(f"{ticker}: paper sell (mode-independent check) failed: {e}", exc_info=True)
 
@@ -1294,14 +1302,19 @@ def _run_cycle_tail(mkt, cfg: dict, trading_mode: str, regime, packets: list,
                 try:
                     paper_trader.execute_sell(db, a["ticker"], price,
                                                reason=f"loop_b_urgent:{pa['label']}",
-                                               pattern_db=pattern_db, cfg=cfg)
+                                               pattern_db=pattern_db, cfg=cfg,
+                                               # §D: only the EOD flatten is a
+                                               # distinct kind; the rest are the
+                                               # Exit Score acting = rule_exit.
+                                               exit_kind=exit_kind_for_loop_b_label(pa["label"]))
                 except Exception as e:
                     logger.error(f"{a['ticker']}: paper urgent exit failed: {e}", exc_info=True)
             elif live_mode_cycle and not (a.get("position") or {}).get("simulated"):
                 try:
                     live_trader.execute_sell_live(db, cfg, a["ticker"],
                                                    reason=f"loop_b_urgent:{pa['label']}",
-                                                   pattern_db=pattern_db)
+                                                   pattern_db=pattern_db,
+                                                   exit_kind=exit_kind_for_loop_b_label(pa["label"]))
                 except Exception as e:
                     logger.error(f"{a['ticker']}: live urgent exit failed: {e}", exc_info=True)
 
@@ -1757,15 +1770,24 @@ def _price_watch_loop():
                     if reason:
                         logger.info(f"{ticker}: [PRICE WATCH] exit trigger between cycles - {reason}")
                         if is_real and live:
+                            # §D: check_exit_triggers' first token IS the kind
+                            # ("stop_loss" / "take_profit" / "trailing_stop"),
+                            # which is why classify_exit could already read
+                            # price_watch: reasons back. Passing it explicitly
+                            # means a future edit to that vocabulary breaks
+                            # close_pattern's EXIT_KINDS validation loudly
+                            # rather than quietly reverting these rows to NULL.
                             live_trader.execute_sell_live(
                                 db, cfg, ticker,
                                 reason=f"price_watch:{reason.split(' ')[0]}",
-                                pattern_db=pattern_db)
+                                pattern_db=pattern_db,
+                                exit_kind=reason.split(" ")[0])
                         elif not is_real:
                             paper_trader.execute_sell(
                                 db, ticker, price,
                                 reason=f"price_watch:{reason.split(' ')[0]}",
-                                pattern_db=pattern_db, cfg=cfg)
+                                pattern_db=pattern_db, cfg=cfg,
+                                exit_kind=reason.split(" ")[0])
                         # (real position, live not armed) - advisory only via
                         # the log line above; no order placed, matching the
                         # scan-cycle sell-rule path's behavior for the same case.
