@@ -6,8 +6,8 @@
 #
 #    TP_VERSION=v1.3.1 TP_UI_PORT=8080 \
 #      docker compose --env-file .env.runtime -p tp-v1-3-1 up -d
-#    TP_VERSION=v1.4.0 TP_UI_PORT=8081 \
-#      docker compose --env-file .env.runtime -p tp-v1-4-0 up -d
+#    TP_VERSION=v2.1.0 TP_UI_PORT=8081 \
+#      docker compose --env-file .env.runtime -p tp-v2-1-0 up -d
 #
 #  --env-file is not optional. `env_file:` below supplies variables to the
 #  CONTAINER; compose's own ${...} interpolation (POSTGRES_PASSWORD, below)

@@ -524,7 +524,7 @@ class TestContainerArtefacts:
         digest_pinned = "python:3.12-slim@sha256:" in text
         assert not digest_pinned, (
             "the base image is now digest-pinned - delete this test, and update "
-            "docs/releases/v1.4.0.md, which lists the tag pin as outstanding")
+            "docs/releases/v2.1.0.md, which lists the tag pin as outstanding")
 
     def test_compose_binds_the_ui_to_loopback_only(self):
         """'8080:8080' would publish the UI to the whole network AND bypass

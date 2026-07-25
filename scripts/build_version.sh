@@ -8,19 +8,19 @@
 #  about - and an image is meant to be the thing you can rebuild in 2029.
 #
 #    ./scripts/build_version.sh v1.3.1
-#    ./scripts/build_version.sh v1.4.0
+#    ./scripts/build_version.sh v2.1.0
 #
 #  Then the Phase 3 exit criterion:
 #    TP_VERSION=v1.3.1 TP_UI_PORT=8080 \
 #      docker compose --env-file .env.runtime -p tp-v1-3-1 up -d
-#    TP_VERSION=v1.4.0 TP_UI_PORT=8081 \
-#      docker compose --env-file .env.runtime -p tp-v1-4-0 up -d
+#    TP_VERSION=v2.1.0 TP_UI_PORT=8081 \
+#      docker compose --env-file .env.runtime -p tp-v2-1-0 up -d
 #  run the same backtest window in both, and confirm the shared code paths
 #  produce identical numbers. If they diverge, the pinning is still loose.
 # =============================================================================
 set -euo pipefail
 
-TAG="${1:?usage: build_version.sh v1.4.0}"
+TAG="${1:?usage: build_version.sh v2.1.0}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKTREE="${TMPDIR:-/tmp}/tp-build-${TAG}"
 

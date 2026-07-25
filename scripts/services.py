@@ -113,7 +113,7 @@ class ServiceManager:
     something that is not running is not an error."""
 
     def __init__(self, suffix: str = ""):
-        # §38.5: '.v1.4.0' when installed by `tp promote`, '' for a plain
+        # §38.5: '.v2.1.0' when installed by `tp promote`, '' for a plain
         # development install.
         self.suffix = suffix
 
@@ -433,7 +433,7 @@ def main(argv=None) -> int:
                              "restart", "status", "logs"])
     ap.add_argument("service", nargs="?", help="one service, or all if omitted")
     ap.add_argument("--suffix", default=os.getenv("TP_LABEL_SUFFIX", ""),
-                    help="version suffix, e.g. .v1.4.0 (§38.5). `tp promote` sets this.")
+                    help="version suffix, e.g. .v2.1.0 (§38.5). `tp promote` sets this.")
     args = ap.parse_args(argv)
 
     mgr = manager(args.suffix)

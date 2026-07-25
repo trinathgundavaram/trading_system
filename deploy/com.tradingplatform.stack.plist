@@ -88,7 +88,7 @@
   <dict>
     <!-- EDIT THESE TWO. -->
     <key>TP_HOME</key><string>/Users/CHANGEME/trading_platform</string>
-    <key>TP_VERSION</key><string>v1.4.0</string>
+    <key>TP_VERSION</key><string>v2.1.0</string>
 
     <!-- launchd gives a service a minimal PATH; docker and python3 are not
          on it. Homebrew on Apple silicon is /opt/homebrew/bin. -->

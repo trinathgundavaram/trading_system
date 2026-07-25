@@ -42,7 +42,7 @@ fi
 # LABEL_SUFFIX is the §38.5 per-version suffix; scripts/services.py reads it
 # as TP_LABEL_SUFFIX so the Python side has one name for it across all three
 # platforms. Exported rather than passed as a flag so an existing
-# `LABEL_SUFFIX=".v1.4.0" ./service.sh install` keeps working untouched.
+# `LABEL_SUFFIX=".v2.1.0" ./service.sh install` keeps working untouched.
 export TP_LABEL_SUFFIX="${LABEL_SUFFIX:-${TP_LABEL_SUFFIX:-}}"
 
 case "${1:-}" in
