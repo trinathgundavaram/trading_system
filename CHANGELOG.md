@@ -20,6 +20,21 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+Nothing. Phase 3 (§41–§47) is on the `phase3` branch and ships as v2.1.0.
+
+## [2.0] — v2.0.0 — 2026-07-25
+
+Phase 2.5 (§48–§55): make the measurement base honest before Phase 3.
+
+**Why this is a major bump and v1.4.0/v1.5.0 were not used.** The plan
+([docs/PHASE2_5_PLAN.md](docs/PHASE2_5_PLAN.md)) suggested splitting this work
+across two releases — v1.4.0 for the decision-function-neutral half and v1.5.0
+for §48/§52/§53. It shipped as one body of work instead, and §53 is in it. Once
+a release contains a decision-function change, §35's rule is not a preference:
+trade history either side of this tag was produced by different strategies, and
+averaging the two sets together is a measurement error. A minor bump would have
+buried that boundary where nobody looks for it.
+
 ### Decision function: CHANGED by §53 — re-validation required before arming live
 
 Phase 2.5 (§48–§55) complete as far as code can take it. Plan and adjudication
