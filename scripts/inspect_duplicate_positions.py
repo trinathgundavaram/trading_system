@@ -29,36 +29,51 @@ FIELDS = ("id", "ticker", "entry_price", "entry_time", "shares", "dollar_amount"
           "entry_signal_score", "risk_per_share")
 
 
-def _score(row: dict, buys: list) -> tuple:
-    """Rank one row of a duplicate group. Higher is more likely to be the real
-    position. Returns (score, [reasons]).
+IDENTITY_FIELDS = ("ticker", "entry_price", "entry_time", "shares",
+                   "dollar_amount", "trade_mode", "pattern_id", "simulated",
+                   "current_stop_price", "current_target_price", "stop_state",
+                   "entry_signal_score", "risk_per_share", "trail_high")
+
+
+def _score(row: dict, unclaimed: list) -> tuple:
+    """Rank one row of a duplicate group. Higher is more likely to be real.
+
+    `unclaimed` is a MUTABLE pool of ledger lines not yet attributed to a
+    row, and a match REMOVES the line from it. That one-to-one pairing is the
+    correction to the first version of this, which let every row in a group
+    match the same buy line: with two open positions and one buy line it
+    reported both as funded, when the arithmetic plainly says one of them was
+    never paid for. A scorer that answers "both are fine" to a question about
+    which one is wrong is worse than not scoring at all.
+
+    Greedy and order-dependent (rows are considered by ascending id), which is
+    fine because it is used to describe a group, not to break a tie: when two
+    rows are otherwise identical, whichever one claims the line first, the
+    OTHER is flagged as unfunded and the group is reported as ambiguous
+    anyway.
 
     The signals, in the order I would trust them:
 
-      A MATCHING LEDGER LINE is the strongest. paper_trades records what the
-      purse was actually debited for. A position with no buy line behind it
-      was never paid for, which makes it the artefact rather than the trade.
+      A MATCHING LEDGER LINE. paper_trades records what the purse was
+      actually debited for.
 
-      A pattern_id means the learning path knows about this row - it was
-      opened through the normal signal flow and something downstream is
-      already linked to it.
+      A pattern_id means the learning path knows about this row.
 
       ENTRY CONTEXT (risk_per_share, entry_signal_score) means §16's seeding
-      ran, which again indicates the normal flow rather than a stray insert.
-
-    Deliberately advisory. This prints a suggestion; it does not act on one.
+      ran, indicating the normal flow rather than a stray insert.
     """
     score, why = 0, []
 
-    match = next((b for b in buys
+    match = next((b for b in unclaimed
                   if abs(float(b.get("dollar_amount") or 0)
                          - float(row.get("dollar_amount") or 0)) < 0.01), None)
     if match:
+        unclaimed.remove(match)          # one ledger line, one position
         score += 4
-        why.append(f"matches paper_trades buy #{match['id']} "
+        why.append(f"claims paper_trades buy #{match['id']} "
                    f"(${match['dollar_amount']})")
     else:
-        why.append("NO matching buy line - this position was never paid for")
+        why.append("NO unclaimed buy line - nothing in the ledger paid for this")
 
     if row.get("pattern_id"):
         score += 2
@@ -70,6 +85,24 @@ def _score(row: dict, buys: list) -> tuple:
         score += 1
         why.append("has entry_signal_score")
     return score, why
+
+
+def _identical(rows: list) -> bool:
+    """True when the rows differ ONLY by id (and by columns that are pure
+    bookkeeping, like the excursion trackers Loop B updates in place).
+
+    This is the case where a tie-break is safe rather than arbitrary. If every
+    field that describes the POSITION is equal, the two rows are not two
+    candidate answers to "which is real" - they are one position written
+    twice, and nothing is lost by keeping either. Choosing the lower id then
+    follows the convention the index itself would have enforced: under
+    ON CONFLICT DO NOTHING the first insert is the one that survives.
+    """
+    if len(rows) < 2:
+        return False
+    first = rows[0]
+    return all(all(r.get(f) == first.get(f) for f in IDENTITY_FIELDS)
+               for r in rows[1:])
 
 
 def main() -> int:
@@ -139,8 +172,15 @@ def main() -> int:
             print(f"    #{b['id']} {b['created_at']} {b['shares']} sh @ "
                   f"${b['price']} (${b['dollar_amount']}) {b['reason']}")
 
+        if len(buys) < len(rows):
+            print(f"  -> {len(rows)} open rows but only {len(buys)} BUY "
+                  f"line(s). At least one of these was never recorded in the "
+                  f"ledger.")
+
         # ── Verdict ────────────────────────────────────────────────────────
-        scored = sorted(((_score(r, buys), r) for r in rows),
+        # One shared pool, consumed as rows claim lines - see _score().
+        unclaimed = list(buys)
+        scored = sorted(((_score(r, unclaimed), r) for r in rows),
                         key=lambda t: (-t[0][0], t[1]["id"]))
         print("\n  assessment:")
         for (sc, why), r in scored:
@@ -150,11 +190,34 @@ def main() -> int:
 
         top = scored[0][0][0]
         tied = [r for (sc, _), r in scored if sc == top]
-        if len(tied) > 1:
+
+        if _identical(rows):
+            # Every field describing the position is equal, so these are not
+            # two candidates for "which is real" - they are one position
+            # written twice. Keeping the lowest id matches what the unique
+            # index would have done under ON CONFLICT DO NOTHING.
+            keep = min(rows, key=lambda r: r["id"])
+            drop = [r for r in rows if r["id"] != keep["id"]]
+            print(f"\n  IDENTICAL ROWS: every field except id is equal, so "
+                  f"there is nothing to choose between them - this is one "
+                  f"position written {len(rows)} times, not {len(rows)} "
+                  f"candidate answers.")
+            print(f"  suggestion: KEEP id={keep['id']} (lowest - what the "
+                  f"index would have kept), delete "
+                  f"{', '.join('id=' + str(r['id']) for r in drop)}")
+            if str(rows[0].get("trade_mode") or "").upper() in ("SEED", "SYNC"):
+                print(f"  These are {rows[0]['trade_mode']} rows: an "
+                      f"informational mirror of the real account, not "
+                      f"positions this engine chose to enter. Deleting the "
+                      f"copy removes a double-count, it does not close a "
+                      f"trade.")
+            deletes.extend((ticker, r) for r in drop)
+        elif len(tied) > 1:
             print(f"\n  NO SUGGESTION: {len(tied)} rows score identically "
-                  f"({top}). Nothing here distinguishes them, so this one is "
-                  f"yours to decide - look at entry_time and the ledger "
-                  f"timestamps above.")
+                  f"({top}) but their fields DIFFER. Something distinguishes "
+                  f"them that this scoring does not capture, so it is yours "
+                  f"to decide - start from the fields marked '<-- differs' "
+                  f"above.")
         else:
             keep = scored[0][1]
             drop = [r for (_, _), r in scored[1:]]
@@ -209,6 +272,16 @@ def main() -> int:
               "  python3 scripts/inspect_duplicate_positions.py "
               "--out /tmp/dedupe.sql\n"
               "  ./scripts/apply_migration.sh /tmp/dedupe.sql\n")
+
+    if args.out and not deletes:
+        # Was: write nothing, say nothing, and let `less` report "No such file
+        # or directory" - which reads as a broken script rather than as the
+        # script declining to guess.
+        print("=" * 74)
+        print(f"NOT written: {args.out}\n")
+        print("There is nothing to suggest. Every group above is either")
+        print("ambiguous or was left to you deliberately, and writing an empty")
+        print("file would look like a cleanup that had already been done.\n")
 
     if args.out and deletes:
         # NO BEGIN/COMMIT in the file. apply_migration.sh runs psql with
