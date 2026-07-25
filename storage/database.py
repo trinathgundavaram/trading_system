@@ -904,6 +904,11 @@ class Database:
                                      "TEXT DEFAULT 'ok'")
         self._add_column_if_missing(conn, "pattern_database", "data_quality",
                                      "TEXT DEFAULT 'ok'")
+        # §18: the dollar amount a declined trade would have taken. Without it
+        # a rejected_signals row is a note rather than a counterfactual -
+        # "what did skipping this cost?" has no denominator. Mirrors
+        # migrations/008.
+        self._add_column_if_missing(conn, "rejected_signals", "would_have_size", "REAL")
 
     def _migrate_rotation_log(self, conn):
         """Portfolio Rotation Engine (engine/rotation.py, 2026-07-17): one row
@@ -1141,7 +1146,10 @@ class Database:
         re-fetching it - open positions are often off the current watchlist
         (e.g. confirm_fill.py'd manually), so this cache is the only place
         that data persists across cycles for those tickers."""
-        new_cols = {"sector": "TEXT", "beta": "REAL"}
+        # §18 adds `industry`: sector alone left the concentration check too
+        # coarse to bind. "Technology" covers a semiconductor foundry and a
+        # payments processor, which do not move together.
+        new_cols = {"sector": "TEXT", "beta": "REAL", "industry": "TEXT"}
         for col, coltype in new_cols.items():
             self._add_column_if_missing(conn, "ticker_info_cache", col, coltype)
 
@@ -1876,29 +1884,42 @@ class Database:
 
     # ---------- ticker info cache (company names, validation) ----------
     def upsert_ticker_info(self, ticker: str, company_name: str = None, last_price: float = None,
-                            valid: bool = True, sector: str = None, beta: float = None):
+                            valid: bool = True, sector: str = None, beta: float = None,
+                            industry: str = None):
         """Called both opportunistically (every scan cycle, for whatever's
         already been fetched) and explicitly (ticker validation on add) - see
         ticker_info_cache's schema comment. Only overwrites company_name/
-        sector/beta when a non-empty/non-None value is given, so an
+        sector/industry/beta when a non-empty/non-None value is given, so an
         opportunistic scheduler.py call missing one field (e.g. yfinance had
         no longName for this ticker) doesn't blank out a value a previous
-        call already found."""
+        call already found.
+
+        `industry` added for §18. "N/A" is treated as absent for the same
+        reason the analyzer refuses to let finviz's "N/A" clobber a real
+        yfinance sector: a placeholder string that overwrites a real value is
+        worse than no value, because it looks like an answer.
+        """
+        sector = None if sector in ("", "N/A") else sector
+        industry = None if industry in ("", "N/A") else industry
         with self._conn() as conn:
             existing = conn.execute(
-                "SELECT company_name, sector, beta FROM ticker_info_cache WHERE ticker = ?", (ticker,)
-            ).fetchone()
+                "SELECT company_name, sector, beta, industry FROM ticker_info_cache WHERE ticker = ?",
+                (ticker,)).fetchone()
             name = company_name or (existing[0] if existing else None)
             sec = sector or (existing[1] if existing else None)
             bta = beta if beta is not None else (existing[2] if existing else None)
+            ind = industry or (existing[3] if existing else None)
             conn.execute(
-                """INSERT INTO ticker_info_cache (ticker, company_name, last_price, valid, updated_at, sector, beta)
-                VALUES (?,?,?,?,?,?,?)
+                """INSERT INTO ticker_info_cache
+                    (ticker, company_name, last_price, valid, updated_at, sector, beta, industry)
+                VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     company_name=excluded.company_name, last_price=excluded.last_price,
                     valid=excluded.valid, updated_at=excluded.updated_at,
-                    sector=excluded.sector, beta=excluded.beta""",
-                (ticker, name, last_price, int(bool(valid)), datetime.utcnow().isoformat(), sec, bta),
+                    sector=excluded.sector, beta=excluded.beta,
+                    industry=excluded.industry""",
+                (ticker, name, last_price, int(bool(valid)), datetime.utcnow().isoformat(),
+                 sec, bta, ind),
             )
 
     def get_ticker_info(self, ticker: str):
@@ -3928,15 +3949,28 @@ class Database:
 
     # ---------- rejected signals / opportunity cost ----------
     def log_rejected_signal(self, ticker: str, reject_stage: str, reject_reason: str,
-                             score_at_rejection: float, price_at_rejection: float) -> int:
+                             score_at_rejection: float, price_at_rejection: float,
+                             would_have_size: float = None) -> int:
+        """One row per declined candidate (§18).
+
+        portfolio_risk_log held 244 evaluations and this table held 0, so
+        there was a complete record of every trade taken and none at all of
+        any trade declined - which makes false negatives unmeasurable. You
+        can audit the trades you took but not the ones you skipped.
+
+        `would_have_size` is what makes a row a genuine counterfactual rather
+        than a note: without the dollar amount the trade would have taken, a
+        later "what did skipping this cost?" question has no denominator.
+        """
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT INTO rejected_signals
-                (timestamp, ticker, reject_stage, reject_reason, score_at_rejection, price_at_rejection)
-                VALUES (?,?,?,?,?,?)
+                (timestamp, ticker, reject_stage, reject_reason, score_at_rejection,
+                 price_at_rejection, would_have_size)
+                VALUES (?,?,?,?,?,?,?)
                 RETURNING id""",
                 (datetime.utcnow().isoformat(), ticker, reject_stage, reject_reason,
-                 score_at_rejection, price_at_rejection),
+                 score_at_rejection, price_at_rejection, would_have_size),
             )
             return cur.lastrowid
 

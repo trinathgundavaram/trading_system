@@ -398,13 +398,19 @@ PORTFOLIO_RISK_CATALOG = {
     "engine": "engine/portfolio_risk.py - evaluates a NEW candidate against the REST of the currently-open "
               "book across five independent exposure dimensions, each producing its own size_multiplier "
               "(0.0-1.0); the final multiplier is the MINIMUM across all five (worst dimension wins, not an "
-              "average) and feeds engine/position_sizing.py as one factor in its chain. This governs SIZE, "
-              "not eligibility, unless portfolio_risk.hard_block_on_severe_breach is enabled (default false) "
-              "- a severe breach (multiplier hits 0.0) then blocks the trade outright instead of just sizing "
-              "it to zero.",
+              "average) and feeds engine/position_sizing.py as one factor in its chain. "
+              "§18 (Phase 2) changed the posture: hard_block_on_severe_breach now defaults to TRUE and "
+              "scheduler.py honours `allowed`, so a SEVERE breach refuses the entry instead of only sizing "
+              "it down. Severe means past severe_breach_multiple (default 1.5) x the cap, or a dimension "
+              "scaling to zero - so the ordinary case is still a size reduction. "
+              "Concentration dimensions (sector/theme) additionally require min_positions_for_concentration_block "
+              "(default 3) open positions before they may REFUSE, because on a nearly-empty book the "
+              "candidate is 100% of every share-of-book measure by construction; below that floor they still "
+              "size down. Beta and correlation are not gated by book size - neither is a share of the book. "
+              "Every refusal is written to rejected_signals with the size the trade would have taken.",
     "dimensions": [
         {"name": "Sector exposure", "cap": "max_sector_exposure_pct (default 35%)", "description": "% of total open-position dollars in the candidate's sector, pre- and post-trade; scales size down as the post-trade % approaches the cap"},
-        {"name": "Theme exposure", "cap": "max_theme_exposure_pct (default 40%)", "description": "Same idea, but for hand-curated theme baskets (config.yaml's portfolio_risk.theme_map, e.g. AI/SEMICONDUCTORS/MEGA_CAP_TECH/EV_AUTO) that cut across GICS sectors - a stock can belong to multiple themes; the WORST theme's exposure governs"},
+        {"name": "Theme exposure", "cap": "max_theme_exposure_pct (default 40%), max_unclassified_exposure_pct (default 25%)", "description": "Same idea, for theme baskets. §18: the hand-curated map (config.yaml's portfolio_risk.theme_map - AI/SEMICONDUCTORS/MEGA_CAP_TECH/EV_AUTO) comes FIRST because it captures cross-sector relationships no vendor labels, then the cached sector and industry are added as SECTOR:/INDUSTRY: buckets automatically. Before that fallback the map covered 12 tickers and none of the names actually traded appeared in it, so ~95% of positions were themeless and the cap silently never bound. A stock can belong to several buckets; the WORST governs. Anything still unclassifiable lands in UNCLASSIFIED, which is its own bucket with a tighter cap - an unmeasurable risk gets rationed rather than ignored"},
         {"name": "Pairwise correlation cluster", "cap": "high_correlation_threshold 0.75, max_high_correlation_cluster 3", "description": "60-day pairwise price correlation (Pearson) between the candidate and every open position. >=3 existing positions already correlated >=0.75 with the candidate -> size multiplier 0.0 (they'd behave like one trade); 1-2 -> 0.6 (diversification buffer)"},
         {"name": "Aggregate portfolio beta", "cap": "max_portfolio_beta (default 1.6)", "description": "Dollar-weighted average beta across the book including the candidate at full size - scales size down as the post-trade weighted beta approaches the cap"},
         {"name": "Simultaneous high-volatility positions", "cap": "high_vol_atr_pct_threshold 5.0% of price, max_simultaneous_high_vol_positions 4", "description": "Counts open positions whose ATR is already >=5% of price. A high-vol candidate hitting the cap -> 0.0; one below the cap -> 0.5 (reduced size, near the limit)"},

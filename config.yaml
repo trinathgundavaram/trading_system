@@ -228,7 +228,44 @@ portfolio_risk:
   max_high_correlation_cluster: 3
   high_vol_atr_pct_threshold: 5.0
   max_simultaneous_high_vol_positions: 4
-  hard_block_on_severe_breach: false
+
+  # §18 (Phase 2). Was false, which meant a breach only scaled position size -
+  # so sector 35%, theme 40%, beta 1.6 and the correlation cluster limit were
+  # all documentation. Turned on NOW, while still in paper mode, so you can
+  # see how often it fires before it ever costs a real trade.
+  #
+  # With 244 BUY signals in eight days from momentum-based discovery,
+  # correlated clustering is the default state rather than the exception. If
+  # this blocks constantly, that is the finding, not a misconfiguration: it
+  # means the screener is producing a single correlated bet dressed up as a
+  # diversified book. Read rejected_signals to see what it declined.
+  hard_block_on_severe_breach: true
+
+  # How far past a cap counts as SEVERE rather than merely over. At 1.5 a 35%
+  # sector cap warns and sizes down from 35%, and refuses the entry at 52.5%.
+  # A single multiple applies to every dimension deliberately - a per-cap
+  # tolerance is four more numbers to justify, and there is no evidence yet
+  # that would justify them differently.
+  severe_breach_multiple: 1.5
+
+  # UNCLASSIFIED is its own bucket with its own tighter cap. A position no
+  # source can categorise is an unmeasured risk, and unmeasured risk should be
+  # rationed rather than allowed to accumulate under the same allowance as a
+  # risk you can actually see. This binds immediately: none of the names
+  # actually traded (ADPT, FLYW, ERAS, XRAY, PSNL, VG, HLN, TAK) appear in the
+  # theme_map below, so before §18 derived sector/industry buckets they were
+  # ALL unclassified and none of them counted toward anything.
+  max_unclassified_exposure_pct: 25
+
+  # A share-of-book measure needs a book. The first trade of the day is 100%
+  # of one sector, 100% of one theme and 100% unclassified simultaneously, so
+  # without this floor the concentration checks would refuse the opening
+  # entries of every session for arithmetic reasons rather than risk ones.
+  # Below the floor those dimensions still SIZE DOWN - they just cannot
+  # refuse. Beta and correlation are deliberately not gated by it: neither is
+  # a share of the book, so both mean something on the very first position.
+  min_positions_for_concentration_block: 3
+
   theme_map:
     AI:
     - NVDA

@@ -5,11 +5,16 @@ behave like one trade."
 
 Checks a BUY candidate against the CURRENTLY OPEN positions for:
   1. Sector exposure       - max_sector_exposure_pct
-  2. Theme exposure        - max_theme_exposure_pct (config-defined ticker->theme map,
-                              e.g. AI / SEMICONDUCTORS / MEGA_CAP_TECH - there is no
-                              free, reliable "theme" data source, so this is
-                              explicitly config-driven rather than a fabricated
-                              auto-classification)
+  2. Theme exposure        - max_theme_exposure_pct. The hand-curated
+                              ticker->theme map (AI / SEMICONDUCTORS /
+                              MEGA_CAP_TECH) FIRST, since it captures real
+                              cross-sector relationships no vendor labels,
+                              then the cached sector/industry as an automatic
+                              fallback (§18). The map alone covered 12 tickers
+                              and left ~95% of traded names themeless, so the
+                              cap silently never bound. Anything still
+                              unclassifiable lands in UNCLASSIFIED, which has
+                              its own tighter cap.
   3. Correlation           - REAL pairwise Pearson correlation of daily returns
                               (same yfinance MCP + cache pattern as
                               engine/market_breadth.py), not a sector-proxy guess
@@ -20,13 +25,24 @@ Checks a BUY candidate against the CURRENTLY OPEN positions for:
                               on the positions table) exceeds a config
                               threshold, capped by max_simultaneous_high_vol_positions
 
-Like every other engine/ module in this codebase, this NEVER blocks a trade
-by itself - it returns a size_multiplier (0.0-1.0) consumed by
+Primarily this returns a size_multiplier (0.0-1.0) consumed by
 engine/position_sizing.py, plus reasons/warnings rendered into
-output/trade_prompt.md. config.yaml's portfolio_risk.hard_block_on_severe_breach
-(default False) is the only thing that flips `allowed` to False, and even
-then, "allowed" is advisory - see README.md, trades are never placed from
-Python regardless.
+output/trade_prompt.md.
+
+§18 (Phase 2) changed the posture. hard_block_on_severe_breach now defaults
+to true in config.yaml and `allowed=False` is HONOURED by scheduler.py, so a
+severe breach refuses the entry rather than merely shrinking it. The previous
+arrangement - a limit that is never measured and never blocks - is
+documentation, not risk management. With 244 BUY signals in eight days from
+momentum-based discovery, correlated clustering is the default state rather
+than the exception, so this was turned on while still in paper mode
+deliberately: you get to see how often it fires before it ever costs a real
+trade. If it blocks constantly, that is itself the finding - it means the
+screener is producing a single correlated bet dressed up as a diversified
+book.
+
+Every refusal is written to rejected_signals, so the counterfactual is
+recorded rather than lost.
 """
 from dataclasses import dataclass, field
 
@@ -51,14 +67,66 @@ class PortfolioRiskResult:
     high_vol_position_count: int
     reasons: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    # §18: which caps were breached severely, and by how much. Kept separate
+    # from `reasons` so a caller can distinguish "this was sized down" from
+    # "this was refused", and so the refusal can be logged with its cause
+    # rather than with the whole advisory narrative.
+    severe_breaches: list = field(default_factory=list)
+
+    @property
+    def reason(self) -> str:
+        """One line, for a log entry or a rejected_signals row."""
+        if self.severe_breaches:
+            return "; ".join(self.severe_breaches)
+        if not self.allowed:
+            return "portfolio risk scaled this candidate to zero size"
+        return "; ".join(self.reasons or ["OK"])
 
 
 def _cfg(cfg: dict) -> dict:
     return (cfg or {}).get("portfolio_risk", {}) or {}
 
 
-def _themes_for(ticker: str, theme_map: dict) -> list:
-    return sorted(name for name, tickers in (theme_map or {}).items() if ticker in (tickers or []))
+UNCLASSIFIED = "UNCLASSIFIED"
+
+
+def _themes_for(ticker: str, theme_map: dict, info: dict = None) -> list:
+    """Every theme bucket this ticker belongs to (§18).
+
+    The hand-curated map FIRST: it captures real cross-sector relationships
+    like "AI" that no data vendor labels, and it is the only part of this that
+    encodes a human's view of what moves together.
+
+    Then the cached sector and industry as an automatic fallback. This is the
+    fix for the finding: the manual map covered 12 tickers in 4 themes, and
+    none of the names actually traded (ADPT, FLYW, ERAS, XRAY, PSNL, VG, HLN,
+    TAK) appeared in any of them - so theme concentration was UNMEASURED for
+    every real trade, and a cap that is never measured is documentation rather
+    than risk management. ticker_info_cache already holds 552 rows of this
+    data; it was simply never consulted here.
+
+    SECTOR: and INDUSTRY: prefixes keep the derived buckets distinguishable
+    from hand-curated ones in logs and in portfolio_risk_log, so a breach can
+    be read back as "this was a sector concentration" rather than looking like
+    someone had hand-listed it.
+
+    An unclassifiable position falls into UNCLASSIFIED, which is its own
+    bucket with its own (tight) cap rather than being skipped. Unmeasured risk
+    should be rationed, not ignored - skipping it is what let the theme cap
+    silently never bind.
+    """
+    themes = {name for name, tickers in (theme_map or {}).items()
+              if ticker in (tickers or [])}
+    info = info or {}
+    sector = info.get("sector")
+    industry = info.get("industry")
+    if sector and sector != "N/A":
+        themes.add(f"SECTOR:{sector}")
+    if industry and industry != "N/A":
+        themes.add(f"INDUSTRY:{industry}")
+    if not themes:
+        themes.add(UNCLASSIFIED)
+    return sorted(themes)
 
 
 def _scale_for_cap(pre_value: float, post_value_at_full: float, cap: float) -> float:
@@ -161,12 +229,18 @@ class PortfolioRiskEngine:
         self.db = db or Database()
 
     def evaluate(self, candidate_ticker: str, candidate_sector: str, candidate_beta: float,
-                 candidate_dollar_amount: float, candidate_atr_pct: float, cfg: dict) -> PortfolioRiskResult:
+                 candidate_dollar_amount: float, candidate_atr_pct: float, cfg: dict,
+                 candidate_industry: str = None) -> PortfolioRiskResult:
         rcfg = _cfg(cfg)
         candidate_sector = candidate_sector or "N/A"
         candidate_beta = candidate_beta if candidate_beta is not None else 1.0
         theme_map = rcfg.get("theme_map", _DEFAULT_THEME_MAP)
-        candidate_themes = _themes_for(candidate_ticker, theme_map)
+        # The candidate's own sector/industry are passed in by the caller, so
+        # they are used directly rather than re-read from the cache - the cache
+        # row for a brand-new candidate may not exist yet this cycle.
+        candidate_themes = _themes_for(
+            candidate_ticker, theme_map,
+            {"sector": candidate_sector, "industry": candidate_industry})
 
         if not rcfg.get("enabled", True):
             return PortfolioRiskResult(
@@ -208,24 +282,44 @@ class PortfolioRiskEngine:
             )
 
         # ---- 2. Theme exposure (worst of any theme the candidate belongs to) ----
+        #
+        # §18: membership is now COMPUTED PER POSITION rather than looked up in
+        # theme_map. That is the substantive change. The map lookup could only
+        # ever see hand-listed tickers, so an open position in a name nobody
+        # had added contributed nothing to any theme's exposure - which is how
+        # a 40% cap went unmeasured across every trade actually taken.
         theme_cap = float(rcfg.get("max_theme_exposure_pct", 40))
+        unclassified_cap = float(rcfg.get("max_unclassified_exposure_pct", 25))
         mult_theme = 1.0
         worst_theme_post_pct = 0.0
+        worst_theme_name, worst_theme_cap = None, theme_cap
+        position_themes = {
+            p["ticker"]: set(_themes_for(p["ticker"], theme_map,
+                                          info_map.get(p["ticker"], {}) or {}))
+            for p in positions
+        }
         for theme in candidate_themes:
-            theme_tickers = set(theme_map.get(theme, []))
             existing_theme_dollars = sum(
-                (p.get("dollar_amount") or 0) for p in positions if p["ticker"] in theme_tickers
+                (p.get("dollar_amount") or 0) for p in positions
+                if theme in position_themes.get(p["ticker"], set())
             )
+            # UNCLASSIFIED gets its own, tighter cap. A position nobody can
+            # categorise is an unmeasured risk, and unmeasured risk should be
+            # rationed rather than allowed to accumulate under the same
+            # allowance as a risk you can actually see.
+            this_cap = unclassified_cap if theme == UNCLASSIFIED else theme_cap
             pre_theme_pct = (existing_theme_dollars / existing_total * 100) if existing_total else 0.0
             post_theme_pct = ((existing_theme_dollars + candidate_dollar_amount) / post_total * 100) if post_total else 0.0
-            worst_theme_post_pct = max(worst_theme_post_pct, post_theme_pct)
-            this_mult = _scale_for_cap(pre_theme_pct, post_theme_pct, theme_cap)
+            if post_theme_pct > worst_theme_post_pct:
+                worst_theme_post_pct, worst_theme_name, worst_theme_cap = (
+                    post_theme_pct, theme, this_cap)
+            this_mult = _scale_for_cap(pre_theme_pct, post_theme_pct, this_cap)
             if this_mult < mult_theme:
                 mult_theme = this_mult
             if this_mult < 1.0:
                 reasons.append(
                     f"Theme '{theme}' exposure {pre_theme_pct:.0f}%->{post_theme_pct:.0f}% "
-                    f"vs {theme_cap:.0f}% cap -> size x{this_mult:.2f}"
+                    f"vs {this_cap:.0f}% cap -> size x{this_mult:.2f}"
                 )
 
         # ---- 3. Correlation ----
@@ -288,10 +382,74 @@ class PortfolioRiskEngine:
             )
 
         size_multiplier = min(mult_sector, mult_theme, mult_corr, mult_beta, mult_vol)
-        blocked = size_multiplier <= 0.0
+
+        # ---- Severity (§18) ----
+        #
+        # `blocked` used to mean "some dimension scaled to zero", which is a
+        # statement about the SIZING arithmetic rather than about how far the
+        # book is out of line. severe_breach_multiple makes the second
+        # question askable directly: at 1.5, a 35% sector cap is a warning at
+        # 40% and severe at 52.5%.
+        #
+        # Both definitions count. A dimension that scales to zero has already
+        # said the candidate should get no capital, and a metric past 1.5x its
+        # cap is out of line whatever the interpolation produced.
+        severe_mult = float(rcfg.get("severe_breach_multiple", 1.5))
+        severe_breaches = []
+
+        # A SHARE-OF-BOOK measure needs a book. On an empty or nearly-empty
+        # portfolio the candidate is most of it by construction - the first
+        # trade of the day is 100% of one sector, 100% of one theme and 100%
+        # unclassified, all at once - so an unguarded severity test would
+        # refuse the first few entries of every session for arithmetic
+        # reasons rather than risk ones. Caught by
+        # test_empty_book_never_blocks, which is the control for this whole
+        # section; without it this shipped looking correct.
+        #
+        # Below the floor these dimensions still SIZE DOWN through
+        # _scale_for_cap - they just cannot refuse. Beta and correlation are
+        # deliberately NOT gated: neither is a share of the book, so both are
+        # meaningful on the very first position. A 3.0-beta candidate alone is
+        # a 3.0-beta portfolio, and that is a real statement about risk.
+        min_positions = int(rcfg.get("min_positions_for_concentration_block", 3))
+        concentration_is_meaningful = len(positions) >= min_positions
+
+        if concentration_is_meaningful and post_sector_pct >= sector_cap * severe_mult:
+            severe_breaches.append(
+                f"sector '{candidate_sector}' at {post_sector_pct:.0f}% "
+                f"(>= {severe_mult:g}x the {sector_cap:.0f}% cap)")
+        if (concentration_is_meaningful and worst_theme_name
+                and worst_theme_post_pct >= worst_theme_cap * severe_mult):
+            severe_breaches.append(
+                f"theme '{worst_theme_name}' at {worst_theme_post_pct:.0f}% "
+                f"(>= {severe_mult:g}x the {worst_theme_cap:.0f}% cap)")
+        if post_beta >= beta_cap * severe_mult:
+            severe_breaches.append(
+                f"portfolio beta {post_beta:.2f} (>= {severe_mult:g}x the {beta_cap:.2f} cap)")
+        if high_corr_count >= max_cluster:
+            severe_breaches.append(
+                f"{high_corr_count} positions correlated >= {corr_threshold:.2f} "
+                f"(cluster cap {max_cluster})")
+
+        # A dimension scaling to zero also counts as blocking - but the same
+        # small-book caveat applies. _scale_for_cap returns 0.0 whenever the
+        # PRE-trade value already exceeds the cap, and on a two-position book
+        # a single same-sector holding is already 100%, so the concentration
+        # dimensions would refuse for the same arithmetic reason as above.
+        # Correlation, beta and simultaneous-high-volatility are counts and
+        # ratios rather than shares of the book, so a zero from any of those
+        # blocks regardless of book size.
+        zero_from_concentration = min(mult_sector, mult_theme) <= 0.0
+        zero_from_absolute = min(mult_corr, mult_beta, mult_vol) <= 0.0
+        blocked = bool(severe_breaches) or zero_from_absolute or (
+            zero_from_concentration and concentration_is_meaningful)
         allowed = True
         if blocked and rcfg.get("hard_block_on_severe_breach", False):
             allowed = False
+            reasons.append(
+                "BLOCKED (portfolio_risk.hard_block_on_severe_breach): "
+                + ("; ".join(severe_breaches) if severe_breaches
+                   else "a risk dimension scaled this candidate to zero size"))
 
         if not reasons and not warnings:
             reasons.append("No portfolio-level exposure concerns")
@@ -309,5 +467,5 @@ class PortfolioRiskEngine:
             themes=candidate_themes, sector_exposure_pct=round(post_sector_pct, 1),
             theme_exposure_pct=round(worst_theme_post_pct, 1), portfolio_beta=round(post_beta, 2),
             max_pairwise_correlation=round(max_corr, 2), high_vol_position_count=existing_high_vol,
-            reasons=reasons, warnings=warnings,
+            reasons=reasons, warnings=warnings, severe_breaches=severe_breaches,
         )

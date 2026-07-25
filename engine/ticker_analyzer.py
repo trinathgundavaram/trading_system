@@ -188,6 +188,14 @@ class TickerData:
     earnings_date: str = "N/A"
     days_to_earnings: int = 999
     sector: str = "N/A"
+    # §18: finer-grained than sector, and the difference matters for
+    # concentration - "Technology" covers both a semiconductor foundry and a
+    # payments processor, which do not move together, while
+    # "Semiconductors" is close to a theme on its own. Populated
+    # opportunistically from whichever of yfinance/finviz answered; stays
+    # "N/A" when neither did, which portfolio_risk treats as unclassified
+    # rather than as a match.
+    industry: str = "N/A"
     # REAL - yfinance's own asset-class classification ("EQUITY", "ETF",
     # "MUTUALFUND", "INDEX", ...). Used by rules/swing_buy_rules.py to pick
     # between the stock and ETF bucket-weight profiles - see that module's
@@ -647,6 +655,11 @@ class TickerAnalyzer:
         # info payload carries the same GICS-style sector name for equities.
         if info.get("sector"):
             td.sector = info["sector"]
+        # §18: same payload, same reasoning as sector above - yfinance carries
+        # industry alongside it, so this costs nothing and gives the
+        # concentration check a second, finer axis to measure on.
+        if info.get("industry"):
+            td.industry = info["industry"]
 
         # Analyst consensus + short float from yfinance (2026-07-15d - the
         # "no Finviz Elite" fallback chain): both fields were finviz-only,
@@ -1213,6 +1226,8 @@ class TickerAnalyzer:
         # Don't clobber a real yfinance-sourced sector with finviz's "N/A"
         if data.get("sector") and data.get("sector") != "N/A":
             td.sector = data["sector"]
+        if data.get("industry") and data.get("industry") != "N/A":
+            td.industry = data["industry"]
 
         if td.earnings_date and td.earnings_date != "N/A":
             try:

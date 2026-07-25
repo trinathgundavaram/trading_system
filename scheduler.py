@@ -529,6 +529,33 @@ def _run_cycle_impl(force: bool = False):
                      triggered_by, start, cycle_count)
 
 
+def _log_rejected(db, ticker: str, stage: str, reason: str,
+                  score: float = None, price: float = None,
+                  would_have_size: float = None):
+    """Record a declined candidate (§18). Never raises.
+
+    rejected_signals had 0 rows against portfolio_risk_log's 244 evaluations:
+    a complete record of every trade taken and none at all of any trade
+    declined, which makes false negatives unmeasurable. This costs one insert
+    per rejection and produces the counterfactual dataset that
+    analytics/missed_opportunity.py and the regret modules were built to
+    consume and have never been fed - missed_opportunity_outcomes is empty.
+
+    Wrapped because a bookkeeping failure must never change a trading
+    decision. The decision has already been made by the time this is called;
+    losing the record of it is bad, and turning it into an exception that
+    propagates into the ticker loop would be worse.
+    """
+    try:
+        db.log_rejected_signal(
+            ticker=ticker, reject_stage=stage,
+            reject_reason=(reason or "")[:500],
+            score_at_rejection=score, price_at_rejection=price,
+            would_have_size=would_have_size)
+    except Exception as e:
+        logger.warning(f"{ticker}: could not record the rejection ({stage}): {e}")
+
+
 def _calc_regime_and_market_dict(mkt, cfg: dict):
     """Regime + breadth (once per market snapshot) - SPY fetched the same way
     as any watchlist ticker so we reuse TickerAnalyzer rather than a separate
@@ -630,7 +657,13 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
         # without re-fetching it (open positions are often off the current
         # watchlist - see that module's docstring).
         db.upsert_ticker_info(ticker, company_name=td.company_name, last_price=td.price,
-                               sector=td.sector, beta=td.beta)
+                               sector=td.sector, beta=td.beta,
+                               # §18: industry comes from the same payload, so
+                               # this is still zero extra MCP calls. It is what
+                               # lets portfolio_risk classify the ~95% of
+                               # traded names the hand-maintained theme_map
+                               # never covered.
+                               industry=getattr(td, "industry", None))
 
         # News tab (2026-07-14): td.news_headlines/news_sentiment_score were
         # already being fetched and scored every cycle for the
@@ -863,6 +896,7 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                         planned_amount = cfg["trading"]["trade_size_usd"]
                         portfolio_risk_result = PortfolioRiskEngine(db).evaluate(
                             ticker, td.sector, td.beta, planned_amount, atr_pct, cfg,
+                            candidate_industry=getattr(td, "industry", None),
                         )
                     except Exception as e:
                         logger.error(f"{ticker}: portfolio risk check failed: {e}", exc_info=True)
@@ -1000,7 +1034,39 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                         "setup_type": (_features.get("setup_type") if _features else None) or "unknown",
                         "risk_per_share": _risk_per_share,
                     }
-                    if watch_mode:
+                    # ── §18 (Phase 2): portfolio risk BINDS ────────────────
+                    #
+                    # This result was computed above and, until now, only fed
+                    # the sizing multiplier. A limit that is measured and then
+                    # ignored is documentation. `allowed` is False only when
+                    # portfolio_risk.hard_block_on_severe_breach is on AND a
+                    # cap is breached severely (1.5x by default), so the
+                    # ordinary case is still a size reduction rather than a
+                    # refusal.
+                    #
+                    # Placed after sizing so the log records the size this
+                    # trade WOULD have taken - that figure is the whole value
+                    # of the counterfactual, and computing it costs nothing
+                    # since sizing has already run.
+                    if portfolio_risk_result is not None and not portfolio_risk_result.allowed:
+                        _would_have = getattr(position_size, "suggested_dollar_amount", None)
+                        logger.info(f"{ticker}: BUY blocked by portfolio risk - "
+                                    f"{portfolio_risk_result.reason}")
+                        _log_rejected(db, ticker, "portfolio_risk",
+                                      portfolio_risk_result.reason,
+                                      _buy_score, td.price, _would_have)
+                        db.log_ui_event("buy_blocked", {
+                            "ticker": ticker, "stage": "portfolio_risk",
+                            "reason": portfolio_risk_result.reason,
+                            "would_have_size": _would_have,
+                        })
+                        continue_buy = False
+                    else:
+                        continue_buy = True
+
+                    if not continue_buy:
+                        pass
+                    elif watch_mode:
                         paper_trader.execute_buy(
                             db, cfg, ticker, td.price, position_size=position_size,
                             pattern_id=pid, trade_mode=effective_mode,
@@ -1017,6 +1083,22 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                                  exc_info=True)
         else:
             logger.info(f"{ticker}: HOLD - score {buy_result.pct_score:.0f}%")
+            # §18: record the counterfactual. portfolio_risk_log had 244 rows
+            # of evaluations and rejected_signals had 0, so there was a record
+            # of every trade taken and none of any trade declined - which
+            # makes false negatives unmeasurable. One insert per rejection
+            # feeds the missed_opportunity and regret modules, which were
+            # built to consume exactly this and have never been given
+            # anything (missed_opportunity_outcomes is empty).
+            #
+            # `stage` distinguishes the reasons: a name vetoed for a wide
+            # spread and a name that simply scored 58% are different
+            # questions, and pooling them would make the dataset unusable for
+            # either.
+            _stage = "veto" if getattr(buy_result, "veto_code", None) else "threshold"
+            _log_rejected(db, ticker, _stage,
+                          getattr(buy_result, "reason", None) or "below threshold",
+                          buy_result.pct_score, td.price, None)
 
         # Dispatch the independent paper sell check computed above - only
         # populated when watch_mode is False (see its computation above), so
