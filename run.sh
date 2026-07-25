@@ -15,6 +15,52 @@ curl -s http://127.0.0.1:8003/mcp > /dev/null 2>&1 \
 
 cd "$(dirname "$0")"
 
+# ── Guard preflight (Phase 1 + Phase 2) ─────────────────────────────────────
+#
+# "Implemented" and "in force" are different claims, and the gap between them
+# is where the 2026-07-25 incident lived. These two scripts answer the second
+# question: are the config flags actually set, are the guards actually wired,
+# is any write route unguarded. Source-only (--no-db), so this costs about a
+# second and needs no database.
+#
+# WHAT A FAILURE DOES, and why it is split:
+#
+#   The web UI starts REGARDLESS. It is read-mostly and it is how you diagnose
+#   the failure - a preflight that locks you out of the tool you would use to
+#   fix the problem is a preflight people disable.
+#
+#   The SCHEDULER asks first. That is the process that scores tickers and
+#   places paper trades, so it is the one whose guards have to be real. An
+#   explicit y/N is the smallest thing that makes "I saw the warning" true
+#   rather than assumed.
+#
+# TP_SKIP_PREFLIGHT=1 skips the whole thing. Deliberately an env var and not a
+# flag: it should be awkward enough that nobody reaches for it by habit.
+PREFLIGHT_FAILED=0
+if [ "${TP_SKIP_PREFLIGHT:-0}" = "1" ]; then
+  echo "preflight: SKIPPED (TP_SKIP_PREFLIGHT=1) - guards are unverified this run"
+else
+  echo "── preflight: are the Phase 1 + Phase 2 guards in force? ──"
+  for check in "scripts/verify_phase1.py" "scripts/verify_phase2.py --no-db"; do
+    # shellcheck disable=SC2086
+    if OUT=$(python3 $check 2>&1); then
+      echo "  OK   $(echo "$check" | awk '{print $1}')  $(echo "$OUT" | grep -E '^[0-9]+ checks:' | head -1)"
+    else
+      PREFLIGHT_FAILED=1
+      echo "  FAIL $(echo "$check" | awk '{print $1}')"
+      echo "$OUT" | grep -E '^\s+FAIL ' | sed 's/^/      /'
+    fi
+  done
+  if [ "$PREFLIGHT_FAILED" = "1" ]; then
+    echo
+    echo "  One or more guards are NOT in force. Full detail:"
+    echo "      python3 scripts/verify_phase1.py"
+    echo "      python3 scripts/verify_phase2.py"
+    echo "  The UI will still start - it is read-mostly and it is how you look."
+  fi
+  echo
+fi
+
 if [ "$1" = "--ui" ]; then
   # 2026-07-14: real incident - a previous run.sh's `main.py --ui` got
   # orphaned (terminal window closed without triggering the EXIT trap below,
@@ -92,8 +138,24 @@ if [ "$1" = "--ui" ]; then
 
   supervise "web UI (main.py --ui)" python3 main.py --ui &
   UI_SUP_PID=$!
-  supervise "scheduler" python3 scheduler.py &
-  SCHED_SUP_PID=$!
+
+  # The scheduler is the process that scores tickers and places paper trades,
+  # so it is the one whose guards have to be real. Asked AFTER the UI is
+  # already coming up, so you can answer with the dashboard in front of you.
+  START_SCHEDULER=1
+  if [ "$PREFLIGHT_FAILED" = "1" ]; then
+    echo
+    echo "  The SCHEDULER trades. Its guards did not verify (see above)."
+    read -rp "  Start the scheduler anyway? [y/N] " ok
+    [ "$ok" = y ] || START_SCHEDULER=0
+  fi
+  SCHED_SUP_PID=""
+  if [ "$START_SCHEDULER" = "1" ]; then
+    supervise "scheduler" python3 scheduler.py &
+    SCHED_SUP_PID=$!
+  else
+    echo "  scheduler NOT started. The UI is up; fix the guards, then re-run."
+  fi
 
   # ── MaverickMCP watchdog ── optional local dependency (localhost:8003).
   # If MAVERICK_CMD is set (or ~/maverick-mcp exists, the default install
@@ -139,5 +201,14 @@ if [ "$1" = "--ui" ]; then
 
   wait
 else
+  # Terminal dashboard: main.py runs the scheduler IN THIS PROCESS (see the
+  # usage text at the top), so a failed preflight gates it the same way the
+  # --ui branch gates the separate scheduler. There is no read-only half to
+  # let through here - the whole thing trades.
+  if [ "$PREFLIGHT_FAILED" = "1" ]; then
+    echo "  This mode runs the scheduler IN THIS PROCESS - it trades."
+    read -rp "  Start anyway? [y/N] " ok
+    [ "$ok" = y ] || { echo "  aborted. Fix the guards, or use ./run.sh --ui to look first."; exit 1; }
+  fi
   python3 main.py
 fi

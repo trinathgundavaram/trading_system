@@ -20,7 +20,100 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
-## [1.2] — v1.2.0 — 2026-07-25
+## [1.3] — v1.3.0 — 2026-07-25
+
+### Decision function: CHANGED — re-validation required before arming live
+
+Phase 2 complete: all ten steps (2.1–2.10). This is the release where "the
+config says a $500 daily loss limit" becomes true at runtime rather than being
+a sentence in a file.
+
+`scripts/classify_change.py v1.1.0` reports MAJOR. This ships as a **minor**
+bump, and the disagreement is recorded rather than waved through: the MAJOR
+comes from the deliberately conservative `migrations/` heuristic, and
+migrations 005–008 are additive columns, one partial index and one data
+quarantine. No scoring weight, threshold, bucket or stop rule moved, and
+`config_fingerprint` is unchanged at `cc9a149613427f56`.
+
+The decision function is nonetheless flagged as changed, for one specific
+reason: §15's quarantine filter applies to `get_patterns` for **every** reader
+including the live path, so `engine/ev_engine.py` now draws on a different
+sample and the same candidate can receive a different EV. Pattern rows remain
+poolable **individually** with v1.1.0; anything reasoning about the population
+must account for §18's new selection filter as well.
+
+Full note: [docs/releases/v1.3.0.md](docs/releases/v1.3.0.md).
+
+### There is no v1.2.0
+
+`docs/releases/v1.2.0.md` was written and never tagged; its content ships
+here. The number is skipped rather than reused — reusing it would mean two
+different trees had at different times been called v1.2.0, which is worse than
+a gap. The note is kept and marked superseded.
+
+### Added — the risk controls have real inputs
+
+- **§7** paper trades increment their own daily counters. `daily_stats` was a
+  live-book table, so on a paper-only deployment the cap read zero forever:
+  31 buys across seven days against a 10/day cap, "0 trades placed" every day.
+- **§8** the daily-loss limit resolves against actual equity — the tighter of
+  the absolute $ and a percentage. $500 against a $1,000 account is not a
+  limit, it is a number.
+- **§9** the automatic kill switch is wired, and the three bugs that would
+  have stopped it firing are fixed. It had zero call sites, so none had ever
+  surfaced.
+- **§10** the risk gate moved inside `execute_buy`. A cycle that began at 9
+  trades and found 15 candidates placed all 15.
+- **§11** drawdown is computed and persisted on every equity point, and both
+  caps bind. An intraday breach blocks entries for the day; a running breach
+  trips the kill switch, because 15% off the all-time high is not a bad day.
+
+### Added — structural guarantees
+
+- **§14** opening a position is one transaction: a partial unique index, an
+  advisory lock for the cap, and a conditional debit for the purse. Six
+  workers on one ticker now open one position.
+- **§15** `data_quality` quarantine on the learning tables; `close_position`
+  is the single definition of P&L and hold time; `scripts/reconcile.py` fails
+  loudly on cross-table disagreement.
+- **§16** every by-ticker position write is book-scoped and raises without it.
+  A $100 paper entry in HCA could previously overwrite the stop on an $8,553
+  real holding of the same ticker.
+- **§18** portfolio risk derives themes from cached sector/industry, blocks on
+  a severe breach, and records every rejection with the size it would have
+  taken.
+
+### Added — verification
+
+- `scripts/verify_phase2.py` — 29 checks that the guards are **in force**, not
+  merely present. `release.sh` and `run.sh` both consult it.
+- `scripts/apply_migration.sh`, `scripts/inspect_duplicate_positions.py`,
+  `scripts/backfill_drawdown.py`.
+
+### Changed
+
+- `release.sh`'s pytest gate is now hard. It soft-failed with a y/N prompt
+  while §12 was outstanding; §12 is done, and the 2026-07-25 incident was a
+  `release.sh` run whose suite executed against the live database.
+- `run.sh` runs a guard preflight. On failure the UI still starts — it is
+  read-mostly and it is how you diagnose — while the scheduler asks first.
+
+### Fixed
+
+- Running drawdown measured its peak across account re-seeds, so the
+  2026-07-25 re-seed (curve stepping ~984 → 1491.54) would have read a ~34%
+  drawdown against a 15% cap and tripped the kill switch on the next cycle.
+  The peak is now scoped to the current paper-account epoch.
+- `RiskEngine.check()` raised `KeyError` on a config with no `risk` section —
+  surfacing through `scheduler.py`'s handler as "paper buy failed", a risk
+  misconfiguration diagnosed as a buy failure. It now fails closed and names
+  the missing key.
+- Every migration header said `psql "$POSTGRES_DB" -f ...`, and `POSTGRES_DB`
+  is unset in this project's `.env`. That expands to an empty database name
+  and psql falls back to `$USER` — so a migration could have applied cleanly
+  to the wrong database and reported success.
+
+## [1.2] — v1.2.0 — 2026-07-25 — SUPERSEDED, never tagged; shipped in v1.3.0
 
 ### Decision function: unchanged — v1.0.x/v1.1.0 trade data remains poolable
 

@@ -47,6 +47,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ui-port", type=int, default=None,
                     help="probe a running UI on this port (auth + bind checks)")
+    ap.add_argument("--release", action="store_true",
+                    help="also require release identity: a clean working tree. "
+                         "Used by scripts/release.sh. Without it a dirty tree "
+                         "is a WARN, so run.sh's preflight is not tripped by "
+                         "the normal state of a machine you are working on.")
     args = ap.parse_args()
 
     # ── version identity ────────────────────────────────────────────────────
@@ -56,7 +61,14 @@ def main() -> int:
         ver = app_version()
         dirty = ver.endswith("-dirty")
         exact = is_release_build()
-        check("working tree is clean", not dirty,
+        # FAIL only under --release. A dirty tree says "what is running is not
+        # what is tagged", which must block a RELEASE - but it is also the
+        # normal state of a machine mid-edit, and run.sh's preflight gates the
+        # scheduler on this script's exit code. Failing here by default would
+        # put a y/N prompt in front of every run during ordinary development,
+        # and a prompt answered reflexively every day is not a control.
+        check("working tree is clean" + ("" if args.release else " (advisory)"),
+              (not dirty) if args.release else (True if not dirty else None),
               ver if not dirty else f"{ver} - uncommitted changes are running")
         check("HEAD is exactly a release tag", True if exact else None,
               f"app_version() = {ver}" + ("" if exact else

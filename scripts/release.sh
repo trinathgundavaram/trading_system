@@ -45,7 +45,7 @@ command -v gitleaks >/dev/null && gitleaks detect --no-banner --redact \
 # Blocking, both of them. A Phase 1 or Phase 2 regression is exactly the kind
 # of thing nobody would choose to release past if they were asked in a
 # language stronger than a prompt.
-python3 scripts/verify_phase1.py
+python3 scripts/verify_phase1.py --release   # --release also demands a clean tree
 python3 scripts/verify_phase2.py
 
 # Cross-table integrity (§15). Non-blocking BY DESIGN: this reads the state of
