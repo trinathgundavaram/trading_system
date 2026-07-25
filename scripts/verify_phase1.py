@@ -107,14 +107,26 @@ def main() -> int:
               f"TP_UI_HOST={os.getenv('TP_UI_HOST')!r} - UI is exposed beyond this machine")
 
     try:
+        import platform as _plat
         from storage import secrets
         tok = secrets.get("UI_AUTH_TOKEN", required=False)
-        check("UI_AUTH_TOKEN is set", bool(tok))
-        check("UI_AUTH_TOKEN is a real token (>= 24 chars)",
-              len(tok) >= 24 if tok else False,
-              f"length {len(tok)}" if tok else "unset")
-        check("UI_AUTH_TOKEN is not the retired 5-char value",
-              tok != "3nath" if tok else False)
+        # storage/secrets.py resolves environment -> .env -> Keychain. The
+        # Keychain leg only exists on macOS, so a run from a container or a
+        # non-Darwin host sees "unset" even when the token is correctly stored.
+        # Report that as a WARN, not a FAIL - a false alarm here trains you to
+        # ignore the one finding on this page that actually matters.
+        if not tok and _plat.system() != "Darwin":
+            check("UI_AUTH_TOKEN is set", None,
+                  "not resolvable on this host (no macOS Keychain) - re-run on "
+                  "the Mac to check it properly")
+        else:
+            check("UI_AUTH_TOKEN is set", bool(tok))
+        if tok or _plat.system() == "Darwin":
+            check("UI_AUTH_TOKEN is a real token (>= 24 chars)",
+                  len(tok) >= 24 if tok else False,
+                  f"length {len(tok)}" if tok else "unset")
+            check("UI_AUTH_TOKEN is not the retired 5-char value",
+                  tok != "3nath" if tok else False)
     except Exception as e:
         check("token check ran", None, str(e))
 
@@ -135,13 +147,12 @@ def main() -> int:
         check("every money/config write route is guarded", must <= guarded,
               f"unguarded: {sorted(must - guarded)}" if must - guarded else
               f"{len(guarded)}/{len(rows)} write routes guarded")
+        # v1.1.1 closed the last eight. This is now a FAIL, not a warning: a
+        # new unguarded write route is a regression, and the whole point of
+        # the require_token dependency is that it cannot be forgotten.
         open_routes = sorted(p for p, a in rows if not a)
-        if open_routes:
-            check("routes still unauthenticated", None,
-                  ", ".join(open_routes) +
-                  "\n         None can place an order or change config. /api/cycle/run_now"
-                  "\n         DOES trigger a scan cycle - harmless while the §2 gates are"
-                  "\n         closed and the bind is loopback. Tracked as a known issue.")
+        check("no write route is unauthenticated", not open_routes,
+              ", ".join(open_routes) if open_routes else f"all {len(rows)} guarded")
     except Exception as e:
         check("route audit ran", None, str(e))
 

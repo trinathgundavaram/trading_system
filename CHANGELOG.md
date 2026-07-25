@@ -20,6 +20,45 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+## [1.11] — v1.1.1 — 2026-07-25
+
+### Decision function: unchanged
+
+Bug fix. Full note: [docs/releases/v1.1.1.md](docs/releases/v1.1.1.md).
+
+### Security
+
+- The last eight write routes now carry the `require_token` dependency —
+  **15 of 15 guarded**. §4 made the argument that a dependency cannot be
+  forgotten the way an inline check can, then applied it to seven routes and
+  left eight that had never had a check to replace. `/api/cycle/run_now` was
+  the one with teeth: with the §2 gates open it reaches the order path.
+- `authFetch()` in the UI — the client-side mirror of `require_token`. One
+  place that attaches the header, and one place that handles a 403 (clear the
+  cached token and re-prompt) and a 429 (report the lockout as a lockout).
+- `saveConfig(update, needsAuth=false)` → `needsAuth=true`. All twelve call
+  sites already pass `true`, so no behaviour changes; a safety parameter
+  should not default to off.
+
+### Fixed
+
+Three pre-existing call sites that misreported an auth failure:
+
+- `/api/ticker/validate` let the error body fall through to `!data.valid` and
+  told you **the ticker was invalid** — sending you to debug the wrong thing.
+- `/api/alerts/{id}/resolve` discarded the response, so a rejected request
+  still toasted "Alert dismissed" and removed the row while the alert stayed
+  open in the database.
+- `/api/prompt/copy` stacked a generic "Copy failed" on top of the real error.
+
+### Changed
+
+- `scripts/verify_phase1.py` treats an unguarded write route as a **FAIL**
+  rather than an accepted warning.
+- `tests/test_ui_auth.py` asserts "no write route lacks the dependency"
+  instead of checking a fixed allow-list — a list has to be remembered, which
+  is the failure mode being designed out.
+
 ## [1.1] — v1.1.0 — 2026-07-25
 
 ### Decision function: unchanged — v1.0.x trade data remains poolable

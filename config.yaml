@@ -642,14 +642,26 @@ backtest:
   - KEY
   - PBR-A
   - MO
-ui:
-  # Phase 0 step 0.2 (2026-07-24): this was a short literal token in a
-  # versioned file. It now resolves from the environment (.env, gitignored).
-  # The retired value is deliberately not quoted here - a comment recording
-  # what a secret used to be is still a secret in the history.
-  # Generate a real one (32+ chars) with:
-  #   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
-  auth_token: ${UI_AUTH_TOKEN}
+# The `ui:` section is gone entirely (v1.1.1), key included - a bare `ui:` with
+# only comments under it parses as None, and `cfg.get("ui", {})` then returns
+# None rather than {}, which crashes on the next .get(). An absent key is
+# safer than an empty one.
+#
+# auth_token REMOVED from this file (v1.1.1).
+#
+# Phase 0 step 0.2 turned a literal token into ${UI_AUTH_TOKEN}. §4 then
+# moved the ACTUAL lookup to storage/secrets.py, so nothing has read
+# cfg["ui"]["auth_token"] since - server.py calls secrets.get() directly.
+#
+# Leaving the reference here was actively harmful: config_loader raises on a
+# missing ${VAR}, by design, so the whole platform refused to start if the
+# token lived only in the macOS Keychain and not in .env. A dead config key
+# was holding startup hostage to a secret no code path consumed.
+#
+# Set the token with:
+#   python3 -c 'import secrets; print(secrets.token_urlsafe(32))' | \
+#     xargs -I{} security add-generic-password -a $USER -s tp_UI_AUTH_TOKEN -w {} -U
+# storage/secrets.py resolves environment -> .env -> Keychain.
 notifications:
   enabled: true
   desktop_enabled: true

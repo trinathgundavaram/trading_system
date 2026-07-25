@@ -616,7 +616,8 @@ function loadTab(name) {
 /* ============================== COPY PROMPT ============================== */
 async function copyPrompt() {
   try {
-    const res = await fetch("/api/prompt/copy", { method: "POST" });
+    const res = await authFetch("/api/prompt/copy", { method: "POST" });
+    if (res.status === 403 || res.status === 429) return;   // authFetch already explained it
     if (res.status === 404) { toast("No prompt ready yet - runs after the first scheduler.py cycle", "alert"); return; }
     const data = await res.json();
     if (data.status === "copied") {
@@ -661,6 +662,32 @@ async function getToken() {
   t = await askToken();
   if (t) localStorage.setItem(AUTH_TOKEN_KEY, t);
   return t;
+}
+
+/* Every write endpoint on the server requires the token (§4). This is the
+   client-side mirror of server.py's require_token dependency: ONE place that
+   attaches the header, so a new call site cannot forget it the way eight of
+   them did before v1.1.1.
+
+   Also centralises the two failure responses. A 403 clears the cached token
+   so the next attempt re-prompts instead of silently failing forever with a
+   stale value; a 429 is the per-client lockout, and says so rather than
+   looking like a wrong password. */
+async function authFetch(url, opts = {}) {
+  const token = await getToken();
+  // A JSON body, not null: several call sites go straight to .json(), and a
+  // null body throws there instead of surfacing the real reason.
+  if (!token) return new Response('{"detail":"no auth token provided"}',
+                                   { status: 403, headers: { "Content-Type": "application/json" } });
+  const headers = Object.assign({}, opts.headers || {}, { "X-Auth-Token": token });
+  const r = await fetch(url, Object.assign({}, opts, { headers }));
+  if (r.status === 403) {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    toast("Invalid auth token", "error");
+  } else if (r.status === 429) {
+    toast("Too many failed attempts - locked out for 15 minutes", "error");
+  }
+  return r;
 }
 
 /* ============================== WEBSOCKET ============================== */
@@ -1019,7 +1046,7 @@ async function cancelCycleNow(evt) {
   btn.disabled = true;
   btn.innerHTML = `${svg("x",13)}<span>Cancelling…</span>`;
   try {
-    const res = await fetch("/api/cycle/cancel", { method: "POST" });
+    const res = await authFetch("/api/cycle/cancel", { method: "POST" });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       toast(`Couldn't cancel: ${body.detail || res.statusText}`, "error");
@@ -1049,7 +1076,7 @@ async function runCycleNow(evt) {
   btn.disabled = true;
   btn.innerHTML = `${svg("refresh",13)}<span>Starting…</span>`;
   try {
-    const res = await fetch("/api/cycle/run_now", { method: "POST" });
+    const res = await authFetch("/api/cycle/run_now", { method: "POST" });
     if (res.status === 409) {
       toast("A manual cycle is already running - hang tight.", "info");
     } else if (!res.ok) {
@@ -2583,7 +2610,12 @@ function setScreenerMax(val) {
   saveConfig({ screener: { max_candidates: Math.max(1, Math.min(50, n)) } }, true);
 }
 
-async function saveConfig(update, needsAuth=false) {
+// needsAuth defaults to TRUE (v1.1.1). /api/config has always been
+// token-gated on the server, and all twelve call sites already pass true
+// explicitly - so this changes no behaviour today. It removes a footgun: the
+// old default meant a thirteenth caller that forgot the flag would send no
+// token and get an opaque 403. A safety parameter must not default to off.
+async function saveConfig(update, needsAuth=true) {
   const headers = { "Content-Type": "application/json" };
   if (needsAuth) {
     const token = await getToken();
@@ -2613,10 +2645,14 @@ async function addTicker() {
   const originalHtml = btn.innerHTML;
   btn.innerHTML = `${svg('clock',14)}<span>Checking…</span>`;
   try {
-    const res = await fetch("/api/ticker/validate", {
+    const res = await authFetch("/api/ticker/validate", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ticker: t }),
     });
+    // authFetch has already explained a 403/429. Without this guard the
+    // {detail: ...} error body falls through to `!data.valid` and the user is
+    // told the ticker is invalid, which is both wrong and hard to debug.
+    if (!res.ok) return;
     const data = await res.json();
     if (!data.valid) {
       toast(`"${t}" doesn't look like a valid ticker (no price data from yfinance)`, "alert");
@@ -2634,7 +2670,7 @@ async function addTicker() {
     if (saved) {
       btn.innerHTML = `${svg('clock',14)}<span>Evaluating…</span>`;
       try {
-        const evalRes = await fetch("/api/ticker/evaluate_now", {
+        const evalRes = await authFetch("/api/ticker/evaluate_now", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ ticker: t }),
         });
@@ -2839,7 +2875,7 @@ async function runBacktestNow(evt) {
   btn.disabled = true;
   btn.innerHTML = `${svg("refresh",13)}<span>Starting…</span>`;
   try {
-    const res = await fetch("/api/backtest/run", { method: "POST" });
+    const res = await authFetch("/api/backtest/run", { method: "POST" });
     if (res.status === 409) {
       toast("A backtest is already running - hang tight.", "info");
       _setBacktestButtonRunning(true);
@@ -3533,7 +3569,7 @@ async function loadThresholdRegretPanel(runNow) {
   let report;
   try {
     if (runNow) {
-      report = await (await fetch("/api/analytics/threshold_regret/run", { method: "POST" })).json();
+      report = await (await authFetch("/api/analytics/threshold_regret/run", { method: "POST" })).json();
     } else {
       report = await (await fetch("/api/analytics/threshold_regret")).json();
     }
@@ -3802,10 +3838,14 @@ async function renderAlertsPanel() {
 
 async function resolveAlert(alertId) {
   try {
-    await fetch(`/api/alerts/${encodeURIComponent(alertId)}/resolve`, {
+    const res = await authFetch(`/api/alerts/${encodeURIComponent(alertId)}/resolve`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ resolution: "dismissed from UI" }),
     });
+    // The response was previously discarded, so a rejected request still
+    // reported "Alert dismissed" and the row vanished from the UI while the
+    // alert remained open in the database.
+    if (!res.ok) return;
     toast("Alert dismissed");
     renderAlertsPanel();
   } catch (e) { toast("Couldn't dismiss alert - is the server running?", "alert"); }

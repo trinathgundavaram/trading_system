@@ -115,28 +115,31 @@ def test_every_write_route_is_guarded():
     tenth write endpoint ships unauthenticated. Any route added to the list
     below must carry the dependency.
 
-    Routes deliberately NOT in this list (run_now, cancel, validate,
-    evaluate_now, backtest/run, alerts/resolve, prompt/copy, threshold_regret)
-    were unauthenticated before Phase 1 and remain so - adding auth to them
-    would break the dashboard, which does not send the header on those calls.
-    They are protected by the loopback bind instead, and are tracked as a
-    known issue in the v1.0.1 release note."""
-    must_be_guarded = {
-        "/api/paper/sell", "/api/real/sell", "/api/portfolio/clear_seed",
-        "/api/positions/clear_synced", "/api/live_execution", "/api/config",
-        "/api/kill_switch",
-    }
-    seen = set()
+    As of v1.1.1 this is EVERY write route, not a chosen subset. The eight
+    that were left open through v1.1.0 (run_now, cancel, validate,
+    evaluate_now, backtest/run, alerts/resolve, prompt/copy,
+    threshold_regret/run) are now guarded too, and the UI sends the header via
+    authFetch().
+
+    Deliberately written as "no write route lacks the dependency" rather than
+    a fixed allow-list: a list has to be remembered, which is the same failure
+    mode as an inline check."""
+    unguarded = []
+    write_routes = []
     for route in server.app.routes:
-        path = getattr(route, "path", None)
-        methods = getattr(route, "methods", set()) or set()
-        if path not in must_be_guarded or "POST" not in methods:
+        methods = (getattr(route, "methods", set()) or set())
+        if not methods & {"POST", "PUT", "PATCH", "DELETE"}:
             continue
-        seen.add(path)
+        write_routes.append(route.path)
         names = [d.call.__name__ for d in route.dependant.dependencies
                  if getattr(d, "call", None)]
-        assert "require_token" in names, f"{path} is a write route with no auth dependency"
-    assert seen == must_be_guarded, f"route(s) missing from the app: {must_be_guarded - seen}"
+        if "require_token" not in names:
+            unguarded.append(route.path)
+
+    assert not unguarded, f"write route(s) with no auth dependency: {unguarded}"
+    # Sanity floor: if the app ever stops registering routes, the assertion
+    # above would pass vacuously.
+    assert len(write_routes) >= 15, f"only {len(write_routes)} write routes found"
 
 
 def test_no_inline_token_comparisons_remain():

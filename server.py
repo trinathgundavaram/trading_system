@@ -790,7 +790,8 @@ async def get_alerts():
 
 
 @app.post("/api/alerts/{alert_id}/resolve")
-async def resolve_alert(alert_id: str, body: dict = None):
+async def resolve_alert(alert_id: str, body: dict = None,
+                         _: bool = Depends(require_token)):
     """Manually acknowledges/dismisses an alert (e.g. after checking the
     ticker symbol is correct, or after removing it from the watchlist) -
     never automatic, matching this codebase's posture that a human decides
@@ -858,7 +859,7 @@ async def get_logs(lines: int = 300, level: str = None, source: str = None):
 
 
 @app.post("/api/ticker/validate")
-async def validate_ticker(body: dict):
+async def validate_ticker(body: dict, _: bool = Depends(require_token)):
     """The ONE endpoint in this file that calls an MCP directly (see module
     docstring) - a ticker you're about to add to the watchlist hasn't
     necessarily been scanned yet, so there's nothing in ticker_info_cache to
@@ -918,7 +919,7 @@ async def validate_ticker(body: dict):
 
 
 @app.post("/api/ticker/evaluate_now")
-async def evaluate_ticker_now(body: dict):
+async def evaluate_ticker_now(body: dict, _: bool = Depends(require_token)):
     """The SECOND (of two) exceptions to this file's normal MCP-free rule -
     imports and calls scheduler.py's evaluate_single_ticker(), triggered only
     right after a ticker is successfully added to the watchlist in the UI.
@@ -972,7 +973,7 @@ async def get_prompt():
 
 
 @app.post("/api/prompt/copy")
-async def copy_prompt():
+async def copy_prompt(_: bool = Depends(require_token)):
     p = BASE_DIR / "output" / "trade_prompt.md"
     if not p.exists():
         raise HTTPException(404, "No prompt ready")
@@ -1047,7 +1048,8 @@ def _run_manual_backtest():
 
 
 @app.post("/api/backtest/run")
-async def run_backtest_now(background_tasks: BackgroundTasks):
+async def run_backtest_now(background_tasks: BackgroundTasks,
+                            _: bool = Depends(require_token)):
     """Powers the Learning tab's "Run Backtest Now" button - triggers
     engine/backtest_engine.py's Stage 1 historical replay on demand using
     config.yaml's backtest.tickers/months/warmup_days/max_hold_days, same
@@ -1398,7 +1400,8 @@ async def get_threshold_regret(limit: int = 200, force_resim: bool = False, use_
 
 
 @app.post("/api/analytics/threshold_regret/run")
-async def run_threshold_regret_now(limit: int = 200, force_resim: bool = False):
+async def run_threshold_regret_now(limit: int = 200, force_resim: bool = False,
+                                    _: bool = Depends(require_token)):
     """Powers a "Run Now" button for the threshold-regret report, matching
     the Learning tab's "Run Backtest Now" precedent (POST /api/backtest/run)
     - Trinath asked for parity after learning the automatic version only
@@ -1521,7 +1524,8 @@ def _run_manual_cycle():
 
 
 @app.post("/api/cycle/run_now")
-async def run_cycle_now(background_tasks: BackgroundTasks):
+async def run_cycle_now(background_tasks: BackgroundTasks,
+                         _: bool = Depends(require_token)):
     """On-demand scan cycle, independent of the Mon-Fri 9:30-16:00 ET
     schedule - for testing, or to populate the dashboard without waiting for
     the next scheduled window. Imports and calls scheduler.py's run_cycle()
@@ -1638,7 +1642,7 @@ async def get_data_sources():
 
 
 @app.post("/api/cycle/cancel")
-async def cancel_running_cycle():
+async def cancel_running_cycle(_: bool = Depends(require_token)):
     """HARD kill switch for a runaway cycle (2026-07-22 - Trinath: "the
     cancel run tab should be able to do all this as well", i.e. the same
     immediate process-group SIGKILL the 15-min auto-kill uses - see
