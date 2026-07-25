@@ -161,9 +161,29 @@ connected_clients: list = []
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
+    """The single-page dashboard, served with caching DISABLED (v1.1.1).
+
+    This response previously carried no cache headers, so browsers cached the
+    page indefinitely. That is how v1.1.1 shipped and appeared not to work: the
+    server required a token on /api/cycle/run_now while the browser was still
+    running the PREVIOUS index.html, which had no authFetch(), never sent the
+    header, and therefore never prompted for a token. The symptom was a
+    permanent 403 that retrying could not clear - the fix looked broken when it
+    was simply not loaded.
+
+    The whole UI is one file with inline JS, so there is no asset-hash
+    cache-busting to fall back on. no-store is the correct trade here: the
+    document is a few hundred KB served over loopback, and a stale dashboard
+    that silently disagrees with the server about authentication - or about
+    which positions are open - is far more expensive than re-sending it.
+    """
     if not UI_PATH.exists():
         return HTMLResponse("<h1>ui/index.html not found</h1>", status_code=500)
-    return UI_PATH.read_text()
+    return HTMLResponse(UI_PATH.read_text(), headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
 
 
 @app.websocket("/ws")
