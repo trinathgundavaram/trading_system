@@ -54,6 +54,14 @@ class FakeDB:
     def get_paper_account(self):
         return {"cash": self.cash}
 
+    # ---- the §11 drawdown API ----
+    # Present so RiskEngine's drawdown gate reads a real (zero) row here
+    # rather than falling into drawdown_breach()'s exception path, which would
+    # make every test in this file pass for the wrong reason.
+    def get_daily_stats(self) -> dict:
+        return {"max_drawdown": 0.0, "running_drawdown": 0.0,
+                "paper_max_drawdown": 0.0, "paper_running_drawdown": 0.0}
+
     def get_all_positions(self, simulated=None):
         return list(self.positions)
 

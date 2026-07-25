@@ -129,6 +129,76 @@ def daily_loss_limit(db, cfg: dict, simulated: bool) -> float:
     return min(absolute, equity * pct / 100.0) if equity > 0 else absolute
 
 
+def drawdown_breach(db, cfg: dict, simulated: bool) -> str:
+    """Reason string when a drawdown cap is breached, "" when it is not (§11).
+
+    Two caps, watching two different things:
+
+      max_intraday_drawdown_pct - today's worst peak-to-trough. Halts the
+          session. This is the daily circuit breaker, and realised P&L alone
+          cannot see what it sees: an account can round-trip 4% intraday and
+          finish flat, having taken every bit of that risk.
+      max_running_drawdown_pct  - distance from the all-time equity high.
+          Halts entirely. That is not a bad day, it is the strategy having
+          stopped working, and it is not a decision to re-take automatically
+          tomorrow morning.
+
+    Reads the drawdown columns for the requested BOOK, so a paper session
+    cannot be halted by a live figure or the reverse.
+
+    Both caps default to 0 = off, and an unreadable stats row returns "" - an
+    unknown drawdown must not block trading. That is the opposite of
+    daily_loss_limit()'s default, deliberately: there, failing open WIDENS a
+    limit that already exists and is already known, whereas failing closed
+    here would halt the session on the strength of a number that nothing has
+    written yet.
+    """
+    # Running first: it is the more serious of the two, so when both are
+    # breached it is the one that should be named in the halt reason.
+    return (_running_drawdown_breach(db, cfg, simulated)
+            or _intraday_drawdown_breach(db, cfg, simulated))
+
+
+def _read_drawdown(db, simulated: bool) -> dict:
+    """Today's drawdown figures for one book, or {} when unreadable.
+
+    The book prefix is the §7 property applied to a third pair of columns: a
+    live figure must never halt a paper session, or the reverse.
+    """
+    try:
+        stats = db.get_daily_stats() or {}
+    except Exception as e:
+        logger.warning(f"drawdown check: could not read daily_stats: {e}")
+        return {}
+    prefix = "paper_" if simulated else ""
+    return {"intraday": float(stats.get(f"{prefix}max_drawdown", 0) or 0),
+            "running": float(stats.get(f"{prefix}running_drawdown", 0) or 0)}
+
+
+def _intraday_drawdown_breach(db, cfg: dict, simulated: bool) -> str:
+    cap = float((cfg.get("risk", {}) or {}).get("max_intraday_drawdown_pct", 0) or 0)
+    if not cap:
+        return ""
+    dd = _read_drawdown(db, simulated).get("intraday")
+    if dd is None or dd < cap:
+        return ""
+    return f"intraday drawdown {dd:.2f}% >= {cap}% - no new entries today"
+
+
+def _running_drawdown_breach(db, cfg: dict, simulated: bool) -> str:
+    """Separate from the intraday check because it has a separate consequence:
+    trip_kill_switch_if_needed() escalates THIS one to the kill switch, and
+    deliberately not the intraday one."""
+    cap = float((cfg.get("risk", {}) or {}).get("max_running_drawdown_pct", 0) or 0)
+    if not cap:
+        return ""
+    dd = _read_drawdown(db, simulated).get("running")
+    if dd is None or dd < cap:
+        return ""
+    return (f"running drawdown {dd:.2f}% >= {cap}% "
+            f"- halted pending human review")
+
+
 class RiskEngine:
     """Dict-access `cfg` version used by the ACTIVE scheduler.py flow.
     Constructed as RiskEngine(db, cfg[, simulated]); .check() takes no args and
@@ -164,6 +234,10 @@ class RiskEngine:
         if realized <= -limit:
             return {"can_trade": False,
                     "reason": f"{book} daily loss ${realized:.2f} breached -${limit:.2f}"}
+
+        dd = drawdown_breach(self.db, cfg, self.simulated)
+        if dd:
+            return {"can_trade": False, "reason": f"{book} {dd}"}
 
         return {"can_trade": True, "reason": "OK"}
 
@@ -235,7 +309,7 @@ def _persist_kill_switch(reason: str):
 
 
 def trip_kill_switch_if_needed(db, cfg=None, simulated: bool = None) -> bool:
-    """Auto-arm the kill switch when today's realised loss breaches the limit.
+    """Auto-arm the kill switch on a realised-loss OR running-drawdown breach.
 
     ONLY EVER FLIPS ON. Clearing it stays a deliberate human act (edit
     config.yaml, restart), which is correct: the single most dangerous failure
@@ -251,6 +325,20 @@ def trip_kill_switch_if_needed(db, cfg=None, simulated: bool = None) -> bool:
          active scheduler passes as a plain dict.
     engine/rules_catalog.py meanwhile told the operator it "runs every cycle".
 
+    §11 (Phase 2) added the second trigger. The RUNNING drawdown cap is the
+    only one of the two drawdown limits that belongs here: an intraday breach
+    is a statement about today, and drawdown_breach() already blocks new
+    entries for the rest of it, so escalating that to a switch a human must
+    clear would halt tomorrow for something that happened this afternoon.
+    A running breach is a statement about the strategy - 15% off the all-time
+    high is not a bad day - and that decision should not be re-taken
+    automatically at the next equity point that happens to tick up. Routing it
+    through the kill switch is what makes "human review required" true rather
+    than merely printed.
+
+    The INTRADAY cap deliberately stays a gate-only control. Together they
+    give the two halts different half-lives, which is the point.
+
     Returns True only when it actually tripped on this call.
     """
     raw = cfg if isinstance(cfg, dict) else None
@@ -265,14 +353,18 @@ def trip_kill_switch_if_needed(db, cfg=None, simulated: bool = None) -> bool:
     if simulated is None:
         simulated = _default_simulated(raw)
 
+    book = "paper" if simulated else "live"
     realized = db.realized_pnl_today(simulated=simulated)
     limit = daily_loss_limit(db, raw, simulated)
-    if realized > -limit:
-        return False
 
-    book = "paper" if simulated else "live"
-    reason = (f"AUTO {datetime.utcnow().isoformat()}Z: {book} realised "
-              f"${realized:.2f} breached -${limit:.2f}")
+    if realized <= -limit:
+        reason = (f"AUTO {datetime.utcnow().isoformat()}Z: {book} realised "
+                  f"${realized:.2f} breached -${limit:.2f}")
+    else:
+        dd = _running_drawdown_breach(db, raw, simulated)
+        if not dd:
+            return False
+        reason = f"AUTO {datetime.utcnow().isoformat()}Z: {book} {dd}"
 
     # Persist to config.yaml so a process restart does NOT clear it.
     #

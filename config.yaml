@@ -91,6 +91,28 @@ risk:
   # days it would have halted the session on day one.
   max_daily_loss_pct: 2.0
   max_daily_loss_usd: 500
+
+  # §11 (Phase 2): drawdown caps. Realised P&L cannot see either of these -
+  # an account can round-trip 4% intraday and finish flat, having taken every
+  # bit of that risk, and max_daily_loss would never have noticed.
+  #
+  # Measured against the equity curve for the book being traded
+  # (daily_stats.paper_max_drawdown / paper_running_drawdown, written by
+  # storage/database.update_drawdown on every equity point).
+  #
+  # 3.0 is 1.5x the 2.0% daily-loss percentage above, deliberately: intraday
+  # excursion is always wider than the realised figure, so a cap set equal to
+  # it would fire on days that ended fine. Set from the backfill over the
+  # existing curve (scripts/backfill_drawdown.py prints the observed
+  # distribution) rather than guessed - re-check it once there is more than
+  # one day of history and tighten if 3.0 never binds.
+  max_intraday_drawdown_pct: 3.0     # halt for the day
+  # 15% from the all-time high is not a bad day, it is the strategy having
+  # stopped working. Halts entirely; clearing it is a human act, same as the
+  # kill switch, because the one thing an automatic breaker must never do is
+  # re-arm itself overnight.
+  max_running_drawdown_pct: 15.0     # halt entirely, human review required
+
   max_trades_per_day: 10
   max_position_size_usd: 500
   max_portfolio_risk_pct: 5.0

@@ -374,16 +374,23 @@ ACCOUNT_RISK_CATALOG = {
         {"name": "kill_switch", "description": "config.yaml's risk.kill_switch_triggered - manual or auto-tripped (see trip_kill_switch_if_needed below), halts all trading until manually cleared + restarted"},
         {"name": "max_trades_per_day", "description": "config.yaml's risk.max_trades_per_day (default 10) - shared budget across DAY+SWING+HYBRID combined"},
         {"name": "max_daily_loss", "description": "Realized P&L today must stay above -risk.max_daily_loss_usd (default $500). Auto-trips the kill switch (see below) rather than just blocking new entries once breached"},
+        {"name": "max_intraday_drawdown", "description": "§11. Today's worst peak-to-trough on the equity curve must stay under risk.max_intraday_drawdown_pct (default 3.0%). Blocks new entries for the rest of the day. Sees what realized P&L cannot: an account can round-trip 4% intraday and finish flat, having taken every bit of that risk. Measured per book from daily_stats.paper_max_drawdown, written by storage/database.update_drawdown() on every equity point"},
+        {"name": "max_running_drawdown", "description": "§11. Distance from the all-time equity high must stay under risk.max_running_drawdown_pct (default 15.0%). Blocks entries entirely - this is not a bad day, it is the strategy having stopped working, and clearing it is a human act. Unlike the intraday figure this one is a current distance, not a high-water mark, so a genuine recovery does clear it"},
         {"name": "max_positions", "description": "config.yaml's trading.max_positions (default 10) - open position count ceiling, separate from the DAY-specific trading.max_day_positions cap (see Trading Modes above)"},
         {"name": "max_position_size", "description": "Any single position's dollar amount must stay under risk.max_position_size_usd (default $500) - the hard ceiling position_sizing.py's suggested dollar amount is clamped to"},
         {"name": "sufficient_buying_power", "description": "Candidate dollar amount must not exceed the account's available buying power (real accounts only)"},
     ],
     "kill_switch_auto_trip": (
-        "trip_kill_switch_if_needed() runs every cycle: if realized P&L today breaches -max_daily_loss_usd "
-        "and the kill switch isn't already on, it flips risk.kill_switch_triggered=true, PERSISTS that to "
-        "config.yaml on disk, and logs a CRITICAL entry. By design this function only ever flips the switch "
-        "ON - clearing it requires a manual config edit + restart, so a bad day can't quietly self-heal "
-        "without a human looking at it first."
+        "trip_kill_switch_if_needed() runs every cycle: if realized P&L today breaches the §8 daily loss "
+        "limit, OR (§11) the running drawdown breaches risk.max_running_drawdown_pct, and the kill switch "
+        "isn't already on, it flips risk.kill_switch_triggered=true, PERSISTS that to config.yaml on disk, "
+        "sends a critical notification, and logs a CRITICAL entry. By design this function only ever flips "
+        "the switch ON - clearing it requires a manual config edit + restart, so a bad day can't quietly "
+        "self-heal without a human looking at it first. "
+        "The INTRADAY drawdown cap deliberately does NOT escalate here: it blocks new entries for the rest "
+        "of the day via the max_intraday_drawdown check above and then expires with the day, because it is "
+        "a statement about today rather than about the strategy. The two halts having different half-lives "
+        "is the intended design, not an oversight."
     ),
 }
 

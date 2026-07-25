@@ -79,6 +79,34 @@ def is_unmanaged_mode(trade_mode) -> bool:
     return str(trade_mode or "").upper() in MANAGED_EXCLUDED_MODES
 
 
+def _local_day_window_utc(day: date = None) -> tuple:
+    """[start, end) in naive-UTC isoformat for one LOCAL calendar day.
+
+    Every timestamp column in this schema is written as naive
+    `datetime.utcnow().isoformat()`, but a trading day is a LOCAL day: an
+    evening close at 00:30 UTC belongs to the session that just ended, not to
+    tomorrow. So the window has to be converted before comparing.
+
+    Computed in Python rather than in SQL. SQLite's `date(col,'localtime')`
+    read the OS timezone directly and Postgres has no equivalent; leaning on
+    the Postgres SERVER's configured timezone would silently break this
+    whenever that is set to anything other than the machine's local zone.
+    This is a plain string-range comparison against an already-UTC column, so
+    the database's timezone configuration cannot affect the answer.
+
+    Extracted 2026-07-25 (§11) from paper_realized_pnl_today(), which is now
+    one of its two callers. Its own docstring already made the argument: two
+    implementations of the same window is how you get two different answers
+    from the same data - and a drawdown day that disagreed with a realised-P&L
+    day would be exactly that failure.
+    """
+    local_ref = datetime.combine(day, datetime.min.time()) if day else datetime.now()
+    local_midnight = local_ref.replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_offset = datetime.utcnow() - datetime.now()   # naive local->UTC on this machine
+    return ((local_midnight + utc_offset).isoformat(),
+            (local_midnight + timedelta(days=1) + utc_offset).isoformat())
+
+
 _POOL_LOCK = threading.Lock()
 _POOL = None  # process-wide pool, shared by every Database() instance in
               # this process (scheduler.py, server.py, main.py, confirm_fill.py
@@ -830,6 +858,18 @@ class Database:
         self._add_column_if_missing(conn, "daily_stats", "paper_winning_trades",
                                      "INTEGER DEFAULT 0")
         self._add_column_if_missing(conn, "daily_stats", "paper_realized_pnl",
+                                     "REAL DEFAULT 0")
+        # §11: drawdown. `max_drawdown` already existed (declared, defaulted to
+        # 0, written by nothing since the schema was created). The other three
+        # are new. Book-separated for the same reason as the counters above:
+        # the only equity curve that exists today is the paper one, and writing
+        # it into a column the live ledger reads is the contamination §7 exists
+        # to prevent. Mirrors migrations/005.
+        self._add_column_if_missing(conn, "daily_stats", "running_drawdown",
+                                     "REAL DEFAULT 0")
+        self._add_column_if_missing(conn, "daily_stats", "paper_max_drawdown",
+                                     "REAL DEFAULT 0")
+        self._add_column_if_missing(conn, "daily_stats", "paper_running_drawdown",
                                      "REAL DEFAULT 0")
 
     def _migrate_rotation_log(self, conn):
@@ -2704,6 +2744,160 @@ class Database:
                  snap.get("invested_cost"), snap.get("market_value"),
                  snap.get("unrealized_pnl"), snap.get("realized_pnl"), snap.get("n_open")),
             )
+        # §11: recompute drawdown here rather than from a scheduled job. The
+        # curve only moves when a point is appended, so the only moment the
+        # figure can go stale is the moment immediately after this insert.
+        # A separate job would add a second thing that has to be running for a
+        # risk control to be current - and a risk control that silently stops
+        # updating is worse than one that was never wired up, because the
+        # dashboard keeps showing a number.
+        try:
+            self.update_drawdown(simulated=True)
+        except Exception as e:
+            # Never let a metric failure lose the equity point that was just
+            # written - the point is the raw material, the metric is derived
+            # and can be recomputed from it by scripts/backfill_drawdown.py.
+            logger.warning(f"update_drawdown after equity insert failed: {e}")
+
+    def update_drawdown(self, simulated: bool = True) -> dict:
+        """Recompute today's drawdown for one book from its equity curve.
+
+        Two numbers, because they answer different questions:
+
+          intraday_dd - worst peak-to-trough WITHIN today. "How bad did it get
+                        before it came back?" This is what a daily circuit
+                        breaker should watch.
+          running_dd  - drawdown from the all-time equity high. "How far from
+                        my best am I?" This is what says whether the strategy
+                        is still working.
+
+        Only the paper book has an equity curve today (paper_equity_history);
+        `simulated=False` is accepted and returns without writing, so the live
+        columns stay honestly zero rather than being fed paper numbers. When a
+        live curve exists, point this at it - the callers and the risk gate do
+        not change.
+
+        On the equity series: `total_value` from paper_trader.snapshot(), which
+        carries unpriced positions at COST. That matters here for the same
+        reason it matters in daily_loss_limit() - a quoteless cycle must not
+        register as a portfolio that lost all its market value, which would
+        manufacture a 100% drawdown and halt the session for entirely the
+        wrong reason.
+
+        Returns the computed figures (or {} when there was nothing to compute)
+        so callers and tests can assert on them without a second read.
+        """
+        if not simulated:
+            return {}
+
+        today = date.today().isoformat()
+        start_utc, end_utc = _local_day_window_utc()
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT total_value FROM paper_equity_history
+                    WHERE timestamp >= ? AND timestamp < ?
+                      AND total_value IS NOT NULL
+                    ORDER BY timestamp, id""",
+                (start_utc, end_utc)).fetchall()
+            if len(rows) < 2:
+                # One point is a level, not a curve. Writing 0 here would be a
+                # claim ("no drawdown today"), and it is not one we can make.
+                return {}
+            eq = [float(r[0]) for r in rows]
+
+            peak, intraday_dd = eq[0], 0.0
+            for v in eq:
+                peak = max(peak, v)
+                if peak > 0:
+                    intraday_dd = max(intraday_dd, (peak - v) / peak * 100)
+
+            all_time_peak = float(conn.execute(
+                "SELECT MAX(total_value) FROM paper_equity_history").fetchone()[0]
+                or eq[-1])
+            running_dd = (((all_time_peak - eq[-1]) / all_time_peak * 100)
+                          if all_time_peak > 0 else 0.0)
+            running_dd = max(0.0, running_dd)
+
+            intraday_dd = round(intraday_dd, 3)
+            running_dd = round(running_dd, 3)
+
+            conn.execute(
+                """INSERT INTO daily_stats
+                    (date, paper_max_drawdown, paper_running_drawdown)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(date) DO UPDATE SET
+                      paper_max_drawdown = GREATEST(
+                          COALESCE(daily_stats.paper_max_drawdown, 0),
+                          excluded.paper_max_drawdown),
+                      paper_running_drawdown = excluded.paper_running_drawdown""",
+                (today, intraday_dd, running_dd))
+
+        # GREATEST on the intraday figure, plain assignment on the running one,
+        # and the asymmetry is the point. max_drawdown is a HIGH-WATER MARK for
+        # the day: a 4% dip at 10am is a fact about today that stays true at
+        # 3pm, and overwriting it the moment equity recovered would erase
+        # precisely the number you most want to keep. running_drawdown is a
+        # CURRENT distance from the all-time high, so the latest value is the
+        # only correct one - a high-water mark there would be a permanent
+        # record of the worst day the account ever had, which is a different
+        # statistic and already recoverable from this table.
+        return {"date": today, "paper_max_drawdown": intraday_dd,
+                "paper_running_drawdown": running_dd}
+
+    def backfill_drawdown(self) -> int:
+        """Recompute paper drawdown for EVERY day in paper_equity_history.
+
+        The curve already holds real history, so the metric can start with a
+        past instead of starting blank - which is what makes the caps in
+        config.yaml settable from evidence rather than guessed. Idempotent:
+        recomputed from the curve each time, so it can be re-run after any
+        correction to the equity series. Returns the number of days written.
+        """
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT timestamp, total_value FROM paper_equity_history
+                    WHERE total_value IS NOT NULL
+                    ORDER BY timestamp, id""").fetchall()
+
+        by_day, running_peak, written = {}, 0.0, 0
+        offset = datetime.utcnow() - datetime.now()   # naive UTC->local, as elsewhere
+        for r in rows:
+            try:
+                local_day = (datetime.fromisoformat(r["timestamp"]) - offset).date().isoformat()
+            except (TypeError, ValueError):
+                continue
+            by_day.setdefault(local_day, []).append(float(r["total_value"]))
+
+        for day in sorted(by_day):
+            eq = by_day[day]
+            if len(eq) < 2:
+                continue
+            peak, intraday_dd = eq[0], 0.0
+            for v in eq:
+                peak = max(peak, v)
+                if peak > 0:
+                    intraday_dd = max(intraday_dd, (peak - v) / peak * 100)
+            # All-time peak AS OF that day, not as of now: a backfill that used
+            # today's peak would report drawdowns the account had not yet had
+            # any way of experiencing.
+            running_peak = max(running_peak, max(eq))
+            running_dd = (((running_peak - eq[-1]) / running_peak * 100)
+                          if running_peak > 0 else 0.0)
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO daily_stats
+                        (date, paper_max_drawdown, paper_running_drawdown)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(date) DO UPDATE SET
+                          paper_max_drawdown = GREATEST(
+                              COALESCE(daily_stats.paper_max_drawdown, 0),
+                              excluded.paper_max_drawdown),
+                          paper_running_drawdown = excluded.paper_running_drawdown""",
+                    (day, round(intraday_dd, 3), round(max(0.0, running_dd), 3)))
+            written += 1
+        return written
 
     def get_paper_equity_history(self, limit: int = 500):
         """Oldest-first (chart-ready) equity curve points."""
@@ -2869,6 +3063,8 @@ class Database:
                 "date": today, "cycles_run": 0, "signals_generated": 0, "trades_placed": 0,
                 "winning_trades": 0, "realized_pnl": 0.0, "max_drawdown": 0.0, "kill_switch_triggered": 0,
                 "paper_trades_placed": 0, "paper_winning_trades": 0, "paper_realized_pnl": 0.0,
+                "running_drawdown": 0.0,
+                "paper_max_drawdown": 0.0, "paper_running_drawdown": 0.0,
             }
 
     # ---------- per-book daily counters (§7, §8, Phase 2) ----------
@@ -2981,11 +3177,11 @@ class Database:
         app already assumes everywhere else) sidesteps the DB engine's
         timezone config entirely - just a plain string-range comparison
         against the already-UTC-isoformat created_at column, same as before."""
-        local_now = datetime.now()
-        local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-        utc_offset = datetime.utcnow() - datetime.now()  # naive local->UTC offset on this machine
-        start_utc = (local_midnight + utc_offset).isoformat()
-        end_utc = (local_midnight + timedelta(days=1) + utc_offset).isoformat()
+        # 2026-07-25 (§11): the window calculation moved to
+        # _local_day_window_utc() so update_drawdown() shares it verbatim.
+        # Behaviour is unchanged; see that helper's docstring for the reasoning
+        # this one used to carry.
+        start_utc, end_utc = _local_day_window_utc()
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT COALESCE(SUM(pnl), 0.0) FROM paper_trades "
