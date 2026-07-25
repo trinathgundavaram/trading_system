@@ -185,8 +185,15 @@ def main() -> int:
               "been executed. Take a backup first: ./scripts/tp backup\n")
         print("BEGIN;")
         for ticker, r in deletes:
-            print(f"  DELETE FROM positions WHERE id = {r['id']};"
-                  f"   -- {ticker}, ${r.get('dollar_amount')}, "
+            # ticker + status in the WHERE, not id alone. An id copied from
+            # the wrong place - stale output, a worked example in a chat
+            # window, another machine's database - would otherwise delete
+            # whatever row happens to hold that id now. With the ticker
+            # pinned, a wrong id deletes NOTHING and psql says "DELETE 0",
+            # which is a question rather than a silent loss.
+            print(f"  DELETE FROM positions WHERE id = {r['id']} "
+                  f"AND ticker = '{ticker}' AND status = 'open';"
+                  f"   -- ${r.get('dollar_amount')}, "
                   f"entry {r.get('entry_time')}")
         print("  -- verify before committing:")
         print("  SELECT ticker, COALESCE(simulated,0) AS book, COUNT(*)")
@@ -226,7 +233,10 @@ def main() -> int:
             lines.append(f"-- {ticker}: ${r.get('dollar_amount')}, "
                          f"entry {r.get('entry_time')}, "
                          f"pattern_id={r.get('pattern_id')}")
-            lines.append(f"DELETE FROM positions WHERE id = {r['id']};")
+            # See the printed block above for why ticker and status are in the
+            # WHERE clause and not just the id.
+            lines.append(f"DELETE FROM positions WHERE id = {r['id']} "
+                         f"AND ticker = '{ticker}' AND status = 'open';")
             lines.append("")
         path = Path(args.out)
         path.write_text("\n".join(lines))
