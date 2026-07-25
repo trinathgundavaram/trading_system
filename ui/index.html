@@ -682,10 +682,16 @@ async function authFetch(url, opts = {}) {
   const headers = Object.assign({}, opts.headers || {}, { "X-Auth-Token": token });
   const r = await fetch(url, Object.assign({}, opts, { headers }));
   if (r.status === 403) {
+    // Say what happens NEXT, not just what went wrong. Several call sites also
+    // report the failure, so a bare "Invalid auth token" here was a duplicate
+    // that told you nothing extra - whereas "you will be asked again" is the
+    // part that stops you hunting for a settings page that does not exist.
     localStorage.removeItem(AUTH_TOKEN_KEY);
-    toast("Invalid auth token", "error");
+    toast("Auth token rejected and cleared - you'll be asked for it again", "alert");
   } else if (r.status === 429) {
-    toast("Too many failed attempts - locked out for 15 minutes", "error");
+    toast("Too many failed attempts - locked out 15 min (or restart the UI)", "error");
+  } else if (r.status === 503) {
+    toast("The server has no UI_AUTH_TOKEN configured - see .env.template", "error");
   }
   return r;
 }
