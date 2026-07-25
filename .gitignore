@@ -1,0 +1,61 @@
+# =============================================================================
+#  Phase 0 step 0.3 (§34.2). Ignore rules go in FIRST, before a single file is
+#  staged. Doing it the other way round is how secrets get into a first commit.
+# =============================================================================
+
+# ── Secrets: never, under any circumstances ─────────────────────────────────
+.env
+.env.*
+!.env.template
+*.pem
+*.p12
+*.pfx
+*.key
+tokens/
+.tokens/
+*.pickle
+secrets.local.*
+credentials.json
+service-account*.json
+
+# ── Local runtime data: machine-specific, often large, never shared ─────────
+# output/ currently holds 344 MB of logs, prompts, backtest artefacts and
+# database files. None of it belongs in git; all of it is reproducible or
+# archivable separately (§30, and `tp backup` in §39.2).
+output/
+!output/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.db.bak-*
+*.postgres-backup-*
+*.sql
+*.sql.gz
+*.sql.gz.sha256
+
+# ── Version-manager scratch (§38) ──────────────────────────────────────────
+.tp/
+venv/
+.venv/
+env/
+VERSION.local
+
+# ── Build / editor / OS noise ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+dist/
+build/
+node_modules/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
