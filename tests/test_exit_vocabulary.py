@@ -12,6 +12,29 @@ import pytest
 
 from rules.common import EXIT_KINDS, classify_exit
 
+# Declared here rather than imported from tests/test_paper_trading.py. There is
+# no tests/__init__.py, so `from tests.test_paper_trading import CFG` raises
+# ModuleNotFoundError under the suite's rootdir - and adding one to make a
+# cross-import work would change how pytest resolves every module in this
+# directory, which is a large change to make for a shared constant.
+#
+# Limits are wide open on purpose: these tests are about the exit vocabulary
+# and the excursion join, so a buy blocked by a risk limit would be a silent
+# false pass. The limits themselves are tested in test_daily_budget.py and
+# test_drawdown.py.
+CFG = {
+    "trading": {"watch_execute": "WATCH", "trade_size_usd": 100, "max_positions": 3},
+    "paper_trading": {"starting_cash": 500.0},
+    "risk": {
+        "kill_switch_triggered": False,
+        "max_trades_per_day": 1000,
+        "max_daily_loss_usd": 1_000_000,
+        "max_daily_loss_pct": 0,
+        "max_intraday_drawdown_pct": 0,
+        "max_running_drawdown_pct": 0,
+    },
+}
+
 
 # ── §50: the exit vocabulary ────────────────────────────────────────────────
 
@@ -69,7 +92,6 @@ def test_paper_stop_close_writes_both_columns(db):
     """The reason keeps its sentence; the kind becomes countable."""
     from engine import paper_trader
     from learning.pattern_database import PatternDatabase
-    from tests.test_paper_trading import CFG
 
     paper_trader.ensure_seeded(db, CFG)
     pdb = PatternDatabase(db)
@@ -89,7 +111,6 @@ def test_prose_close_leaves_exit_kind_null(db):
     bucket nobody measured."""
     from engine import paper_trader
     from learning.pattern_database import PatternDatabase
-    from tests.test_paper_trading import CFG
 
     paper_trader.ensure_seeded(db, CFG)
     pdb = PatternDatabase(db)
@@ -225,7 +246,6 @@ def test_paper_buy_links_the_pattern_to_its_position(db):
     """The whole point of §51: trade_id stops being NULL on every row."""
     from engine import paper_trader
     from learning.pattern_database import PatternDatabase
-    from tests.test_paper_trading import CFG
 
     paper_trader.ensure_seeded(db, CFG)
     pdb = PatternDatabase(db)

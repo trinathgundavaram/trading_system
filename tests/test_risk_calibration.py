@@ -9,6 +9,25 @@ import pytest
 
 from engine.portfolio_risk import _position_atr_pct, _position_risk_band_pct
 
+# Declared here rather than imported from tests/test_paper_trading.py - there is
+# no tests/__init__.py, so a cross-import raises ModuleNotFoundError, and adding
+# one would change how pytest resolves every module in this directory.
+#
+# watch_execute: "WATCH" is LOAD-BEARING, not boilerplate - see
+# test_high_vol_count_uses_atr_units.
+CFG = {
+    "trading": {"watch_execute": "WATCH", "trade_size_usd": 100, "max_positions": 3},
+    "paper_trading": {"starting_cash": 500.0},
+    "risk": {
+        "kill_switch_triggered": False,
+        "max_trades_per_day": 1000,
+        "max_daily_loss_usd": 1_000_000,
+        "max_daily_loss_pct": 0,
+        "max_intraday_drawdown_pct": 0,
+        "max_running_drawdown_pct": 0,
+    },
+}
+
 
 # ── §53: the units ──────────────────────────────────────────────────────────
 
@@ -62,15 +81,31 @@ def test_unusable_entry_atr_falls_back_rather_than_raising():
 
 def test_high_vol_count_uses_atr_units(db):
     """End to end: a position that is volatile by ATR but tightly stopped must
-    count toward max_simultaneous_high_vol_positions. Before §53 it did not."""
+    count toward max_simultaneous_high_vol_positions. Before §53 it did not.
+
+    THE cfg MUST SAY WHICH BOOK. PortfolioRiskEngine.evaluate() selects the
+    book from cfg["trading"]["watch_execute"] - in WATCH mode the SIMULATED
+    book is the portfolio being risk-managed, otherwise only the real one
+    counts. A cfg without a `trading` key resolves to the real book, so this
+    test's simulated position was invisible and the count came back 0 while
+    the code under test was working correctly.
+
+    That is worth a comment rather than a quiet fix: a portfolio-risk test
+    that does not state its book is not testing what it says it is, and
+    "silently read the other book" is the §7/§16 failure mode wearing a
+    different hat.
+    """
     from engine.portfolio_risk import PortfolioRiskEngine
 
-    cfg = {"portfolio_risk": {"enabled": True, "high_vol_atr_pct_threshold": 5.0,
+    cfg = {"trading": {"watch_execute": "WATCH"},
+           "portfolio_risk": {"enabled": True, "high_vol_atr_pct_threshold": 5.0,
                               "max_simultaneous_high_vol_positions": 1,
                               "min_positions_for_concentration_block": 99,
                               "hard_block_on_severe_breach": False}}
     pid = db.open_position("VOL", 100.0, 1.0, 100.0, simulated=True)
     assert pid is not None
+    # Stop 4% from entry, ATR 8% of price. The proxy says 4.0 (below the 5.0
+    # threshold, so uncounted); the persisted ATR says 8.0 (counted).
     db.update_position_by_ticker("VOL", {"current_stop_price": 96.0,
                                           "entry_atr_pct": 8.0}, simulated=True)
 
@@ -79,9 +114,29 @@ def test_high_vol_count_uses_atr_units(db):
     assert res.size_multiplier == 0.0    # at the cap, candidate would add another
 
 
+def test_high_vol_count_would_have_missed_this_before_53(db):
+    """The control for the test above: strip entry_atr_pct and the same
+    position stops counting, because the proxy reads 4.0 against a 5.0
+    threshold. This is the bug, pinned - if someone reverts _position_atr_pct
+    to the proxy, the test above fails and this one still passes, which says
+    plainly what changed."""
+    from engine.portfolio_risk import PortfolioRiskEngine
+
+    cfg = {"trading": {"watch_execute": "WATCH"},
+           "portfolio_risk": {"enabled": True, "high_vol_atr_pct_threshold": 5.0,
+                              "max_simultaneous_high_vol_positions": 1,
+                              "min_positions_for_concentration_block": 99,
+                              "hard_block_on_severe_breach": False}}
+    db.open_position("VOL", 100.0, 1.0, 100.0, simulated=True)
+    db.update_position_by_ticker("VOL", {"current_stop_price": 96.0},
+                                 simulated=True)      # no entry_atr_pct
+
+    res = PortfolioRiskEngine(db).evaluate("NEWV", "Tech", 1.0, 100.0, 9.0, cfg)
+    assert res.high_vol_position_count == 0
+
+
 def test_paper_buy_persists_entry_atr_pct(db):
     from engine import paper_trader
-    from tests.test_paper_trading import CFG
 
     paper_trader.ensure_seeded(db, CFG)
     paper_trader.execute_buy(db, CFG, "ASTS", 20.0,
@@ -96,7 +151,6 @@ def test_reset_clears_the_equity_curve(db):
     downward re-seed reads as a 33% intraday drawdown (v1.3.1). The epoch guard
     handles a re-seed; a RESET should have nothing to guard against."""
     from engine import paper_trader
-    from tests.test_paper_trading import CFG
 
     paper_trader.ensure_seeded(db, CFG)
     db.record_paper_equity({"total_value": 1000.0, "cash": 1000.0, "n_open": 0})
