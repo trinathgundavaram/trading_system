@@ -51,3 +51,32 @@ repos:
         language: system
         pass_filenames: false
         files: ^requirements\.txt$
+
+      # §12 (Phase 2 step 2.1). The suite is safe to run from a hook only
+      # because tests/conftest.py now pins POSTGRES_DB away from production -
+      # before 2026-07-25 this hook would have corrupted the live database on
+      # every commit. Read that file's docstring before changing this.
+      #
+      # -x stops at the first failure: a pre-commit hook that prints 40
+      # tracebacks gets bypassed with --no-verify, and a hook that is routinely
+      # bypassed is not a hook.
+      - id: pytest-fast
+        name: pytest (unit)
+        entry: python3 -m pytest tests/ -q -x -m 'not slow'
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      # Complements gitleaks rather than duplicating it: this catches the shape
+      # `NAME = "long-opaque-string"` in any staged file, including the .py and
+      # .md files where a key gets pasted "just to test something".
+      # Kept to ONE line on purpose. As a folded YAML scalar this becomes a
+      # single shell command; broken across lines, `xargs -r grep -lEi` and its
+      # pattern end up on separate lines and grep reads the pattern as a
+      # filename. That failure mode exits 0 - a security hook that silently
+      # passes - so it is worth the long line.
+      - id: no-secrets
+        name: block committed secrets
+        entry: bash scripts/hooks/check_no_secrets.sh
+        language: system
+        pass_filenames: false

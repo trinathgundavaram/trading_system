@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from storage.database import Database
 from learning.pattern_database import PatternDatabase
 from engine import paper_trader
 
@@ -23,9 +22,12 @@ CFG = {
 }
 
 
-@pytest.fixture()
-def db(tmp_path):
-    return Database(path=str(tmp_path / "test_paper.db"))
+# The `db` fixture now comes from tests/conftest.py: a real ephemeral
+# Postgres with a clean schema per test (§12). This module used to define its
+# own `db` fixture as `Database(path=tmp_path / "...")`, which LOOKED isolated
+# and was not - `path` has been a dead parameter since the 2026-07-21 Postgres
+# migration, so every one of these tests ran against the production database.
+# See tests/conftest.py for the incident that made this urgent.
 
 
 def test_is_watch_mode():

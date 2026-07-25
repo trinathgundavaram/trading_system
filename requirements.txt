@@ -80,6 +80,21 @@ tabulate==0.9.0
 # -----------------------------------------------------------------------------
 pytest==8.3.4
 pre-commit==4.0.1
+pytest-cov==6.0.0
+
+# §12 (Phase 2 step 2.1) - OPTIONAL, and the suite runs without it.
+#
+# pytest-postgresql starts a genuinely throwaway server per session, which is
+# the best isolation available. It is not pinned as a hard requirement because
+# it pulls psycopg3 (a SECOND driver alongside the psycopg2 this codebase
+# actually uses) and needs libpq present, and a test harness that cannot be
+# installed is a test harness that does not get run.
+#
+# Without it, tests/conftest.py creates a scratch DATABASE on the Postgres you
+# already run locally - no new dependency, same safety guarantee. Install this
+# only if you want per-session server isolation as well:
+#   pip install 'pytest-postgresql>=6'
+#   pytest-postgresql==6.1.1
 
 # -----------------------------------------------------------------------------
 #  NOTES
