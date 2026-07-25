@@ -26,9 +26,48 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-FILE="${1:?usage: apply_migration.sh <file.sql> [--yes]}"
-[ -f "$FILE" ] || { echo "FAIL: no such file: $FILE"; exit 1; }
-ASSUME_YES="${2:-}"
+# Arguments in any order, so `--yes <file>` works as well as `<file> --yes`.
+# `${1:?msg}` was the first version of this and it renders as
+# "apply_migration.sh: line 29: 1: usage: ..." - bash prefixing the parameter
+# name and line number onto the message. That reads like an internal error
+# rather than a usage note, which is the wrong first impression from a script
+# whose entire job is to be trusted with the production database.
+FILE=""
+ASSUME_YES=""
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) ASSUME_YES='--yes' ;;
+    -h|--help) FILE="" ; break ;;
+    *) [ -n "$FILE" ] || FILE="$arg" ;;
+  esac
+done
+
+usage() {
+  cat >&2 <<USAGE
+usage: ./scripts/apply_migration.sh <file.sql> [--yes]
+
+Applies one migration to the database this project actually uses, resolving
+the connection the same way storage/database.py does.
+
+Keep it on ONE line - a newline before the filename leaves this script with no
+argument and hands the .sql file to your shell as a command.
+
+Available:
+USAGE
+  for f in migrations/*.sql; do
+    printf '  %s\n' "$f" >&2
+  done
+  echo >&2
+  echo "e.g.  ./scripts/apply_migration.sh migrations/007_learning_data_quarantine.sql" >&2
+}
+
+if [ -z "$FILE" ]; then usage; exit 2; fi
+if [ ! -f "$FILE" ]; then
+  echo "FAIL: no such file: $FILE" >&2
+  echo >&2
+  usage
+  exit 1
+fi
 
 # Read the POSTGRES_* keys out of .env WITHOUT sourcing it.
 #
@@ -72,7 +111,14 @@ esac
 
 echo "file:     $FILE"
 echo "database: $DB  ($USER_@$HOST:$PORT)"
-grep -m1 '^-- rollback_safe' "$FILE" 2>/dev/null || true
+# The rollback_safe claim, shown BEFORE the prompt - it is the one fact you
+# want in front of you at the moment you decide. Matched anywhere in a comment
+# rather than at line start: every migration writes it mid-sentence
+# ("Purely additive, nullable. rollback_safe: true."), and the first version of
+# this anchored on '^-- rollback_safe', so it silently matched nothing and the
+# prompt appeared with no safety note at all.
+ROLLBACK=$(grep -m1 -o 'rollback_safe: *[a-z]*' "$FILE" 2>/dev/null || true)
+echo "rollback: ${ROLLBACK:-not stated in this file - read it before applying}"
 
 if [ "$ASSUME_YES" != '--yes' ]; then
   read -rp "Apply to '$DB'? [y/N] " ok
