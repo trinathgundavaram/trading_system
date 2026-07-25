@@ -891,7 +891,7 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                 try:
                     paper_trader.execute_sell(db, ticker, td.price,
                                                reason=f"sell_rules:{sell_result.reason}",
-                                               pattern_db=pattern_db)
+                                               pattern_db=pattern_db, cfg=cfg)
                 except Exception as e:
                     logger.error(f"{ticker}: paper sell failed: {e}", exc_info=True)
             elif live_mode and position and not position.get("simulated"):
@@ -1010,7 +1010,7 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
             try:
                 paper_trader.execute_sell(db, ticker, td.price,
                                            reason=f"sell_rules:{paper_sell_result.reason}",
-                                           pattern_db=pattern_db)
+                                           pattern_db=pattern_db, cfg=cfg)
             except Exception as e:
                 logger.error(f"{ticker}: paper sell (mode-independent check) failed: {e}", exc_info=True)
 
@@ -1157,7 +1157,7 @@ def _run_cycle_tail(mkt, cfg: dict, trading_mode: str, regime, packets: list,
                 try:
                     paper_trader.execute_sell(db, a["ticker"], price,
                                                reason=f"loop_b_urgent:{pa['label']}",
-                                               pattern_db=pattern_db)
+                                               pattern_db=pattern_db, cfg=cfg)
                 except Exception as e:
                     logger.error(f"{a['ticker']}: paper urgent exit failed: {e}", exc_info=True)
             elif live_mode_cycle and not (a.get("position") or {}).get("simulated"):
@@ -1314,6 +1314,19 @@ def _run_cycle_tail(mkt, cfg: dict, trading_mode: str, regime, packets: list,
         "duration_sec": round(duration, 1),
         "triggered_by": triggered_by,
     })
+
+    # §9 (Phase 2): belt and braces. Both sell paths already check the breaker
+    # after every close, so this should never be the one that trips it - but
+    # "should never" is why the original had zero call sites. A close that
+    # bypassed those paths, or a loss booked by confirm_fill.py between cycles,
+    # gets caught here at the cost of one query per cycle.
+    try:
+        from rules.risk_rules import trip_kill_switch_if_needed
+        if trip_kill_switch_if_needed(db, cfg):
+            logger.critical("Kill switch tripped at end of cycle - "
+                            "a close outside the normal sell paths breached the limit")
+    except Exception as e:
+        logger.error(f"End-of-cycle kill-switch check failed: {e}", exc_info=True)
 
 
 def evaluate_single_ticker(ticker: str, cfg: dict = None) -> dict | None:
@@ -1604,7 +1617,7 @@ def _price_watch_loop():
                             paper_trader.execute_sell(
                                 db, ticker, price,
                                 reason=f"price_watch:{reason.split(' ')[0]}",
-                                pattern_db=pattern_db)
+                                pattern_db=pattern_db, cfg=cfg)
                         # (real position, live not armed) - advisory only via
                         # the log line above; no order placed, matching the
                         # scan-cycle sell-rule path's behavior for the same case.

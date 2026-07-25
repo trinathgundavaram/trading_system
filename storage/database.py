@@ -294,7 +294,16 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     winning_trades INTEGER DEFAULT 0,
     realized_pnl REAL DEFAULT 0,
     max_drawdown REAL DEFAULT 0,
-    kill_switch_triggered INTEGER DEFAULT 0
+    kill_switch_triggered INTEGER DEFAULT 0,
+    -- §7/§8 (Phase 2). The paper book keeps its OWN counters rather than
+    -- sharing the live ones. Two reasons: a paper session and a live session
+    -- must not consume each other's daily budget, and `realized_pnl` is
+    -- audited as real-money-only - a guarantee worth preserving rather than
+    -- quietly widening. db.trades_placed_today()/realized_pnl_today() resolve
+    -- the right column, so no caller needs to know which one it landed in.
+    paper_trades_placed INTEGER DEFAULT 0,
+    paper_winning_trades INTEGER DEFAULT 0,
+    paper_realized_pnl REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS logs (
@@ -815,6 +824,13 @@ class Database:
         self._add_column_if_missing(conn, "positions", "quarantined_stop_price", "REAL")
         self._add_column_if_missing(conn, "positions", "quarantined_stop_state", "TEXT")
         self._add_column_if_missing(conn, "positions", "quarantined_at", "TEXT")
+        # §7/§8: per-book daily counters. Mirrors migrations/004.
+        self._add_column_if_missing(conn, "daily_stats", "paper_trades_placed",
+                                     "INTEGER DEFAULT 0")
+        self._add_column_if_missing(conn, "daily_stats", "paper_winning_trades",
+                                     "INTEGER DEFAULT 0")
+        self._add_column_if_missing(conn, "daily_stats", "paper_realized_pnl",
+                                     "REAL DEFAULT 0")
 
     def _migrate_rotation_log(self, conn):
         """Portfolio Rotation Engine (engine/rotation.py, 2026-07-17): one row
@@ -2437,15 +2453,29 @@ class Database:
             entry_price, shares = row["entry_price"], row["shares"]
             pnl = (exit_price - entry_price) * shares if entry_price and shares else 0.0
             pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price else 0.0
-            if not simulated:
-                today = date.today().isoformat()
-                conn.execute(
-                    """INSERT INTO daily_stats (date, realized_pnl, winning_trades) VALUES (?, ?, ?)
-                       ON CONFLICT(date) DO UPDATE SET
-                         realized_pnl = daily_stats.realized_pnl + excluded.realized_pnl,
-                         winning_trades = daily_stats.winning_trades + excluded.winning_trades""",
-                    (today, pnl, 1 if pnl > 0 else 0),
-                )
+            # §8 (Phase 2): BOTH books now record. This used to be
+            # `if not simulated`, on the reasoning that daily_stats feeds the
+            # risk engine's max_daily_loss guard and must report real money
+            # only. That was sound while paper trading was a display feature.
+            # It stopped being sound the moment paper became the primary
+            # operating mode, because it meant the $500 daily loss limit read
+            # $0.00 every day, forever, on the only book that was trading.
+            #
+            # Separate columns, not a shared one: a paper drawdown trips the
+            # paper session's limit without contaminating the live ledger, so
+            # the real-money-only guarantee on `realized_pnl` - which is what
+            # the auditors of that column actually needed - is preserved
+            # exactly.
+            today = date.today().isoformat()
+            pnl_col = "paper_realized_pnl" if simulated else "realized_pnl"
+            win_col = "paper_winning_trades" if simulated else "winning_trades"
+            conn.execute(
+                f"""INSERT INTO daily_stats (date, {pnl_col}, {win_col}) VALUES (?, ?, ?)
+                    ON CONFLICT(date) DO UPDATE SET
+                      {pnl_col} = daily_stats.{pnl_col} + excluded.{pnl_col},
+                      {win_col} = daily_stats.{win_col} + excluded.{win_col}""",
+                (today, pnl, 1 if pnl > 0 else 0),
+            )
             return {
                 "ticker": ticker, "entry_price": entry_price, "entry_time": row["entry_time"],
                 "shares": shares, "pattern_id": row.get("pattern_id"),
@@ -2838,7 +2868,98 @@ class Database:
             return dict(row) if row else {
                 "date": today, "cycles_run": 0, "signals_generated": 0, "trades_placed": 0,
                 "winning_trades": 0, "realized_pnl": 0.0, "max_drawdown": 0.0, "kill_switch_triggered": 0,
+                "paper_trades_placed": 0, "paper_winning_trades": 0, "paper_realized_pnl": 0.0,
             }
+
+    # ---------- per-book daily counters (§7, §8, Phase 2) ----------
+    def record_trade_placed(self, simulated: bool):
+        """Increment today's trade counter for the relevant book.
+
+        Deliberately NOT log_trade(). The `trades` table is the real-fill
+        ledger, and writing simulated fills into it would destroy the one
+        clean separation the schema still has. This separates the LEDGER from
+        the COUNTER: paper trading gets a budget without pretending its fills
+        are real.
+
+        Before this (§7), `trades_placed` was incremented only by
+        live_trader.py and confirm_fill.py, so RiskEngine read 0 forever on a
+        paper-only deployment - 31 buys across seven days against a 10/day
+        cap, reporting "0 trades placed" every single day.
+        """
+        col = "paper_trades_placed" if simulated else "trades_placed"
+        today = date.today().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                f"""INSERT INTO daily_stats (date, {col}) VALUES (?, 1)
+                    ON CONFLICT(date) DO UPDATE SET {col} = daily_stats.{col} + 1""",
+                (today,),
+            )
+
+    def trades_placed_today(self, simulated: bool) -> int:
+        """Today's trade count for the requested book. Callers use this rather
+        than reading a column name, so neither book can accidentally read the
+        other's budget."""
+        stats = self.get_daily_stats() or {}
+        key = "paper_trades_placed" if simulated else "trades_placed"
+        return int(stats.get(key, 0) or 0)
+
+    def realized_pnl_today(self, simulated: bool = False) -> float:
+        """Today's realised P&L for the requested book, in LOCAL calendar days.
+
+        rules/risk_rules.py has called this method since it was written; it
+        never existed, so `trip_kill_switch_if_needed` raised AttributeError on
+        its first statement and the automatic kill switch could never fire
+        (§8, §9).
+
+        Local days, not UTC: an evening close at 00:30 UTC belongs to the
+        trading day that just ended, not to tomorrow. The paper branch
+        delegates to paper_realized_pnl_today() rather than reimplementing that
+        conversion - two implementations of the same window is how you get two
+        different answers from the same data.
+        """
+        stats = self.get_daily_stats() or {}
+        if not simulated:
+            return float(stats.get("realized_pnl", 0.0) or 0.0)
+
+        # The LEDGER is authoritative for paper. paper_trades is itemised and
+        # is what the Journal shows; daily_stats.paper_realized_pnl is an
+        # accumulator written by close_position for O(1) reads and for the
+        # §7 backfill.
+        ledger = self.paper_realized_pnl_today()
+
+        # Two records of the same quantity is how S-2 happened on the live
+        # book: `trades` and `realized_pnl` disagreed about 2026-07-24 and
+        # nothing noticed, because nothing ever compared them. Comparing them
+        # costs one float subtraction, so there is no reason not to.
+        accumulator = float(stats.get("paper_realized_pnl", 0.0) or 0.0)
+        if abs(ledger - accumulator) > 0.01:
+            logger.warning(
+                f"paper realised P&L disagrees for today: ledger(paper_trades)="
+                f"{ledger:.2f} vs accumulator(daily_stats)={accumulator:.2f}. "
+                f"Using the ledger. A close that skipped log_paper_trade, or a "
+                f"log_paper_trade with no matching close, will do this.")
+        return ledger
+
+    def set_kill_switch(self, on: bool, reason: str = None):
+        """Mirror the kill-switch state into today's daily_stats row.
+
+        config.yaml remains the authority - rules/risk_rules.py writes there,
+        and every gate reads there. This is the audit trail: "was the breaker
+        tripped on the 24th?" is a question about a day, and config.yaml only
+        ever holds the answer for today.
+        """
+        today = date.today().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO daily_stats (date, kill_switch_triggered) VALUES (?, ?)
+                   ON CONFLICT(date) DO UPDATE SET kill_switch_triggered = excluded.kill_switch_triggered""",
+                (today, 1 if on else 0),
+            )
+        if reason:
+            try:
+                self.log("CRITICAL" if on else "WARNING", reason)
+            except Exception:
+                pass
 
     def paper_realized_pnl_today(self) -> float:
         """Sum of today's PAPER sell P/L, for the dashboard's Realized P&L

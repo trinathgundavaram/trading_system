@@ -306,9 +306,31 @@ cmd_remove() {
 # ── backup [tag] (§39.2) ────────────────────────────────────────────────────
 cmd_backup() {
   local tag="${1:-$(cat "$TP_ROOT/PRIMARY" 2>/dev/null || echo '')}"
-  [ -n "$tag" ] || die "no primary set - usage: tp backup <tag>"
-  local db ts out; db=$(_db "$tag")
-  [ -n "$db" ] || die "unknown version: $tag"
+  local db ts out
+
+  if [ -n "$tag" ]; then
+    db=$(_db "$tag")
+    [ -n "$db" ] || die "unknown version: $tag"
+  else
+    # No version manager in use (S-3, 2026-07-25). `tp install` has never been
+    # run on this machine, so there is no registry and no PRIMARY - and the
+    # previous behaviour was to die, which meant the ONE command whose whole
+    # job is "make sure a restore point exists" refused to run on the setup
+    # that most needed it. The 2026-07-25 incident had no restore point for
+    # exactly this reason.
+    #
+    # Fall back to the database the checkout in $REPO actually uses. Same
+    # resolution order as storage/database.py: POSTGRES_DB, else the default.
+    tag='working'
+    db="${POSTGRES_DB:-}"
+    if [ -z "$db" ] && [ -f "$REPO/.env" ]; then
+      db=$(grep -E '^(export )?POSTGRES_DB=' "$REPO/.env" 2>/dev/null \
+           | tail -1 | sed 's/.*=//' | tr -d '"'"'"'' || true)
+    fi
+    db="${db:-trading_platform}"
+    note "no PRIMARY set - backing up the working checkout's database ($db)"
+    note "run 'tp install <tag>' if you want per-version databases (§38)"
+  fi
   ts=$(date +%Y%m%d_%H%M%S)
   out="$TP_ROOT/archive/${tag}_${ts}.sql.gz"
   mkdir -p "$TP_ROOT/archive"
@@ -324,6 +346,82 @@ cmd_backup() {
   echo "  destination - but NEVER to the git remote. A dump contains your"
   echo "  positions, account activity and entire signal history. It is more"
   echo "  sensitive than the code."
+}
+
+# ── autobackup (S-3) ────────────────────────────────────────────────────────
+# `tp backup` only helps if something runs it. On 2026-07-25 a test suite wiped
+# the paper ledger and there was no restore point, because nothing ever had.
+# A daily launchd job is the smallest thing that fixes that permanently -
+# deliberately NOT tied to the scheduler, so backups keep happening on days the
+# scheduler is stopped, which are exactly the days you are changing things.
+AUTOBACKUP_LABEL="com.tradingplatform.autobackup"
+_autobackup_plist() { echo "$HOME/Library/LaunchAgents/$AUTOBACKUP_LABEL.plist"; }
+
+cmd_autobackup() {
+  local action="${1:-status}"
+  local plist; plist=$(_autobackup_plist)
+
+  case "$action" in
+    install)
+      [ "$(uname -s)" = Darwin ] || die "autobackup is launchd-only; on Linux use a systemd timer or cron"
+      mkdir -p "$HOME/Library/LaunchAgents" "$TP_ROOT/archive"
+      cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$AUTOBACKUP_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$REPO/scripts/tp</string>
+    <string>backup</string>
+  </array>
+  <key>WorkingDirectory</key><string>$REPO</string>
+  <!-- 02:30 local. After the close, before any morning work. -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>30</integer></dict>
+  <!-- The Mac is usually asleep at 02:30. RunAtLoad plus this means the job
+       fires on the next wake instead of being skipped silently, which is the
+       classic way a scheduled backup turns out never to have run. -->
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>$TP_ROOT/archive/autobackup.log</string>
+  <key>StandardErrorPath</key><string>$TP_ROOT/archive/autobackup.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$PATH</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>TP_ROOT</key><string>$TP_ROOT</string>
+  </dict>
+</dict>
+</plist>
+PLIST
+      launchctl bootout "gui/$(id -u)/$AUTOBACKUP_LABEL" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$plist"
+      echo "installed $AUTOBACKUP_LABEL (daily 02:30, and once now)"
+      echo "  log: $TP_ROOT/archive/autobackup.log"
+      ;;
+    uninstall)
+      launchctl bootout "gui/$(id -u)/$AUTOBACKUP_LABEL" 2>/dev/null || true
+      rm -f "$plist"
+      echo "removed $AUTOBACKUP_LABEL"
+      ;;
+    status)
+      if launchctl list 2>/dev/null | grep -q "$AUTOBACKUP_LABEL"; then
+        note "ok: $AUTOBACKUP_LABEL is loaded"
+      else
+        note "NOT installed - run: tp autobackup install"
+      fi
+      local newest
+      newest=$(ls -t "$TP_ROOT/archive/"*.sql.gz 2>/dev/null | head -1 || true)
+      if [ -n "$newest" ]; then
+        echo "  newest dump: $newest ($(du -h "$newest" | cut -f1))"
+      else
+        echo "  no dumps in $TP_ROOT/archive"
+      fi
+      ;;
+    *) die "usage: tp autobackup install|uninstall|status" ;;
+  esac
 }
 
 # ── doctor (§39.3) ──────────────────────────────────────────────────────────
@@ -418,6 +516,8 @@ tp - trading_platform version manager (§38, §39)
   tp secrets import [file] [--shred]
                               mirror .env into the Keychain
   tp backup [tag]             verified, pruned pg_dump into ~/tp/archive
+  tp autobackup install|uninstall|status
+                              daily launchd job that runs `tp backup`
   tp doctor                   standing audit - run before any push, and monthly
 
 Everyday use:
@@ -435,6 +535,7 @@ case "${1:-}" in
   patch)   shift; cmd_patch "$@" ;;
   remove)  shift; cmd_remove "$@" ;;
   backup)  shift; cmd_backup "$@" ;;
+  autobackup) shift; cmd_autobackup "$@" ;;
   doctor)  shift; cmd_doctor "$@" ;;
   secrets)
     shift

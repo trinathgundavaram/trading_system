@@ -81,6 +81,15 @@ screener:
     min_stale_block_rate_to_exclude: 0.5
 risk_level: TURBO
 risk:
+  # §8 (Phase 2): the TIGHTER of these two binds.
+  #
+  # max_daily_loss_usd was $500 against a $1,000 paper account - a limit that
+  # only triggers after losing half the account is a number, not a limit. The
+  # percentage resolves against the book's actual equity, so it scales with
+  # the account instead of being re-guessed every time the account changes.
+  # On $1,000 that is a $20 daily stop; against the observed -$15.25 over four
+  # days it would have halted the session on day one.
+  max_daily_loss_pct: 2.0
   max_daily_loss_usd: 500
   max_trades_per_day: 10
   max_position_size_usd: 500

@@ -58,6 +58,38 @@ def notify_buy_signal(cfg: dict, ticker: str, pct_score: float, regime: str = ""
     )
 
 
+def send_critical(title: str, message: str):
+    """A notification that IGNORES notifications.enabled (§9).
+
+    Every other notifier here is courtesy: a buy signal you can catch on the
+    next cycle. This one exists for events where the system has stopped itself
+    - the automatic kill switch - and those must reach you even if you muted
+    the noisy ones. Someone who turned notifications off to stop buy-signal
+    chatter has not consented to missing "TRADING HALTED".
+
+    Takes no cfg, deliberately: it must be callable from rules/risk_rules.py
+    without threading config through, and there is no configuration under
+    which suppressing this would be the right behaviour.
+    """
+    if sys.platform != "darwin":
+        logger.critical(f"{title}: {message}")
+        return
+
+    def esc(s: str) -> str:
+        return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+    script = (f'display notification "{esc(message)}" with title "{esc(title)}" '
+              f'subtitle "Trading Platform" sound name "Basso"')
+    try:
+        subprocess.run(["osascript", "-e", script], check=True, timeout=5,
+                        capture_output=True)
+    except Exception as e:
+        logger.warning(f"Critical notification failed ({e}): {title} - {message}")
+    # Log it regardless of whether the desktop notification landed. The log is
+    # the durable record; the banner is the interrupt.
+    logger.critical(f"{title}: {message}")
+
+
 def notify_urgent_exit(cfg: dict, ticker: str, reason: str):
     notify(
         cfg,

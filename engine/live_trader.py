@@ -561,6 +561,15 @@ def execute_sell_live(db, cfg: dict, ticker: str, reason: str, pattern_db=None,
         db.log_ui_event("live_sell", {"ticker": ticker, "price": fill_price, "reason": reason,
                                        "pnl": round(closed.get("pnl", 0), 2),
                                        "pnl_pct": round(closed.get("pnl_pct", 0), 2)})
+
+        # §9 (Phase 2): the breaker is checked after every real close. On this
+        # path it matters most - a cascade here is spending actual money.
+        try:
+            from rules.risk_rules import trip_kill_switch_if_needed
+            trip_kill_switch_if_needed(db, cfg, simulated=False)
+        except Exception as e:
+            logger.error(f"{ticker}: [LIVE] kill-switch check failed: {e}", exc_info=True)
+
         return closed
     except Exception as e:
         breaker.record(False, error=str(e)[:200])

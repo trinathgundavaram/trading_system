@@ -1,12 +1,19 @@
 """Risk guardrails + kill switch. Used by engine/executor.py's safety chain -
 these are per-trade / per-day account-level checks, distinct from market_filters.py
 (which are market-wide) and buy/sell_rules.py (which are per-ticker signal rules)."""
+import json
+import logging
+import re
+import os
 from dataclasses import dataclass
+from datetime import datetime
 
 import yaml
 
 from config_loader import CONFIG_PATH
 from rules.common import RuleResult
+
+logger = logging.getLogger("trading")
 
 
 def check_kill_switch(cfg) -> RuleResult:
@@ -71,47 +78,235 @@ class LegacyRiskEngine:
         return RiskCheckResult(True, "OK")
 
 
+def _default_simulated(cfg: dict) -> bool:
+    """Which book is this deployment actually trading?
+
+    WATCH (or anything that is not EXECUTE) means the paper book is the one
+    placing trades, so it is the one whose budget matters. Defaulting to the
+    LIVE counters during a paper session is how the daily limits came to read
+    zero forever (§7)."""
+    return str((cfg.get("trading", {}) or {})
+               .get("watch_execute", "WATCH")).upper() != "EXECUTE"
+
+
+def daily_loss_limit(db, cfg: dict, simulated: bool) -> float:
+    """Today's loss limit as a POSITIVE dollar figure: the TIGHTER of the
+    absolute cap and a percentage of the book's actual equity (§8).
+
+    max_daily_loss_usd was $500 against a $1,000 paper account. A limit that
+    only triggers after losing half the account is not a limit - it is a
+    number. Expressed as a percentage it resolves to about $20 on that
+    account, which against the observed -$15.25 over four days would have
+    halted the session on day one and forced the question weeks earlier.
+
+    Falls back to the absolute cap when equity is unknown or the percentage is
+    unset, so an unreadable account can never widen the limit."""
+    risk = cfg.get("risk", {}) or {}
+    absolute = abs(float(risk.get("max_daily_loss_usd", 500) or 500))
+    pct = float(risk.get("max_daily_loss_pct", 0) or 0)
+    if pct <= 0:
+        return absolute
+    try:
+        if simulated:
+            acct = db.get_paper_account() or {}
+            equity = float(acct.get("cash", 0) or 0)
+            snap = None
+            try:
+                from engine.paper_trader import snapshot
+                snap = snapshot(db, cfg=cfg)
+            except Exception:
+                snap = None
+            if snap and snap.get("market_value") is not None:
+                equity += float(snap.get("market_value") or 0)
+            else:
+                equity += sum(float(p.get("dollar_amount") or 0)
+                              for p in db.get_all_positions(simulated=True))
+        else:
+            equity = sum(float(p.get("dollar_amount") or 0)
+                         for p in db.get_all_positions(simulated=False))
+    except Exception:
+        return absolute
+    return min(absolute, equity * pct / 100.0) if equity > 0 else absolute
+
+
 class RiskEngine:
     """Dict-access `cfg` version used by the ACTIVE scheduler.py flow.
-    Constructed once per cycle as RiskEngine(db, cfg); .check() takes no args
-    and returns a plain dict ({"can_trade": bool, "reason": str}) matching
-    scheduler.py's `risk_check["can_trade"]` / `risk_check["reason"]` usage."""
+    Constructed as RiskEngine(db, cfg[, simulated]); .check() takes no args and
+    returns a plain dict ({"can_trade": bool, "reason": str}) matching
+    scheduler.py's `risk_check["can_trade"]` / `risk_check["reason"]` usage.
 
-    def __init__(self, db, cfg: dict):
+    BOOK-AWARE as of §7. It previously read `trades_placed` and `realized_pnl`
+    unconditionally - the LIVE columns - which on a paper-only deployment are
+    both permanently zero. The result was a risk engine that answered
+    can_trade: True to every question it was ever asked.
+    """
+
+    def __init__(self, db, cfg: dict, simulated: bool = None):
         self.db = db
         self.cfg = cfg
+        self.simulated = _default_simulated(cfg) if simulated is None else simulated
 
     def check(self) -> dict:
         cfg = self.cfg
-        if cfg["risk"]["kill_switch_triggered"]:
+        if (cfg.get("risk", {}) or {}).get("kill_switch_triggered"):
             return {"can_trade": False, "reason": "Kill switch is ON"}
 
-        stats = self.db.get_daily_stats()
-        trades_today = stats.get("trades_placed", 0)
-        if trades_today >= cfg["risk"]["max_trades_per_day"]:
-            return {"can_trade": False,
-                    "reason": f"{trades_today}/{cfg['risk']['max_trades_per_day']} trades today"}
+        book = "paper" if self.simulated else "live"
 
-        realized = stats.get("realized_pnl", 0.0)
-        if realized <= -abs(cfg["risk"]["max_daily_loss_usd"]):
+        trades_today = self.db.trades_placed_today(self.simulated)
+        max_trades = int(cfg["risk"]["max_trades_per_day"])
+        if trades_today >= max_trades:
             return {"can_trade": False,
-                    "reason": f"daily loss ${realized:.2f} breached -${cfg['risk']['max_daily_loss_usd']}"}
+                    "reason": f"{trades_today}/{max_trades} {book} trades today"}
+
+        realized = self.db.realized_pnl_today(simulated=self.simulated)
+        limit = daily_loss_limit(self.db, cfg, self.simulated)
+        if realized <= -limit:
+            return {"can_trade": False,
+                    "reason": f"{book} daily loss ${realized:.2f} breached -${limit:.2f}"}
 
         return {"can_trade": True, "reason": "OK"}
 
 
-def trip_kill_switch_if_needed(db, cfg) -> bool:
-    """Auto-sets kill_switch_triggered=true in config.yaml (persisted to disk) if the
-    daily loss limit has been breached. Per build note: kill switch requires manual
-    restart + config edit to clear - this function only ever flips it ON, never off."""
-    realized = db.realized_pnl_today()
-    if realized <= -abs(cfg.risk.max_daily_loss_usd) and not cfg.risk.kill_switch_triggered:
-        with open(CONFIG_PATH, "r") as f:
-            raw = yaml.safe_load(f)
-        raw["risk"]["kill_switch_triggered"] = True
-        with open(CONFIG_PATH, "w") as f:
-            yaml.safe_dump(raw, f, sort_keys=False)
-        db.set_kill_switch(True)
-        db.log("CRITICAL", f"KILL SWITCH TRIPPED - daily loss ${realized:.2f} breached limit")
-        return True
-    return False
+_KILL_LINE = re.compile(r"^(\s*)kill_switch_triggered:\s*(?:false|False|no|off)\s*$",
+                        re.MULTILINE)
+_KILL_TRUE = re.compile(r"^\s*kill_switch_triggered:\s*(?:true|True|yes|on)\s*$",
+                        re.MULTILINE)
+
+
+def _persist_kill_switch(reason: str):
+    """Flip kill_switch_triggered to true in config.yaml, atomically, WITHOUT
+    reserialising the file.
+
+    A yaml.safe_dump round-trip would strip every comment in config.yaml - and
+    that file is where the reasoning behind each risk threshold is recorded.
+    Destroying the documentation at the exact moment the system halts itself,
+    when the next thing a human does is open that file to understand why, is a
+    bad trade. So this is a targeted single-line substitution, with a
+    round-trip only as the fallback for a config that does not match the
+    expected shape.
+
+    The atomic replace is not incidental either: config.yaml is re-read on
+    every call by design (hot reload), so a partially-written file during a
+    loss event would crash the scheduler at precisely the moment you need it
+    to stop trading in an orderly way.
+    """
+    text = CONFIG_PATH.read_text()
+    # json.dumps, NOT yaml.safe_dump. safe_dump serialises a bare scalar as a
+    # whole DOCUMENT and appends "...", YAML's end-of-document marker - which
+    # lands in the middle of the file and truncates everything after it at
+    # parse time. A JSON string is a valid YAML double-quoted scalar and has
+    # no such framing. (Caught by test_persist_preserves_config_comments; the
+    # first hand-check of this missed it because it only inspected keys that
+    # happened to sit BEFORE the injected marker.)
+    stamped = f"  kill_switch_reason: {json.dumps(reason)}\n"
+
+    new, n = _KILL_LINE.subn(
+        lambda m: f"{m.group(1)}kill_switch_triggered: true", text, count=1)
+
+    if n == 0 and _KILL_TRUE.search(text):
+        # Already true. Not the normal path - trip_kill_switch_if_needed()
+        # returns early in that case - but reachable if something calls this
+        # directly, and it must NOT fall through to the reserialising branch
+        # below just because there was nothing to flip.
+        new, n = text, 1
+
+    if n == 1:
+        # Drop any previous reason line, then record this one next to the flag.
+        new = re.sub(r"^\s*kill_switch_reason:.*\n", "", new, flags=re.MULTILINE)
+        new = _KILL_TRUE.sub(lambda m: m.group(0) + "\n" + stamped.rstrip("\n"),
+                             new, count=1)
+        if not new.endswith("\n"):
+            new += "\n"
+    else:
+        # The key is absent entirely - a hand-edited or truncated config. Fall
+        # back to a structural write rather than silently not persisting, and
+        # say plainly what it costs.
+        disk = yaml.safe_load(text) or {}
+        disk.setdefault("risk", {})["kill_switch_triggered"] = True
+        disk["risk"]["kill_switch_reason"] = reason
+        new = yaml.safe_dump(disk, sort_keys=False)
+        logger.warning("kill switch: config.yaml has no kill_switch_triggered "
+                       "key - rewrote it structurally, COMMENTS ARE LOST")
+
+    tmp = CONFIG_PATH.with_suffix(".yaml.tmp")
+    tmp.write_text(new)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def trip_kill_switch_if_needed(db, cfg=None, simulated: bool = None) -> bool:
+    """Auto-arm the kill switch when today's realised loss breaches the limit.
+
+    ONLY EVER FLIPS ON. Clearing it stays a deliberate human act (edit
+    config.yaml, restart), which is correct: the single most dangerous failure
+    mode for an automatic breaker is one that resets itself - a bad day would
+    re-arm the moment the clock rolled over.
+
+    §9 (Phase 2) rewrote this. The previous version was broken in three
+    independent ways and had zero call sites, so none of them had ever
+    surfaced:
+      1. `db.realized_pnl_today()` did not exist - AttributeError on line one.
+      2. `db.set_kill_switch()` did not exist either.
+      3. It used attribute access (`cfg.risk.max_daily_loss_usd`) on what the
+         active scheduler passes as a plain dict.
+    engine/rules_catalog.py meanwhile told the operator it "runs every cycle".
+
+    Returns True only when it actually tripped on this call.
+    """
+    raw = cfg if isinstance(cfg, dict) else None
+    if raw is None:
+        from config_loader import load_config_dict
+        raw = load_config_dict()
+
+    risk = raw.get("risk", {}) or {}
+    if risk.get("kill_switch_triggered"):
+        return False                      # already on; nothing to do, no rewrite
+
+    if simulated is None:
+        simulated = _default_simulated(raw)
+
+    realized = db.realized_pnl_today(simulated=simulated)
+    limit = daily_loss_limit(db, raw, simulated)
+    if realized > -limit:
+        return False
+
+    book = "paper" if simulated else "live"
+    reason = (f"AUTO {datetime.utcnow().isoformat()}Z: {book} realised "
+              f"${realized:.2f} breached -${limit:.2f}")
+
+    # Persist to config.yaml so a process restart does NOT clear it.
+    #
+    # The atomic write is not incidental. config.yaml is re-read on every call
+    # by design (hot reload), so a partially-written file during a loss event
+    # would crash the scheduler at precisely the moment you need it to stop
+    # trading in an orderly way.
+    try:
+        _persist_kill_switch(reason)
+    except Exception as e:
+        # A failed persist must not swallow the event. Keep going: the
+        # in-memory flag, the DB row and the alert still fire, and a loud log
+        # line is better than a silent half-trip.
+        logger.error(f"kill switch: could not persist to config.yaml: {e}")
+
+    # Reflect it in the caller's live dict too, so the current cycle stops
+    # immediately rather than at the next config reload.
+    risk["kill_switch_triggered"] = True
+    risk["kill_switch_reason"] = reason
+
+    try:
+        db.set_kill_switch(True, reason=reason)
+        db.log_ui_event("kill_switch_auto",
+                        {"realized": realized, "limit": limit, "book": book})
+    except Exception as e:
+        logger.error(f"kill switch: could not record to the database: {e}")
+
+    # An automatic kill switch that trips silently at 2pm while you are out is
+    # only half a control.
+    try:
+        from engine.notifications import send_critical
+        send_critical("TRADING HALTED", reason)
+    except Exception as e:
+        logger.error(f"kill switch fired but notification failed: {e}")
+
+    logger.critical(f"KILL SWITCH TRIPPED - {reason}")
+    return True

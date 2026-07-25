@@ -413,7 +413,7 @@ async def paper_sell(body: dict, _: bool = Depends(require_token)):
     from engine.paper_trader import execute_sell
     from learning.pattern_database import PatternDatabase
     closed = execute_sell(db, ticker, float(price), reason="manual_ui",
-                           pattern_db=PatternDatabase(db))
+                           pattern_db=PatternDatabase(db), cfg=_load_config())
     if not closed:
         raise HTTPException(500, "Sell failed - see server log")
     return closed

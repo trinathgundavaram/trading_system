@@ -159,7 +159,7 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
             logger.info(f"{ticker}: [PAPER] buy skipped - {open_count}/{max_positions} positions open")
             return {}
         closed = execute_sell(db, victim["ticker"], victim_price,
-                               reason=victim["reason"], pattern_db=pattern_db)
+                               reason=victim["reason"], pattern_db=pattern_db, cfg=cfg)
         if not closed:
             logger.warning(f"{ticker}: [PAPER] rotation sell of {victim['ticker']} "
                            f"failed - buy skipped")
@@ -208,6 +208,9 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
     db.adjust_paper_cash(-amount)
     db.log_paper_trade(ticker, "buy", price, shares, amount,
                         reason="buy_signal", pattern_id=pattern_id, trade_mode=trade_mode)
+    # §7 (Phase 2): the paper book now consumes the daily budget. Placed AFTER
+    # the fill is recorded, so a skipped or failed buy never burns budget.
+    db.record_trade_placed(simulated=True)
     logger.info(f"{ticker}: [PAPER] BOUGHT {shares:.4f} sh @ ${price:.2f} "
                 f"(${amount:.2f}) [{trade_mode}] - purse now ${account['cash'] - amount:.2f}")
     db.log_ui_event("paper_buy", {
@@ -218,7 +221,8 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
     return {"ticker": ticker, "price": price, "shares": shares, "dollar_amount": amount}
 
 
-def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None) -> dict:
+def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None,
+                  cfg: dict = None) -> dict:
     """Closes the simulated position at the current price and settles the
     purse. Closes the linked pattern with the rule-driven outcome so the
     learning loop trains on realistic exits. Returns {} if nothing to sell."""
@@ -234,6 +238,11 @@ def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None) ->
                         reason=reason, pattern_id=closed.get("pattern_id"),
                         pnl=closed.get("pnl"), pnl_pct=closed.get("pnl_pct"),
                         trade_mode=closed.get("trade_mode"))
+    # §7: sells count too. max_trades_per_day limits how much the system may
+    # DO in a day, and a runaway exit loop is exactly as damaging as a runaway
+    # entry loop - the MAN sequence in the July data (bought and sold four
+    # times in 30 hours) is that loop starting.
+    db.record_trade_placed(simulated=True)
 
     # Learning: rule-driven outcome replaces the flat time-based close.
     if pattern_db is not None and closed.get("pattern_id"):
@@ -281,6 +290,19 @@ def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None) ->
         "ticker": ticker, "price": price, "reason": reason,
         "pnl": round(closed["pnl"], 2), "pnl_pct": round(closed["pnl_pct"], 2),
     })
+
+    # §9 (Phase 2): check the breaker after EVERY close, not once per cycle.
+    # A cycle can take twelve minutes; a stop cascade inside one cycle would
+    # otherwise run to completion before anything checked. cfg is threaded in
+    # from the call site rather than re-read here - this path has five callers
+    # and a hidden disk read in each is both slow and a source of
+    # inconsistency.
+    try:
+        from rules.risk_rules import trip_kill_switch_if_needed
+        trip_kill_switch_if_needed(db, cfg, simulated=True)
+    except Exception as e:
+        logger.error(f"{ticker}: [PAPER] kill-switch check failed: {e}", exc_info=True)
+
     return closed
 
 
