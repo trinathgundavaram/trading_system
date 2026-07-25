@@ -1,33 +1,47 @@
-"""FastAPI + WebSocket server - Phase 2's replacement for the Rich terminal
-dashboard. Read-only over SQLite plus a handful of safe config edits (watchlist,
-trading.mode, kill switch) - same "never places a trade" guarantee as main.py's
-terminal mode. Run alongside `python3 scheduler.py` (a separate process does the
-actual scanning); this process only serves state and broadcasts updates.
+"""FastAPI + WebSocket server - the web replacement for the Rich terminal
+dashboard. Serves platform state from Postgres and offers a set of writes.
+Run alongside `python3 scheduler.py` (a separate process does the actual
+scanning); this process does not scan on its own.
 
-DOES NOT call Robinhood, does NOT place orders - reads output/trading.db and
-config.yaml, same as main.py's terminal dashboard. THREE narrow exceptions,
-all user-triggered (never automatic): /api/ticker/validate calls the
-yfinance MCP directly when adding a new ticker to the watchlist;
-/api/cycle/run_now imports scheduler.py's run_cycle() to run a full scan
-cycle on demand; /api/ticker/evaluate_now imports scheduler.py's
-evaluate_single_ticker() to score one freshly-added ticker immediately
-instead of waiting for the next scheduled cycle. See each endpoint's
-docstring - everything else stays MCP-free/scan-free.
+WHAT THIS MODULE CAN DO (not what today's deployment happens to be configured
+to do - see storage/banner.py's execution_posture() and /api/status for the
+resolved runtime answer; §6, 2026-07-24, replaced the four paragraphs that
+previously asserted runtime state here and had been wrong since 16 July):
+
+  - Reads: signals, positions, trades, analytics, logs, config.
+  - Writes to config.yaml: watchlist, trading.mode/watch_execute/auto_trade/
+    max_positions, the kill switch, and the live-execution master switch.
+    All token-gated via require_token; arming live execution additionally
+    requires a typed confirmation phrase.
+  - Places a REAL Robinhood order in exactly one place: /api/real/sell, which
+    calls engine/live_trader.py's execute_sell_live() after a token check, a
+    re-typed ticker confirmation, and the live-execution master switch. Every
+    other route is order-free.
+  - Calls out to the network in three user-triggered (never automatic)
+    places: /api/ticker/validate, /api/cycle/run_now, /api/ticker/evaluate_now.
+
+Auth: every write route uses the require_token dependency (§4). The token is
+resolved by storage/secrets.py, never from config.yaml.
 """
 import asyncio
+import hmac
 import json
 import logging
 import re
 import subprocess
 import threading
+import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
 import yaml
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Header
+from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
+                     Request)
 from fastapi.responses import HTMLResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
+from storage import banner, secrets
 from storage.database import Database
 from storage.log_setup import setup_logging, tail_log_lines
 
@@ -69,8 +83,77 @@ def _save_config(cfg: dict):
         yaml.dump(cfg, f, sort_keys=False)
 
 
+# ═══ Auth (§4, Phase 1, 2026-07-24) ═════════════════════════════════════════
+# Four compounding weaknesses were found in the evaluation: a 5-character
+# token; stored in cleartext in a versioned file; served over plain HTTP bound
+# to 0.0.0.0 so every device on the LAN could reach it; and compared with a
+# plain `!=`, with no rate limiting, in nine separate endpoints. That token
+# gates the kill switch, config mutation, arming live execution, and manual
+# real-money sells.
+#
+# The token now comes from storage/secrets.py (environment -> .env -> macOS
+# Keychain), NEVER from config.yaml. This also closes a latent hole opened by
+# Phase 0 step 0.2: config.yaml's ui.auth_token became the literal string
+# "${UI_AUTH_TOKEN}" (server.py loads the YAML raw, without config_loader's
+# ${VAR} expansion), so the old _auth_token() was comparing every request
+# against that placeholder - anyone sending the header "${UI_AUTH_TOKEN}"
+# would have authenticated.
+_fail_counts: dict[str, list] = defaultdict(list)
+_fail_lock = threading.Lock()
+_MAX_FAILS, _WINDOW_S, _LOCKOUT_S = 5, 300, 900
+
+
 def _auth_token() -> str:
-    return _load_config().get("ui", {}).get("auth_token", "")
+    """The expected token. Raises if it is not configured anywhere - an empty
+    expected token would compare equal to a blank header and silently
+    unauthenticate every write endpoint in this process."""
+    return secrets.get("UI_AUTH_TOKEN")
+
+
+def _throttle(key: str):
+    """Refuse further attempts from a client that has failed _MAX_FAILS times
+    inside _WINDOW_S. Without this, a 5-character token is enumerable in
+    seconds."""
+    now = time.time()
+    with _fail_lock:
+        recent = [t for t in _fail_counts[key] if now - t < _WINDOW_S]
+        _fail_counts[key] = recent
+        if len(recent) >= _MAX_FAILS:
+            raise HTTPException(
+                429, f"Too many failed attempts - locked {_LOCKOUT_S // 60} min")
+
+
+def _record_fail(key: str):
+    with _fail_lock:
+        _fail_counts[key].append(time.time())
+
+
+def require_token(request: Request, x_auth_token: str = Header(None)) -> bool:
+    """FastAPI dependency guarding every write endpoint.
+
+    hmac.compare_digest, not `!=`: a plain string compare short-circuits on
+    the first differing byte, which leaks the token one character at a time to
+    anyone who can measure response latency.
+
+    A dependency rather than an inline `if` in each handler, because a
+    dependency cannot be forgotten on a NEW endpoint the way an inline check
+    can - and "the tenth write route shipped without the check" is the exact
+    mistake this shape exists to prevent.
+    """
+    client = request.client.host if request.client else "unknown"
+    _throttle(client)
+    try:
+        expected = _auth_token()
+    except Exception as e:
+        # Misconfiguration must fail CLOSED, and must say so plainly rather
+        # than looking like a wrong token.
+        logging.getLogger("trading").error(f"UI auth token is not configured: {e}")
+        raise HTTPException(503, "UI auth token is not configured on the server - "
+                                 "set UI_AUTH_TOKEN (see .env.template)")
+    if not x_auth_token or not hmac.compare_digest(str(x_auth_token), expected):
+        _record_fail(client)
+        raise HTTPException(403, "Invalid auth token")
+    return True
 
 
 connected_clients: list = []
@@ -290,14 +373,12 @@ async def get_paper_summary(live: bool = False):
 
 
 @app.post("/api/paper/sell")
-async def paper_sell(body: dict, x_auth_token: str = Header(None)):
+async def paper_sell(body: dict, _: bool = Depends(require_token)):
     """Manual close of a paper position at the current market price,
     REGARDLESS of the sell rules (Akhil's ask: an escape hatch when you want
     out now). Token-protected like every other write endpoint. Still only
     ever touches the SIMULATED book - no real order is placed, same
     guarantee as everything else in this process."""
-    if x_auth_token != _auth_token():
-        raise HTTPException(403, "Invalid auth token")
     ticker = (body.get("ticker") or "").upper().strip()
     if not ticker:
         raise HTTPException(400, "ticker required")
@@ -319,7 +400,7 @@ async def paper_sell(body: dict, x_auth_token: str = Header(None)):
 
 
 @app.post("/api/real/sell")
-async def real_sell(body: dict, x_auth_token: str = Header(None)):
+async def real_sell(body: dict, _: bool = Depends(require_token)):
     """Manual REAL sell (2026-07-24, Trinath's explicit choice: the Real
     Portfolio tab's Sell button places an ACTUAL Robinhood market order, not
     just a recorded fill). Goes through engine/live_trader.py's exact
@@ -335,9 +416,12 @@ async def real_sell(body: dict, x_auth_token: str = Header(None)):
     exist for the ticker -> the order circuit breaker must be closed.
     Deliberately does NOT require watch_execute=='EXECUTE'/auto_trade to be
     armed (execute_sell_live's require_auto_trade=False) - those gate the
-    SCHEDULER's automated decisions, not this explicit one-off human click."""
-    if x_auth_token != _auth_token():
-        raise HTTPException(403, "Invalid auth token")
+    SCHEDULER's automated decisions, not this explicit one-off human click.
+
+    §5 (Phase 1): still works for a SYNC row, deliberately.
+    execute_sell_live's unmanaged-position refusal is gated on
+    require_auto_trade, which this path passes as False - being unable to
+    manually exit a real position would itself be a risk."""
     ticker = (body.get("ticker") or "").upper().strip()
     if not ticker:
         raise HTTPException(400, "ticker required")
@@ -368,7 +452,7 @@ async def real_sell(body: dict, x_auth_token: str = Header(None)):
 
 
 @app.post("/api/portfolio/clear_seed")
-async def clear_seed_positions(x_auth_token: str = Header(None)):
+async def clear_seed_positions(_: bool = Depends(require_token)):
     """Powers the Portfolio tab's "Clear synced positions" button - removes
     trade_mode='SEED' rows (robinhood_sync.py's seed-paper command, which
     clones the real Robinhood account into the paper book for display) and
@@ -378,21 +462,17 @@ async def clear_seed_positions(x_auth_token: str = Header(None)):
     SEED from that count regardless of whether this has been run; this is
     for actually clearing them out of the DB/UI.) Doesn't touch Robinhood
     (read-only either way) or any real confirm_fill.py position."""
-    if x_auth_token != _auth_token():
-        raise HTTPException(403, "Invalid auth token")
     return Database().remove_seed_positions()
 
 
 @app.post("/api/positions/clear_synced")
-async def clear_synced_positions(x_auth_token: str = Header(None)):
+async def clear_synced_positions(_: bool = Depends(require_token)):
     """Real-book counterpart to /api/portfolio/clear_seed - powers the
     Positions tab's "Clear synced positions" button. Removes trade_mode=
     'SYNC' rows (engine/account_sync.py's auto-import of real Robinhood
     holdings, config.yaml account.auto_sync). Doesn't touch Robinhood
     (read-only either way) or place any order - only deletes the local
     tracking row. Doesn't change account.auto_sync itself."""
-    if x_auth_token != _auth_token():
-        raise HTTPException(403, "Invalid auth token")
     return Database().remove_synced_positions()
 
 
@@ -403,16 +483,18 @@ async def get_paper_trades(limit: int = 100):
 
 
 @app.post("/api/live_execution")
-async def set_live_execution(body: dict, x_auth_token: str = Header(None)):
+async def set_live_execution(body: dict, _: bool = Depends(require_token)):
     """Flips the LIVE EXECUTION master switch (trading.live_execution_enabled)
     - the gate that decides whether engine/live_trader.py may EVER place a
     real order. Deliberately the hardest write in the app (2026-07-17,
     Akhil's design: 'display what needs to be typed so it doesn't turn on by
     accident'): enabling requires the auth token AND the exact confirmation
     phrase typed by a human. Disabling requires only the token - turning
-    live trading OFF should never have friction."""
-    if x_auth_token != _auth_token():
-        raise HTTPException(403, "Invalid auth token")
+    live trading OFF should never have friction.
+
+    Note that flipping this ON is necessary but NOT sufficient as of §2:
+    engine/live_trader.py's is_live_mode() additionally requires a current
+    validation receipt, so this switch cannot arm live trading on its own."""
     enable = bool(body.get("enable"))
     from engine.live_trader import LIVE_EXECUTION_CONFIRM_PHRASE
     if enable:
@@ -598,9 +680,7 @@ async def get_config():
 
 
 @app.post("/api/config")
-async def update_config(update: dict, x_auth_token: str = Header(None)):
-    if x_auth_token != _auth_token():
-        raise HTTPException(403, "Invalid auth token")
+async def update_config(update: dict, _: bool = Depends(require_token)):
     cfg = _load_config()
     # Only allow safe, non-financial-risk updates from the UI.
     safe_top_keys = ["watchlist"]
@@ -877,9 +957,7 @@ async def evaluate_ticker_now(body: dict):
 
 
 @app.post("/api/kill_switch")
-async def toggle_kill_switch(x_auth_token: str = Header(None)):
-    if x_auth_token != _auth_token():
-        raise HTTPException(403, "Invalid auth token — kill switch requires auth")
+async def toggle_kill_switch(_: bool = Depends(require_token)):
     cfg = _load_config()
     cfg.setdefault("risk", {})
     cfg["risk"]["kill_switch_triggered"] = not cfg["risk"].get("kill_switch_triggered", False)
@@ -1406,6 +1484,11 @@ async def get_status():
         "next_open_et": next_open,
         "last_cycle": last_cycle,
         "kill_switch": cfg.get("risk", {}).get("kill_switch_triggered", False),
+        # §6 (Phase 1, 2026-07-24): the same resolved posture the terminal
+        # banner prints, so the dashboard cannot show a friendlier answer
+        # than the process actually behaves. Derived from
+        # engine/live_trader.py's gate functions, never from prose.
+        "execution_posture": banner.execution_posture(cfg),
         # actual running cadence - 5 min for DAY/HYBRID modes, otherwise
         # trading.scan_interval_minutes (see scheduler.py's
         # _effective_scan_interval()). Note this reflects config.yaml as of

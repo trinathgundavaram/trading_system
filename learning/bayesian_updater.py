@@ -67,6 +67,30 @@ def _month_start(d: datetime = None) -> str:
     return d.replace(day=1).date().isoformat()
 
 
+def learning_frozen(cfg: dict) -> tuple[bool, str]:
+    """Is the Bayesian learning loop frozen, and why? (§17, Phase 1)
+
+    Returns (frozen, reason). One function so that every entry point - the
+    proposal path, the challenge path and the config-write path - asks the
+    same question and cannot answer it differently. Fails CLOSED: a config
+    that does not mention bayesian_enabled at all is treated as frozen,
+    because an absent flag on a safety gate is not consent.
+    """
+    lcfg = (cfg or {}).get("learning", {}) or {}
+    if not lcfg.get("bayesian_enabled", False):
+        return True, ("learning.bayesian_enabled=false - the Bayesian loop is "
+                      "frozen until the §19 scoring recalibration lands and a "
+                      "clean post-fix sample exists (§17 of the 2026-07-24 "
+                      "remediation plan)")
+    return False, ""
+
+
+def clean_pattern_cutoff(cfg: dict) -> str | None:
+    """The earliest recorded_at a pattern may have and still be allowed to
+    train anything. None means no cutoff configured."""
+    return ((cfg or {}).get("learning", {}) or {}).get("min_pattern_recorded_at")
+
+
 class BayesianUpdater:
     def __init__(self, db, cfg: dict):
         self.db = db
@@ -86,10 +110,27 @@ class BayesianUpdater:
 
     def propose_update(self, rule_name: str, bucket: str, current_weight: float,
                         occurrences: int, win_rate_when_fired: float, overall_win_rate: float,
-                        frequency_class: str = "COMMON", mode: str = "swing") -> dict:
+                        frequency_class: str = "COMMON", mode: str = "swing",
+                        force: bool = False) -> dict:
         """Computes a proposed new weight and every gate's pass/fail, but does
         NOT write anything - call apply_update() separately once you're happy
-        with the proposal (mirrors the spec's 'never silently overwrite')."""
+        with the proposal (mirrors the spec's 'never silently overwrite').
+
+        §17 (Phase 1, 2026-07-24): the FIRST gate is now the freeze. It is
+        checked before the trade count, before the loss streak and before the
+        drift caps, because none of those are meaningful while the sample
+        itself is contaminated - all 23 closed patterns at the time of the
+        audit were produced under the stop bug removed 2026-07-20.
+
+        `force=True` is a deliberate, logged escape hatch for a human running
+        an analysis by hand - the same "never a silent default" pattern
+        apply_bucket_weight_to_config() already uses. It does not bypass any
+        other gate.
+        """
+        frozen, why = learning_frozen(self.cfg)
+        if frozen and not force:
+            return self._blocked(rule_name, bucket, current_weight, why)
+
         cfg = self.cfg["learning"]
         min_trades = cfg["min_trades_before_bayesian"]
 
@@ -235,6 +276,18 @@ def _record_provenance(db, bucket: str, mode: str, old_weight: float, new_weight
         pass
 
 
+class LearningFrozen(Exception):
+    """Raised by apply_bucket_weight_to_config() when the learning loop is
+    frozen (§17, Phase 1: config.yaml's learning.bayesian_enabled is false).
+
+    Distinct from ShadowValidationRequired on purpose. That exception means
+    "this change has not proved itself yet"; this one means "no change may be
+    proposed at all, because the evidence base is contaminated". The remedy is
+    different too: shadow validation is satisfied by running the challenge,
+    whereas the freeze is only lifted by a deliberate config change that is
+    itself a decision-function change requiring a version bump."""
+
+
 class ShadowValidationRequired(Exception):
     """Raised by apply_bucket_weight_to_config() when
     config.yaml's learning.require_shadow_validation is True (the default)
@@ -293,6 +346,25 @@ def apply_bucket_weight_to_config(bucket: str, new_weight_0_100: float, mode: st
     posture as cfg=None skipping the shadow gate)."""
     old_weight = get_current_bucket_weight(cfg, bucket, mode) if cfg is not None else None
 
+    # §17 (Phase 1, 2026-07-24): the freeze outranks the shadow gate. This is
+    # the ONLY function in the system that writes a bucket weight to
+    # config.yaml, so it is the one that must not be bypassable while the
+    # pattern sample is contaminated. Checked before the shadow gate so the
+    # error names the real reason. `force=True` still bypasses, loudly and on
+    # the record - the freeze is a safety default, not a lock.
+    if cfg is not None and not force:
+        frozen, why = learning_frozen(cfg)
+        if frozen:
+            reason = (f"Refusing to apply {bucket}={new_weight_0_100:.2f} to live config: {why}. "
+                      f"Pass force=True to bypass explicitly (logged, not recommended).")
+            _record_provenance(
+                db, bucket, mode, old_weight, new_weight_0_100, decision="rejected",
+                decision_reason=reason, challenge_result=challenge_result,
+                strategy_version=strategy_version, feature_ranking=feature_ranking,
+                walk_forward_report=walk_forward_report, trade_count=trade_count,
+            )
+            raise LearningFrozen(reason)
+
     if cfg is not None and cfg.get("learning", {}).get("require_shadow_validation", True) and not force:
         validated = (
             challenge_result is not None
@@ -348,7 +420,18 @@ def propose_as_challenge(cfg: dict, db, bucket: str, new_weight_0_100: float, mo
     on each side and a two-proportion z-test can say whether the challenger
     is really better, not just luckier over a short run. Returns the
     challenge_id - pass its eventual ChampionChallenger.evaluate() result
-    into apply_challenge_promoted_weight() once it's ready."""
+    into apply_challenge_promoted_weight() once it's ready.
+
+    §17 (Phase 1): refuses while the learning loop is frozen. Starting a
+    challenge is not itself a live change, but a challenge started on
+    contaminated evidence produces a result that LOOKS like out-of-sample
+    proof, and would then be handed to apply_challenge_promoted_weight().
+    Blocking it here stops a laundered proposal existing at all."""
+    frozen, why = learning_frozen(cfg)
+    if frozen:
+        raise LearningFrozen(
+            f"Refusing to start a champion/challenger test for {bucket}: {why}")
+
     import json
     from learning.champion_challenger import ChampionChallenger
 

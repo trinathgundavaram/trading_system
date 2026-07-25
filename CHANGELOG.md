@@ -20,6 +20,55 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+## [1.01] — v1.0.1 — 2026-07-24
+
+### Decision function: unchanged — v1.0.0 trade data remains poolable
+
+Phase 1: contain the risk that can cost real money before Phase 2's controls
+exist. Nothing here touches scoring, sizing, thresholds or exits. Full note:
+[docs/releases/v1.0.1.md](docs/releases/v1.0.1.md).
+
+### Security
+
+- UI binds `127.0.0.1` by default; `TP_UI_HOST` overrides it with a loud
+  warning. Use an SSH tunnel or Tailscale for remote access. (§4, E-3)
+- Nine inline token checks replaced by one `require_token` dependency, using
+  `hmac.compare_digest` and a per-client 5-failures/5-minutes lockout. A
+  dependency cannot be forgotten on a new route the way an inline `if` can.
+- The token resolves through `storage/secrets.py`, never `config.yaml`. This
+  closes a hole opened in Phase 0: `server.py` reads the YAML unexpanded, so
+  the expected token had become the literal `${UI_AUTH_TOKEN}`. **Generate a
+  new token** — see the release note.
+
+### Fixed
+
+- SYNC/SEED positions (~$42,000 of imported real holdings) are quarantined from
+  every automated exit path, at the query, decision and execution layers. Their
+  existing stop machinery is preserved and disarmed by `migrations/002`.
+  Manual `/api/real/sell` still works. (§5, R-5)
+- Live execution now requires a passing validation receipt no older than 30
+  days, in addition to the three original gates. No receipt exists yet — §23
+  writes the first one in Phase 4 — so live execution is blocked by code rather
+  than by intention. (§2, R-4)
+- The Bayesian learning loop is frozen (`learning.bayesian_enabled: false`) and
+  the minimum sample raised 10 → 150. All 23 closed patterns were produced
+  under the stop bug removed 2026-07-20; a large sample of contaminated trades
+  is worse than a small one, because it looks trustworthy. (§17, T-9)
+
+### Added
+
+- `storage/banner.py` — the resolved execution posture, derived from
+  `live_trader`'s own gate functions and printed at startup by every entry
+  point. It replaces five prose claims that had been false since 16 July and
+  cannot drift the way they did. (§6)
+- `pattern_database` rows carry `engine_version` and `config_fingerprint`, so
+  the Phase 4 recalibration partitions its own data without anyone having to
+  remember the date. (§17, `migrations/003`)
+- `scripts/audit_stops.py` — zero-distance, missing and prematurely advanced
+  stops on managed positions.
+- Four test files, 47 new tests, each with explicit control cases: a guard test
+  that passes because the harness is broken is worse than no test.
+
 ### Phase 0 — Foundation (in progress)
 
 Nothing in this phase changes a trading decision. That is deliberate: it is the

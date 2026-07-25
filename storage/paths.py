@@ -49,6 +49,24 @@ def archive_dir() -> Path:
     return _ensure(output_dir() / "archive")
 
 
+def validation_dir() -> Path:
+    """Where run_backtest.py writes the live-arm validation receipt (§2/§23)."""
+    return _ensure(output_dir() / "validation")
+
+
+def validation_receipt_path() -> Path:
+    """The receipt engine/live_trader.py's _validation_current() requires
+    before live execution may arm. Per-version, like everything else under
+    output_dir(): a receipt earned by v1.2.0's backtest must not silently
+    authorise v1.3.0 to trade.
+
+    Does NOT create the directory, unlike its siblings above. This is on the
+    read path - is_live_mode() calls it - and a read should not have a
+    filesystem side effect. The writer (run_backtest.py) calls
+    validation_dir() first."""
+    return output_dir() / "validation" / "live_arm_receipt.json"
+
+
 def trade_prompt_path() -> Path:
     """Not a directory - the generated prompt file main.py opens."""
     return output_dir() / "trade_prompt.md"

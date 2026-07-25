@@ -346,7 +346,7 @@
 <div id="modal-backdrop">
   <div class="modal">
     <h3 id="modal-title">Enter auth token</h3>
-    <p id="modal-desc">Matches <code>config.yaml → ui.auth_token</code>. Saved locally so you won't be asked again on this browser.</p>
+    <p id="modal-desc">Matches the server's <code>UI_AUTH_TOKEN</code> (environment / <code>.env</code> / Keychain — no longer <code>config.yaml</code>). Saved locally so you won't be asked again on this browser.</p>
     <input type="text" id="modal-input" placeholder="auth token" autocomplete="off">
     <div class="row">
       <button class="btn btn-ghost btn-sm" onclick="closeModal(null)">Cancel</button>
@@ -644,7 +644,7 @@ function askToken(title, desc) {
   return new Promise(resolve => {
     _modalResolve = resolve;
     document.getElementById("modal-title").textContent = title || "Enter auth token";
-    document.getElementById("modal-desc").textContent = desc || "Matches config.yaml → ui.auth_token.";
+    document.getElementById("modal-desc").textContent = desc || "Matches the server's UI_AUTH_TOKEN (environment / .env / Keychain).";
     const input = document.getElementById("modal-input");
     input.value = localStorage.getItem(AUTH_TOKEN_KEY) || "";
     document.getElementById("modal-backdrop").classList.add("open");

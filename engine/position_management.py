@@ -65,7 +65,15 @@ def run_loop_b(ticker_data_cache: dict, mkt, cfg: dict, regime=None, analyzer=No
     Returns a list of per-position action dicts for engine/packet_builder.py.
     """
     db = Database()
-    positions = db.get_all_positions()
+    # get_MANAGED_positions, not get_all_positions (§5, 2026-07-24): Loop B
+    # runs the ATR stop machine, writes current_stop_price back to the row and
+    # raises URGENT exit actions that scheduler.py executes automatically. A
+    # SYNC row (an imported real holding) or a SEED row (a paper mirror of
+    # one) entering here would get engine-sized stop machinery armed on
+    # capital this engine never chose to deploy. Excluding them here also
+    # means no NEW stop is ever written to those rows - the existing stale
+    # ones are neutralised by migrations/002 (§5).
+    positions = db.get_managed_positions()
     if not positions:
         return []
 

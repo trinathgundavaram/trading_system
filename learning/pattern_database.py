@@ -12,6 +12,8 @@ acceptable for a single-user, single-machine tool at this trade volume, but
 worth knowing about if you extend this into something with much higher data
 volume or multiple concurrent readers/writers.
 """
+import hashlib
+import json
 import math
 from datetime import datetime
 
@@ -106,13 +108,54 @@ def _recency_weight(recorded_at: str, lambda_decay: float) -> float:
     return math.exp(-lambda_decay * days_ago / 365.0)
 
 
+def config_fingerprint(cfg: dict) -> str:
+    """Hash of every config value that can change a score or an exit (§17).
+
+    Two patterns with different fingerprints were produced by different
+    strategies and must NOT be pooled, however close their timestamps are.
+    This is what makes the Phase 4 recalibration (§19) self-partitioning: the
+    moment the weights change, every subsequent row is automatically
+    distinguishable from every earlier one, with nobody having to remember
+    the date.
+
+    Deliberately narrow. Adding a key here invalidates comparability with
+    every previously recorded pattern, so it must only cover values that
+    genuinely alter a decision - not watchlists, not intervals, not
+    notification settings. `default=str` keeps it total: an unexpected
+    non-JSON value produces a stable-but-ugly hash rather than an exception
+    on the trade-recording path.
+    """
+    material = {
+        "weights": cfg.get("weights"),
+        "buy_rules": cfg.get("buy_rules"),
+        "sell_rules": cfg.get("sell_rules"),
+        "stop_machine": cfg.get("stop_machine"),
+        "position_sizing": cfg.get("position_sizing"),
+        "risk_level": cfg.get("risk_level"),
+        "risk": {k: v for k, v in (cfg.get("risk") or {}).items()
+                 if k in ("CONSERVATIVE", "MODERATE", "AGGRESSIVE", "TURBO")},
+    }
+    blob = json.dumps(material, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
 class PatternDatabase:
     def __init__(self, db):
         self.db = db
 
-    def record_entry(self, ticker: str, mode: str, features: dict, trade_id: str = None) -> int:
-        """Called at signal/entry time - outcome fields stay NULL until close_trade()."""
-        return self.db.add_pattern(ticker, mode, features, trade_id=trade_id)
+    def record_entry(self, ticker: str, mode: str, features: dict, trade_id: str = None,
+                      cfg: dict = None) -> int:
+        """Called at signal/entry time - outcome fields stay NULL until close_trade().
+
+        `cfg` (§17, Phase 1) stamps the row with the build and the
+        configuration fingerprint that produced it. Optional so that existing
+        callers keep working during the migration; when it is absent the row
+        records config_fingerprint='unstamped', which is honest and
+        filterable, rather than NULL, which reads as 'not recorded yet'.
+        """
+        fingerprint = config_fingerprint(cfg) if cfg is not None else "unstamped"
+        return self.db.add_pattern(ticker, mode, features, trade_id=trade_id,
+                                    config_fingerprint=fingerprint)
 
     def close_trade(self, pattern_id: int, outcome_pct: float, hold_hours: float, exit_reason: str):
         self.db.close_pattern(pattern_id, outcome_pct, hold_hours, exit_reason)

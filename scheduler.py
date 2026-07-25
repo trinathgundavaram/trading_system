@@ -375,6 +375,11 @@ def _run_cycle_impl(force: bool = False):
         # would silently stop being scanned (and therefore stop being
         # sell-checked) the moment EXECUTE mode took over - the exact class
         # of gap the 2026-07-16 fix above this comment closed for WATCH mode.
+        # get_all_positions is correct HERE, unlike the exit paths (§5): this
+        # builds the SCAN list, and a held SYNC ticker must keep being scanned
+        # so that swing_buy_rules.already_open() still vetoes buying more of
+        # something the account already holds. Nothing in this list can trigger
+        # an exit - rules/sell_rules.py refuses SYNC/SEED rows outright.
         held_sim_tickers = [p["ticker"] for p in db.get_all_positions(simulated=True)]
         if live_trader.is_live_mode(cfg):
             # Same coverage guarantee for the REAL book in live mode.
@@ -871,7 +876,11 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
             # plain SWING/DAY config just uppercases trading_mode - so this
             # now records the pattern under the SAME mode key the EV lookup
             # will later query it under.
-            new_pattern_id = pattern_db.record_entry(ticker, effective_mode, features)
+            # cfg is passed so the row is stamped with the build and the
+            # config fingerprint that produced it (§17, Phase 1) - without it
+            # a future contamination event is unfilterable, which is exactly
+            # how the 23 pre-2026-07-20 patterns became a problem.
+            new_pattern_id = pattern_db.record_entry(ticker, effective_mode, features, cfg=cfg)
 
         if sell_result and sell_result.should_sell:
             logger.info(f"{ticker}: SELL SIGNAL - {sell_result.reason}")
@@ -1560,9 +1569,14 @@ def _price_watch_loop():
                 continue
             # Paper book always watched; real book joins only when
             # EXECUTE+auto_trade is armed.
-            positions = db.get_all_positions(simulated=True)
+            # get_MANAGED_positions, not get_all_positions (§5, 2026-07-24):
+            # this loop calls check_exit_triggers() and then sells on a hit,
+            # so a SYNC row reaching it would mean an ATR stop computed for a
+            # $100 engine entry liquidating a real multi-thousand-dollar
+            # holding between cycles.
+            positions = db.get_managed_positions(simulated=True)
             if live:
-                positions = positions + db.get_all_positions(simulated=False)
+                positions = positions + db.get_managed_positions(simulated=False)
             if not positions:
                 time.sleep(interval)
                 continue
@@ -1660,6 +1674,14 @@ def start():
 
     _log_startup_health_check()
     cfg = load_config()
+
+    # §6 (Phase 1, 2026-07-24): the resolved execution posture goes into the
+    # log at startup. Under launchd there is no console, and scheduler.log is
+    # the only place anyone can answer "was this process able to place real
+    # orders?" after the fact.
+    from storage import banner
+    banner.log_banner(cfg, logger)
+
     interval = _effective_scan_interval(cfg)
     scheduler = BlockingScheduler(timezone=ET)
     scheduler.add_job(

@@ -1,9 +1,17 @@
-"""LIVE Robinhood order execution - BUILT 2026-07-16, HARD-DISABLED
-2026-07-17 (see LIVE_EXECUTION_ENABLED below). Execution is Claude-Desktop-
-only: the scheduler writes output/trade_prompt.md, Claude Desktop (with the
-Robinhood MCP) places any orders, confirm_fill.py records the fills.
+"""LIVE Robinhood order execution.
 
-Original design notes (still accurate if ever re-enabled):
+THIS MODULE PLACES REAL ORDERS when all of its gates are open. It does not
+know, and this docstring deliberately does not claim, what today's deployment
+is configured to do - that is a resolved runtime value: see storage/banner.py's
+execution_posture() and server.py's /api/status (§6, 2026-07-24). The previous
+version of this paragraph said "HARD-DISABLED 2026-07-17 ... execution is
+Claude-Desktop-only", which had been false since the master switch became a
+config value, and was one of the five sentences the audit found describing a
+system state that ended in July.
+
+When every gate is closed, execution is Claude-Desktop-only: the scheduler
+writes output/trade_prompt.md, Claude Desktop (with the Robinhood MCP) places
+any orders, and confirm_fill.py records the fills.
 
 This module is the ONLY place in the platform that can place a real order.
 It calls robin_stocks directly (the read-only robinhood-mcp server exposes
@@ -39,15 +47,21 @@ UNOFFICIAL API WARNING (same as robinhood-mcp's README): robin_stocks is an
 unofficial client. Robinhood can change or rate-limit it at any time. The
 circuit breaker below stops repeated failures from hammering your account.
 """
+import json
 import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from mcp_clients.base import SourceCircuitBreaker
 
 logger = logging.getLogger("trading")
+
+# ── Unmanaged position modes (§5, Phase 1, 2026-07-24 audit) ────────────────
+# Mirrors storage.database.MANAGED_EXCLUDED_MODES; see that constant for why
+# the duplication is deliberate. tests/test_sync_quarantine.py guards drift.
+UNMANAGED_TRADE_MODES = ("SYNC", "SEED")
 
 FILL_WAIT_SECONDS = 60      # market orders in-hours fill in seconds; this is generous
 _POLL_INTERVAL = 2.0
@@ -109,10 +123,95 @@ def is_live_execution_enabled(cfg: dict) -> bool:
     return bool((cfg.get("trading", {}) or {}).get("live_execution_enabled", False))
 
 
+# ── The validation receipt (§2, Phase 1) ────────────────────────────────────
+# "I will not arm live trading until the backtest passes" was an intention.
+# This makes it a code path, so it cannot be forgotten at 11pm on a Sunday.
+# The receipt is written by run_backtest.py ONLY when a run clears the
+# pre-committed go/no-go bar (§23, Phase 4) - until Phase 4 lands, no receipt
+# exists, and that is the correct state: live execution stays blocked.
+VALIDATION_MAX_AGE_DAYS = 30
+
+
+def _validation_receipt_path() -> str:
+    """Resolved lazily, not at import: TP_OUTPUT_DIR is per-version (§38) and
+    tests need to point this somewhere else without reloading the module."""
+    from storage.paths import validation_receipt_path
+    return str(validation_receipt_path())
+
+
+def _parse_receipt_time(raw: str) -> datetime:
+    """Naive-UTC datetime from an ISO string, tolerating a trailing 'Z' and an
+    explicit offset. Anything unparseable raises, and an unreadable receipt is
+    treated as no receipt - fail closed, never open.
+
+    Naive strings are ASSUMED to be UTC, matching how every other timestamp in
+    this codebase is written (datetime.utcnow().isoformat())."""
+    s = str(raw).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _validation_current(max_age_days: int = VALIDATION_MAX_AGE_DAYS) -> tuple[bool, str]:
+    """Live execution requires a signed-off validation run no older than
+    max_age_days.
+
+    Returns (ok, human_readable_why). The why-string is surfaced verbatim by
+    storage/banner.py, so it is written to be read by an operator at a glance,
+    not parsed. NEVER raises: this is called from is_live_mode() on every
+    cycle and from the startup banner, and a crash here would be a far worse
+    failure than a blocked arm.
+    """
+    path = _validation_receipt_path()
+    if not os.path.exists(path):
+        return False, "no validation receipt - run the backtest gate first"
+    try:
+        with open(path) as f:
+            r = json.load(f)
+        age = datetime.utcnow() - _parse_receipt_time(r["generated_at"])
+        if age > timedelta(days=max_age_days):
+            return False, f"validation receipt is {age.days}d old (max {max_age_days})"
+        if not r.get("passed"):
+            return False, f"last validation FAILED: {r.get('reason', '')}"
+        return True, f"validated {age.days}d ago: {r.get('summary', '')}"
+    except Exception as e:
+        return False, f"unreadable validation receipt: {e}"
+
+
+_blocked_log_state = {"reason": "", "at": 0.0}
+_BLOCKED_LOG_INTERVAL_S = 300
+
+
+def _log_blocked_once(why: str):
+    """is_live_mode() is called several times per ticker per cycle. Log the
+    same block reason at most every 5 minutes, but log IMMEDIATELY whenever
+    the reason changes - a changed reason is news, a repeated one is noise."""
+    now = time.time()
+    if (why != _blocked_log_state["reason"]
+            or now - _blocked_log_state["at"] > _BLOCKED_LOG_INTERVAL_S):
+        logger.error(f"LIVE BLOCKED - {why}")
+        _blocked_log_state["reason"] = why
+        _blocked_log_state["at"] = now
+
+
 def is_live_mode(cfg: dict) -> bool:
-    """True only when ALL THREE gates are on: master switch + EXECUTE mode +
-    auto_trade. Anything less and this codebase places no orders."""
+    """True only when ALL gates are on: master switch (+ no TP_FORCE_PAPER
+    veto) + a current validation receipt + EXECUTE mode + auto_trade. Anything
+    less and this codebase places no orders.
+
+    The validation receipt (§2, added 2026-07-24) is the gate that did not
+    exist when the evaluation report found all three original gates open on a
+    strategy with no validated edge. It is checked BEFORE watch_execute/
+    auto_trade so the log line names the real blocker.
+    """
     if not is_live_execution_enabled(cfg):
+        return False
+    ok, why = _validation_current()
+    if not ok:
+        _log_blocked_once(why)
         return False
     t = cfg.get("trading", {}) or {}
     return (str(t.get("watch_execute", "WATCH")).upper() == "EXECUTE"
@@ -381,7 +480,12 @@ def execute_sell_live(db, cfg: dict, ticker: str, reason: str, pattern_db=None,
     ticker confirmation at the API layer) is a deliberate one-off action, not
     an automated trading decision, so it shouldn't require EXECUTE mode/
     auto_trade to be armed - those two gate whether the SCHEDULER may decide
-    to trade on its own, not whether an explicit human click can act."""
+    to trade on its own, not whether an explicit human click can act.
+
+    §5 (Phase 1, 2026-07-24): an AUTOMATED call (require_auto_trade=True) is
+    additionally refused for SYNC/SEED positions - see the block below. A
+    human clicking Sell for one named ticker still works, because losing the
+    ability to manually exit a real position would itself be a risk."""
     if require_auto_trade:
         if not is_live_mode(cfg):
             return {}
@@ -392,6 +496,28 @@ def execute_sell_live(db, cfg: dict, ticker: str, reason: str, pattern_db=None,
     pos = db.get_open_position(ticker, simulated=False)
     if not pos or not pos.get("shares"):
         return {}
+
+    # ── §5 layer 3: execution refuses the order ────────────────────────────
+    # The last line of defence, after the query layer
+    # (db.get_managed_positions) and the decision layer
+    # (rules/sell_rules.py). It sits here, AFTER the position lookup and
+    # BEFORE _login(), so that no automated path can place a real sell on a
+    # holding this engine never chose to enter - not via the sell rules, not
+    # via Loop B, not via the price-watch loop, not via rotation, and not via
+    # any call site added in future that forgets the other two layers.
+    mode = str(pos.get("trade_mode") or "").upper()
+    if mode in UNMANAGED_TRADE_MODES and require_auto_trade:
+        logger.error(
+            f"{ticker}: [LIVE] REFUSED automated sell of an unmanaged {mode} position "
+            f"({float(pos['shares']):.4f} sh). Close it in the Robinhood app or use the "
+            f"explicit manual endpoint.")
+        try:
+            db.log_ui_event("unmanaged_sell_blocked", {"ticker": ticker, "mode": mode,
+                                                        "reason": reason})
+        except Exception as e:
+            logger.warning(f"{ticker}: could not log unmanaged_sell_blocked: {e}")
+        return {}
+
     if not _login():
         return {}
     try:

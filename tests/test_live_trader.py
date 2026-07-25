@@ -98,9 +98,27 @@ UNARMED_CFG = {**LIVE_CFG,
 
 
 @pytest.fixture()
-def enabled():
-    """Kept for readability in test signatures - arming now happens via the
-    live_execution_enabled key inside each test's cfg, not a module flag."""
+def enabled(tmp_path, monkeypatch):
+    """Arms live execution for a test.
+
+    Arming is a config matter (live_execution_enabled inside each test's cfg)
+    PLUS, since §2 (Phase 1, 2026-07-24), a current validation receipt. This
+    fixture supplies a passing one so the tests below keep describing the
+    gates they were written to describe. The receipt gate itself is tested
+    separately and exhaustively in tests/test_live_arm_gate.py.
+
+    TP_FORCE_PAPER is cleared for the same reason: these tests describe the
+    gates, not the environment they happen to run in."""
+    import json
+    from datetime import datetime
+    from engine import live_trader
+
+    monkeypatch.delenv("TP_FORCE_PAPER", raising=False)
+    receipt = tmp_path / "live_arm_receipt.json"
+    receipt.write_text(json.dumps({"passed": True,
+                                   "generated_at": datetime.utcnow().isoformat(),
+                                   "summary": "test fixture"}))
+    monkeypatch.setattr(live_trader, "_validation_receipt_path", lambda: str(receipt))
     yield
 
 
@@ -129,23 +147,33 @@ def test_no_order_without_master_switch(db, rh_mock):
 
 def test_confirm_phrase_required_to_enable():
     """The /api/live_execution endpoint rejects enabling without the exact
-    typed phrase (token alone is not enough)."""
+    typed phrase.
+
+    §4 (Phase 1, 2026-07-24) moved the token check out of the handler body and
+    into the require_token FastAPI dependency, so the handler no longer takes
+    an x_auth_token argument at all - calling it here means the token has
+    already been verified. The token half of this test now lives in
+    tests/test_ui_auth.py, which also asserts structurally that this route
+    still carries the dependency."""
     import asyncio
     from fastapi import HTTPException
     import server
-    token = server._auth_token()
     loop = asyncio.new_event_loop()
     with pytest.raises(HTTPException) as e:
         loop.run_until_complete(server.set_live_execution(
-            {"enable": True, "confirm": "yes please"}, x_auth_token=token))
+            {"enable": True, "confirm": "yes please"}))
     assert e.value.status_code == 400
-    with pytest.raises(HTTPException) as e:
-        loop.run_until_complete(server.set_live_execution(
-            {"enable": True, "confirm": "ENABLE LIVE TRADING"}, x_auth_token="wrong"))
-    assert e.value.status_code == 403
 
 
 # ---- ARMED (master switch on in cfg): gates + bookkeeping stay valid ----
+
+def test_is_live_mode_without_a_validation_receipt():
+    """§2 (Phase 1): the fourth gate. Deliberately does NOT take the `enabled`
+    fixture, so no receipt exists - which is the platform's state today, and
+    must stay inert even with all three original gates open."""
+    from engine import live_trader
+    assert live_trader.is_live_mode(LIVE_CFG) is False
+
 
 def test_is_live_mode_gates(enabled):
     from engine import live_trader

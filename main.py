@@ -1,8 +1,13 @@
 """Entry point + rich terminal dashboard (default mode) or FastAPI/WebSocket web
-UI (--ui flag). Reads SQLite only (build note #15) - all MCP/network work happens
-in scheduler.py, run either as this process's background thread (terminal mode)
-or as its own separate process alongside `python3 main.py --ui` (web mode - see
-run.sh). This process just renders what's already been written to output/trading.db.
+UI (--ui flag). Renders platform state from the database; all MCP/network work
+happens in scheduler.py, run either as this process's background thread
+(terminal mode) or as its own separate process alongside
+`python3 main.py --ui` (web mode - see run.sh).
+
+Whether this process can place real orders is a RESOLVED runtime question, not
+a property of this file: storage/banner.py prints the answer at startup and
+server.py's /api/status returns it (§6, 2026-07-24). Terminal mode starts a
+scheduler thread, so it inherits whatever posture the banner reports.
 
 Terminal mode keyboard: [R] run a cycle now  [C] copy trade_prompt.md to clipboard
           (pbcopy)  [O] open trade_prompt.md (macOS `open`)  [P] pause/resume
@@ -219,10 +224,14 @@ def main():
     console.print("[bold blue]TRADING PLATFORM - STARTUP[/bold blue]")
     cfg = scheduler_module.load_config()
     console.print(f"Watchlist: {cfg['watchlist']}")
-    console.print(f"Auto-trade: {'ON' if cfg['trading']['auto_trade'] else 'OFF'} "
-                   f"(edit config.yaml -> trading.auto_trade to change)")
-    console.print("Trades are never placed from Python - paste output/trade_prompt.md "
-                   "into Claude Desktop to review/execute via the robinhood-trading MCP.")
+
+    # §6 (Phase 1, 2026-07-24): the two lines that used to sit here asserted
+    # runtime state in prose - "Trades are never placed from Python" stopped
+    # being true on 16 July, when engine/live_trader.py landed. The banner
+    # below is DERIVED from live_trader's own gate functions, so it cannot
+    # drift from behaviour the way a hand-written sentence did.
+    from storage import banner
+    banner.print_banner(console, cfg)
 
     threading.Thread(target=_run_scheduler_background, daemon=True).start()
 
@@ -239,11 +248,34 @@ def run_ui():
     scheduler thread; run `python3 scheduler.py` separately (see run.sh --ui)."""
     import uvicorn
     from server import app
+    from storage import banner
     console.print("[bold blue]TRADING PLATFORM - WEB UI[/bold blue]")
-    console.print("Serving http://localhost:8080  (Ctrl+C to stop)")
+
+    # §4 (Phase 1, 2026-07-24): loopback by default. This used to bind
+    # 0.0.0.0, which served a plain-HTTP dashboard - gating the kill switch,
+    # config mutation, arming live execution and manual real-money sells -
+    # to every device on the LAN behind a 5-character bearer token.
+    #
+    # TP_UI_HOST is a deliberate, loud escape hatch, not a convenience. If you
+    # want the dashboard from your phone, prefer an SSH tunnel
+    # (ssh -L 8080:localhost:8080 you@mac) or Tailscale: both give transport
+    # encryption and device-level authentication that a bearer token over
+    # plain HTTP cannot.
+    host = os.getenv("TP_UI_HOST", "127.0.0.1")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(f"[bold red]WARNING: UI bound to {host} - reachable beyond this "
+                       f"machine over PLAIN HTTP.[/bold red]")
+        console.print("[bold red]  Every write endpoint (kill switch, config, live-execution "
+                       "arming, real sells)[/bold red]")
+        console.print("[bold red]  is protected only by a bearer token on an unencrypted "
+                       "connection. Prefer an[/bold red]")
+        console.print("[bold red]  SSH tunnel or Tailscale, and unset TP_UI_HOST.[/bold red]")
+    console.print(f"Serving http://{host}:8080  (Ctrl+C to stop)")
     console.print("This process does NOT run the scan loop - start "
                    "`python3 scheduler.py` separately, or use `./run.sh --ui`.")
-    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="warning")
+
+    banner.print_banner(console, scheduler_module.load_config())
+    uvicorn.run(app, host=host, port=8080, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -26,8 +26,13 @@ cloned into the simulated book at its real entry prices - so from day one
 the paper portfolio mirrors the actual portfolio, then evolves by the
 rules alone.
 
-Never calls Robinhood, never places an order - the "no real trades from
-this codebase" guarantee (see README) is untouched.
+THIS MODULE never calls Robinhood and never places an order - every fill here
+is simulated. That is a property of this file and stays true regardless of
+configuration. It is NOT a claim about the platform: engine/live_trader.py
+places real orders when its gates are open. See storage/banner.py for the
+resolved runtime posture (§6, 2026-07-24 - the previous wording asserted a
+platform-wide "no real trades from this codebase" guarantee that stopped being
+true on 16 July, when live_trader.py landed).
 """
 import logging
 

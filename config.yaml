@@ -529,11 +529,38 @@ probabilistic_decision:
   min_win_probability: 0.5
   min_ev_pct: 0.0
 learning:
+  # ── Phase 1 step 1.4 (§17, 2026-07-24): the learning loop is FROZEN ──────
+  # The gate was open on 23 closed patterns, every one produced under the
+  # stop bug removed 2026-07-20. Nothing had moved yet only because
+  # require_shadow_validation was true and bayesian_weight_history happened
+  # to be empty - that is luck holding, not a control.
   bayesian_learning_rate: 0.01
   bayesian_max_change_per_trade_pct: 3
   bayesian_weekly_max_total_pct: 10
   bayesian_monthly_max_total_pct: 25
-  min_trades_before_bayesian: 10
+
+  # Raised 10 -> 150. Six weighted buckets and ~60 rules cannot be fitted
+  # from 23 observations - the parameter space exceeds the sample, so any
+  # weight movement is noise fitted to a defect. 150 is the floor at which a
+  # 5pp shift in a bucket weight is distinguishable from sampling error at
+  # this win rate.
+  min_trades_before_bayesian: 150
+
+  # HARD gate, independent of the count. Weights stay frozen until the
+  # scoring recalibration (§19, Phase 4) lands AND a clean sample exists - a
+  # large sample of contaminated trades is worse than a small one, because it
+  # looks trustworthy. Flipping this to true is a decision-function change:
+  # it requires a minor/major version bump and a release note (§35/§36).
+  bayesian_enabled: false
+
+  # Only patterns recorded at or after this timestamp may train anything.
+  # Everything earlier was produced under the stop bug removed 2026-07-20.
+  # Applies to the LEARNING path only - the EV engine's pattern matching is
+  # deliberately left alone in Phase 1, because filtering it would change
+  # live scoring and this release is decision_function_changed: false. §15
+  # (Phase 2) extends the filter to every learning read.
+  min_pattern_recorded_at: '2026-07-25T00:00:00'
+
   loss_streak_halt: 5
   walk_forward_trigger_trades: 10
   walk_forward_trigger_days: 7
@@ -542,7 +569,7 @@ learning:
   pattern_db_lambda_day: 1.4
   champion_challenger_min_trades_for_significance: 30
   pattern_hold_days: 5
-  require_shadow_validation: true
+  require_shadow_validation: true    # never turn this off (§17)
 backtest:
   enabled: true
   weekly_trigger_days: 7

@@ -114,17 +114,19 @@ def find_rotation_victim(db, cfg: dict, candidate_ticker: str,
     min_days = float(rc.get("min_hold_days", 3.0))
 
     eligible = []
-    for pos in db.get_all_positions(simulated=simulated):
+    # get_MANAGED_positions (§5, 2026-07-24) now enforces at the query layer
+    # what the in-loop check below has enforced since 2026-07-23. Both are
+    # kept: rotation executes an ACTUAL market sell on the chosen victim, so
+    # a SYNC row reaching here would place a real, unrequested sell order on a
+    # holding the algorithm was never asked to manage - the one place in the
+    # system where belt AND braces is obviously worth the duplicated line.
+    for pos in db.get_managed_positions(simulated=simulated):
         if pos["ticker"] == candidate_ticker:
             continue
         # SYNC (engine/account_sync.py's auto-import of real Robinhood
         # holdings) and SEED (robinhood_sync.py's seed-paper mirror) rows
         # are positions the account happens to hold, not ones this engine
-        # chose to enter (2026-07-23) - never eligible as a rotation victim.
-        # For the real book this matters a lot: rotation executes an actual
-        # market sell on the chosen victim, so a SYNC row reaching here
-        # would mean placing a real, unrequested sell order on a holding
-        # the algorithm was never asked to manage.
+        # chose to enter - never eligible as a rotation victim.
         if str(pos.get("trade_mode") or "").upper() in ("SYNC", "SEED"):
             continue
         health = pos.get("position_health_score")

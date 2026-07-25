@@ -14,9 +14,11 @@ Combines FOUR components into one 0-100 score:
                       large the candidate trade is relative to the stock's
                       own average dollar volume. This is a MODEL, not
                       historical fill data - this codebase has no real
-                      execution/fill feedback loop from Robinhood (see
-                      README: trades are never placed from Python), so
-                      there's nothing to calibrate against yet. Treat it as
+                      execution/fill feedback loop from Robinhood yet (fills
+                      recorded by engine/live_trader.py and confirm_fill.py
+                      are not fed back into this estimate), so there is
+                      nothing to calibrate against. §22 (Phase 4) replaces
+                      this with the shared execution-cost model. Treat it as
                       directional, not exact - same posture as
                       storage/database.py's get_portfolio_heat().
   4. Liquidity consistency - PROXY from how far today's volume_ratio sits

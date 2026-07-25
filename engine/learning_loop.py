@@ -61,7 +61,14 @@ def maybe_run(db, cfg: dict, mode: str = "SWING") -> dict | None:
     trigger_days = learn_cfg.get("walk_forward_trigger_days", 30)
 
     last_run = db.get_last_learning_run(mode=mode)
-    current_closed = db.get_patterns(mode=mode, closed_only=True)
+    # §17 (Phase 1, 2026-07-24): only patterns recorded at or after
+    # learning.min_pattern_recorded_at may train anything. Walk-forward
+    # attribution IS training - it produces the per-rule proposals a human is
+    # then asked to approve - so it must not be computed from the 23 patterns
+    # produced under the stop bug removed 2026-07-20. In practice this means
+    # no learning run triggers until a clean sample accumulates, which is the
+    # intended effect of the freeze and is visible in the log line below.
+    current_closed = db.get_closed_patterns(cfg=cfg, mode=mode)
     current_n = len(current_closed)
 
     reason = _check_trigger(last_run, current_n, trigger_trades, trigger_days)

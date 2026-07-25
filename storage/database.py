@@ -59,6 +59,26 @@ PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 # (verified via repo-wide grep before this migration).
 DB_PATH = Path(__file__).resolve().parent.parent / "output" / "trading.db"
 
+# ── Unmanaged position modes (§5, Phase 1, 2026-07-24 audit) ────────────────
+# SYNC: engine/account_sync.py's import of REAL Robinhood holdings.
+# SEED: robinhood_sync.py's clone of the real book into the paper book.
+# Neither is a position this engine decided to enter, so neither is one this
+# engine may decide to exit. This tuple is the single source of truth; every
+# other layer that repeats the check (rules/sell_rules.py,
+# engine/live_trader.py, engine/rotation.py) mirrors it deliberately rather
+# than importing it, so that the purest, dependency-free modules stay
+# importable without the Postgres driver. tests/test_sync_quarantine.py
+# asserts the mirrors have not drifted.
+MANAGED_EXCLUDED_MODES = ("SYNC", "SEED")
+
+
+def is_unmanaged_mode(trade_mode) -> bool:
+    """True when a position's trade_mode marks it as NOT this engine's to
+    close. Case-insensitive and None-safe: a NULL trade_mode is a legacy
+    engine row, which IS managed."""
+    return str(trade_mode or "").upper() in MANAGED_EXCLUDED_MODES
+
+
 _POOL_LOCK = threading.Lock()
 _POOL = None  # process-wide pool, shared by every Database() instance in
               # this process (scheduler.py, server.py, main.py, confirm_fill.py
@@ -308,7 +328,14 @@ CREATE TABLE IF NOT EXISTS pattern_database (
     outcome_pct REAL,                -- NULL until the trade closes
     hold_hours REAL,
     exit_reason TEXT,
-    is_closed INTEGER DEFAULT 0
+    is_closed INTEGER DEFAULT 0,
+    -- Provenance (§17, migrations/001 + 003). Which build and which scoring
+    -- configuration produced this row. Two rows with different
+    -- config_fingerprints came from different strategies and must not be
+    -- pooled, however close their recorded_at values are.
+    app_version TEXT,
+    engine_version TEXT,
+    config_fingerprint TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bayesian_weekly_tracker (
@@ -769,6 +796,25 @@ class Database:
             self._add_column_if_missing(conn, "cycle_status", "kill_reason", "TEXT")
             self._migrate_paper_trading(conn)
             self._migrate_rotation_log(conn)
+            self._migrate_phase1_columns(conn)
+
+    def _migrate_phase1_columns(self, conn):
+        """Phase 1 (§5, §17). Mirrors migrations/002 and 003 so that a FRESH
+        database converges to the same schema as a migrated one.
+
+        The .sql files remain the reviewable record - they carry the backward
+        SQL that migrations/README requires, and 002 additionally performs the
+        one-time data quarantine, which is a data change and therefore
+        deliberately NOT repeated here. This method is schema only, and every
+        statement is idempotent."""
+        # §17: pattern provenance. 001 added app_version via SQL; add it here
+        # too so a fresh database that never ran 001 still has it.
+        for col in ("app_version", "engine_version", "config_fingerprint"):
+            self._add_column_if_missing(conn, "pattern_database", col, "TEXT")
+        # §5: preserved stop machinery for quarantined SYNC/SEED rows.
+        self._add_column_if_missing(conn, "positions", "quarantined_stop_price", "REAL")
+        self._add_column_if_missing(conn, "positions", "quarantined_stop_state", "TEXT")
+        self._add_column_if_missing(conn, "positions", "quarantined_at", "TEXT")
 
     def _migrate_rotation_log(self, conn):
         """Portfolio Rotation Engine (engine/rotation.py, 2026-07-17): one row
@@ -2415,8 +2461,12 @@ class Database:
             )
 
     def get_all_positions(self, simulated: bool = None):
-        """simulated: None = both books (back-compat), False = real only,
-        True = simulated (paper) only."""
+        """EVERY open row, including unmanaged ones. simulated: None = both
+        books (back-compat), False = real only, True = simulated (paper) only.
+
+        Use this ONLY for display, reconciliation and position-count maths.
+        Any code path that can CLOSE a position must call
+        get_managed_positions() instead - see MANAGED_EXCLUDED_MODES."""
         q = "SELECT * FROM positions WHERE status = 'open'"
         if simulated is not None:
             q += f" AND COALESCE(simulated, 0) = {1 if simulated else 0}"
@@ -2424,6 +2474,49 @@ class Database:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(q)
             return [dict(r) for r in cur.fetchall()]
+
+    def get_managed_positions(self, simulated: bool = None) -> list:
+        """Positions this ENGINE opened and may therefore close (§5, Phase 1).
+
+        Excludes SYNC (engine/account_sync.py's import of real Robinhood
+        holdings) and SEED (robinhood_sync.py's paper mirror of the real
+        book) - both are informational, and neither represents a decision
+        this system made. Their size bears no relation to
+        trading.trade_size_usd, so a stop sized for a $100 engine entry
+        would be liquidating thousands of dollars of unrelated capital: as
+        of the 2026-07-24 audit the eight SYNC rows totalled ~$42,000 and
+        carried LIVE stop machinery (KMB in TREND_FOLLOWING, RVI in
+        PROFIT_PROTECT, SMFL with a stop exactly equal to its entry).
+
+        Every automated exit path must use this, never get_all_positions().
+        This is layer 1 of three; rules/sell_rules.py's evaluate() and
+        engine/live_trader.py's execute_sell_live() repeat the check, because
+        a single guard on a $42,000 exposure is a single point of failure.
+
+        `simulated` follows get_all_positions' semantics exactly (None = both
+        books) so this is a drop-in replacement at every call site. The
+        remediation plan's sketch defaulted to False; defaulting to None here
+        avoids silently narrowing the two callers that legitimately manage
+        both books (engine/position_management.py's Loop B being the one that
+        matters).
+        """
+        q = ("SELECT * FROM positions WHERE status = 'open' "
+             "AND COALESCE(UPPER(trade_mode), '') NOT IN ('SYNC', 'SEED')")
+        if simulated is not None:
+            q += f" AND COALESCE(simulated, 0) = {1 if simulated else 0}"
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(q)
+            return [dict(r) for r in cur.fetchall()]
+
+    def is_managed(self, ticker: str, simulated: bool = False) -> bool:
+        """True when an open position exists for `ticker` AND this engine is
+        allowed to close it. False for no position at all, and False for a
+        SYNC/SEED row - callers must not treat 'not managed' as 'not held'."""
+        pos = self.get_open_position(ticker, simulated=simulated)
+        if not pos:
+            return False
+        return not is_unmanaged_mode(pos.get("trade_mode"))
 
     def get_open_position_by_pattern(self, pattern_id: int, simulated: bool = True):
         """Used by scheduler._close_due_patterns() to skip the time-based
@@ -2807,14 +2900,26 @@ class Database:
             return dict(row) if row else None
 
     # ---------- pattern database ----------
-    def add_pattern(self, ticker: str, mode: str, features: dict, trade_id: str = None) -> int:
+    def add_pattern(self, ticker: str, mode: str, features: dict, trade_id: str = None,
+                     config_fingerprint: str = None) -> int:
+        """§17 (Phase 1): every pattern row is stamped with the build that
+        produced it (app_version/engine_version from storage/version.py) and
+        the fingerprint of the config values that can change a score or an
+        exit. Provenance is written at INSERT and never updated - a row's
+        origin is not a thing that changes."""
         import json
+        from storage.version import app_version
+        version = app_version()
         with self._conn() as conn:
             cur = conn.execute(
-                """INSERT INTO pattern_database (trade_id, ticker, mode, recorded_at, features, is_closed)
-                VALUES (?,?,?,?,?,0)
+                """INSERT INTO pattern_database
+                   (trade_id, ticker, mode, recorded_at, features, is_closed,
+                    app_version, engine_version, config_fingerprint)
+                VALUES (?,?,?,?,?,0,?,?,?)
                 RETURNING id""",
-                (trade_id, ticker, mode, datetime.utcnow().isoformat(), json.dumps(features)),
+                (trade_id, ticker, mode, datetime.utcnow().isoformat(),
+                 json.dumps(features), version, version,
+                 config_fingerprint or "unstamped"),
             )
             return cur.lastrowid
 
@@ -2837,7 +2942,16 @@ class Database:
                 (outcome_pct, hold_hours, exit_reason, pattern_id),
             )
 
-    def get_patterns(self, mode: str = None, ticker: str = None, closed_only: bool = True) -> list:
+    def get_patterns(self, mode: str = None, ticker: str = None, closed_only: bool = True,
+                      since: str = None) -> list:
+        """`since`: ISO timestamp; only patterns with recorded_at >= it.
+
+        DEFAULTS ARE UNCHANGED ON PURPOSE (§17, Phase 1). engine/ev_engine.py
+        reaches this method through PatternDatabase.find_similar_trades on the
+        live decision path, so making the cutoff a default would change live
+        scoring - and Phase 1 ships decision_function_changed: false. Learning
+        callers opt in via get_closed_patterns() below; §15 (Phase 2) is where
+        the filter becomes universal."""
         import json
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
@@ -2851,11 +2965,37 @@ class Database:
                 params.append(ticker)
             if closed_only:
                 query += " AND is_closed = 1"
+            if since:
+                query += " AND recorded_at >= ?"
+                params.append(since)
             cur = conn.execute(query, params)
             rows = [dict(r) for r in cur.fetchall()]
             for r in rows:
                 r["features"] = json.loads(r["features"])
             return rows
+
+    def get_closed_patterns(self, cfg: dict = None, mode: str = None,
+                             since: str = None) -> list:
+        """Closed patterns that are ALLOWED TO TRAIN something (§17).
+
+        Applies learning.min_pattern_recorded_at, so every learning caller
+        gets the same clean sample without each one remembering to pass the
+        cutoff. Everything recorded before it was produced under the stop bug
+        removed 2026-07-20; a large sample of contaminated trades is worse
+        than a small one, because it looks trustworthy.
+
+        Pass `cfg` (preferred) or an explicit `since`. With neither, this is
+        just get_patterns(closed_only=True) - and that is a bug in the caller,
+        so it logs a warning rather than silently widening the sample.
+
+        §15 (Phase 2) adds the data_quality='ok' filter here.
+        """
+        if since is None and cfg is not None:
+            since = ((cfg.get("learning", {}) or {}).get("min_pattern_recorded_at"))
+        if since is None:
+            logger.warning("get_closed_patterns called with no cutoff - the §17 "
+                            "contamination filter is NOT being applied")
+        return self.get_patterns(mode=mode, closed_only=True, since=since)
 
     # ---------- Bayesian weight updates ----------
     def log_bayesian_update(self, rule_name: str, bucket: str, old_weight: float, new_weight: float,

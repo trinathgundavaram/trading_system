@@ -47,6 +47,14 @@ with each stock's own volatility instead of every stock sharing a flat 10%.
 """
 from dataclasses import dataclass, field
 
+# ── Unmanaged position modes (§5, Phase 1, 2026-07-24 audit) ────────────────
+# Mirrors storage.database.MANAGED_EXCLUDED_MODES. Deliberately duplicated as
+# a literal rather than imported: this module has no dependency beyond the
+# stdlib, and it must stay that way so it can be unit-tested (and reasoned
+# about) without the Postgres driver, the connection pool, or a live database.
+# tests/test_sync_quarantine.py asserts the two definitions have not drifted.
+UNMANAGED_TRADE_MODES = ("SYNC", "SEED")
+
 
 @dataclass
 class SellResult:
@@ -68,6 +76,20 @@ class SellRulesEngine:
     def evaluate(self, td, position, mkt, cfg: dict) -> SellResult:
         if not position:
             return SellResult(False)
+
+        # SYNC/SEED positions are NOT this engine's to close (§5, 2026-07-24
+        # audit). A SYNC row is a real brokerage holding imported for
+        # visibility; its size bears no relation to trading.trade_size_usd, so
+        # a stop sized for a $100 entry would be liquidating thousands of
+        # dollars of unrelated capital. Checked here as well as at the query
+        # layer (storage/database.py's get_managed_positions) so that a future
+        # caller handing us a position dict directly cannot bypass it - this
+        # is layer 2 of 3, and it is the layer that catches the case where
+        # someone reintroduces get_all_positions() at a call site.
+        if str(position.get("trade_mode") or "").upper() in UNMANAGED_TRADE_MODES:
+            return SellResult(
+                False,
+                reason="unmanaged position (SYNC/SEED) - engine does not exit these")
 
         sell_cfg = cfg["sell_rules"]
         rules = sell_cfg["rules"]
