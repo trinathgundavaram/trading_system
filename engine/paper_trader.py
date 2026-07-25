@@ -307,15 +307,16 @@ def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None,
 
     # Learning: rule-driven outcome replaces the flat time-based close.
     if pattern_db is not None and closed.get("pattern_id"):
-        try:
-            from datetime import datetime
-            entry = datetime.fromisoformat(closed["entry_time"])
-            hold_hours = (datetime.utcnow() - entry).total_seconds() / 3600
-        except (ValueError, TypeError, KeyError):
-            hold_hours = 0.0
+        # §15: hold_hours comes from close_position, which is now the single
+        # place it is computed. This used to re-derive it from
+        # closed["entry_time"] against a fresh clock reading, and the MAE/MFE
+        # block below re-derived it a third time from a re-fetched row - which
+        # is how ADPT ended up recorded as 6.34h in one table and 5.0h in
+        # another. Three computations, three answers.
         try:
             pattern_db.close_trade(closed["pattern_id"], closed["pnl_pct"],
-                                    hold_hours, exit_reason=f"paper_{reason}")
+                                    closed.get("hold_hours", 0.0),
+                                    exit_reason=f"paper_{reason}")
         except Exception as e:
             logger.error(f"{ticker}: [PAPER] pattern close failed: {e}", exc_info=True)
 
@@ -333,13 +334,18 @@ def execute_sell(db, ticker: str, price: float, reason: str, pattern_db=None,
     try:
         trade = db.get_closed_trade_for_ticker(ticker, simulated=True)
         if trade:
+            # §15: the AUTHORITATIVE values come from close_position's own
+            # arithmetic - the same numbers written to paper_trades. This
+            # block used to recompute pnl_pct's companion figures from the
+            # re-fetched row, which is what produced two different answers for
+            # ADPT (-1.88% over 6.34h in paper_trades, -3.20% over 5.0h in
+            # mae_mfe_data - one trade, two records, neither reconcilable
+            # against the other). The re-fetch itself stays: it is the only
+            # source of setup_type/entry_regime/MAE/MFE, which
+            # close_position's return value does not carry.
             trade["pnl_pct"] = closed["pnl_pct"]
-            try:
-                from datetime import datetime as _dt
-                entry_time = _dt.fromisoformat(trade["entry_time"])
-                trade["hold_hours"] = (_dt.utcnow() - entry_time).total_seconds() / 3600
-            except (KeyError, ValueError, TypeError):
-                trade["hold_hours"] = 0.0
+            trade["pnl"] = closed["pnl"]
+            trade["hold_hours"] = closed.get("hold_hours", 0.0)
             from engine.mae_mfe_engine import record_completed
             record_completed(trade)
     except Exception as e:

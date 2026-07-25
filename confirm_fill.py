@@ -211,12 +211,13 @@ def cmd_sell(ticker: str, price: float):
     # immediately re-buying the same ticker after a stop-out.
     trade = db.get_closed_trade_for_ticker(ticker)
     if trade:
+        # §15: authoritative figures from close_position, which is now the one
+        # place P&L and hold time are computed. Recomputing them here from the
+        # re-fetched row against a fresh clock reading is what let the same
+        # trade be recorded two different ways in two tables.
         trade["pnl_pct"] = closed["pnl_pct"]
-        try:
-            entry_time = datetime.fromisoformat(trade["entry_time"])
-            trade["hold_hours"] = (datetime.utcnow() - entry_time).total_seconds() / 3600
-        except (KeyError, ValueError, TypeError):
-            trade["hold_hours"] = 0.0
+        trade["pnl"] = closed["pnl"]
+        trade["hold_hours"] = closed.get("hold_hours", 0.0)
         from engine.mae_mfe_engine import record_completed
         record_completed(trade)
         print(f"  Recorded MAE/MFE for future pattern-matching "
@@ -246,8 +247,14 @@ def cmd_sell(ticker: str, price: float):
               f"(consider this a data quality note, not an error).")
         return
 
-    recorded = datetime.fromisoformat(pattern["recorded_at"])
-    hold_hours = (datetime.utcnow() - recorded).total_seconds() / 3600
+    # §15: hold time is measured from ENTRY, using close_position's figure -
+    # the same definition paper_trader and live_trader now use. This measured
+    # from the pattern's recorded_at instead, i.e. from SIGNAL time, which is
+    # a different quantity: a signal recorded at 09:35 and filled at 10:10
+    # produced a hold time 35 minutes longer than the same trade closed by any
+    # other path. pattern_database.hold_hours has to mean one thing, since
+    # engine/ev_engine.py averages it across rows from all three.
+    hold_hours = closed.get("hold_hours", 0.0)
     pattern_db.close_trade(pattern_id, closed["pnl_pct"], hold_hours, exit_reason="manual_fill_confirmed")
     print(f"  Closed pattern #{pattern_id} with your REAL outcome ({closed['pnl_pct']:+.2f}%, "
           f"{hold_hours:.1f}h held) - this is what the learning backend will use.")

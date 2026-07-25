@@ -570,10 +570,13 @@ def execute_sell_live(db, cfg: dict, ticker: str, reason: str, pattern_db=None,
                       fill_price=fill_price, order_id=order_id, status="filled")
         if pattern_db is not None and closed.get("pattern_id"):
             try:
-                entry = datetime.fromisoformat(closed["entry_time"])
-                hold_hours = (datetime.utcnow() - entry).total_seconds() / 3600
+                # §15: from close_position, the one place hold time is
+                # computed. Re-deriving it here against a fresh clock reading
+                # is how the same trade came to be recorded with two different
+                # hold times in two different tables.
                 pattern_db.close_trade(closed["pattern_id"], closed["pnl_pct"],
-                                        hold_hours, exit_reason=f"live_{reason}")
+                                        closed.get("hold_hours", 0.0),
+                                        exit_reason=f"live_{reason}")
             except Exception as e:
                 logger.error(f"{ticker}: [LIVE] pattern close failed: {e}")
         logger.info(f"{ticker}: [LIVE] SOLD @ ${fill_price:.2f} ({reason}) - "

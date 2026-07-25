@@ -2,7 +2,11 @@
 favorable excursion per open position, and compares live trades against
 historical percentiles (from storage/database.py's mae_mfe_data table) to
 flag anomalies once enough history exists."""
+import logging
+
 from storage.database import Database
+
+logger = logging.getLogger("trading")
 
 
 def update_live(position_id, ticker_data: dict, entry_price: float) -> dict:
@@ -68,17 +72,68 @@ def evaluate_mae_percentile(position: dict, setup_type: str, regime: str) -> dic
     }
 
 
+def _classify_quality(mae_pct, mfe_pct, outcome_pct, hold_hours) -> str:
+    """The §15 sweep, applied at WRITE time.
+
+    Migration 007 quarantines the rows that are already there. This stops the
+    same shapes coming back in as 'ok' - because a cleanup that only runs once
+    is a cleanup that has to be run again, and the next person to notice will
+    be whoever is puzzled by the learning results.
+
+    The two conditions are the ones the audit actually found, and both are
+    statements about arithmetic rather than about plausibility:
+
+      A hold time under 36 seconds is not a trade this system can produce -
+      the fastest configured cycle is minutes apart (NVDA at +6.67% held for
+      12 milliseconds; MU at +10.00% for 10ms).
+
+      A non-zero outcome with zero MAE and zero MFE is impossible, since the
+      outcome is itself an excursion. All three of the fabricated rows had
+      exactly 0.0 for both.
+
+    Marked, not rejected. Refusing the insert would lose the evidence, and the
+    evidence is how the contamination gets traced next time.
+    """
+    try:
+        if hold_hours is not None and float(hold_hours) < 0.01:
+            return "synthetic"
+        if (float(mae_pct or 0) == 0 and float(mfe_pct or 0) == 0
+                and float(outcome_pct or 0) != 0):
+            return "synthetic"
+    except (TypeError, ValueError):
+        return "synthetic"      # unparseable numbers are not a real trade either
+    return "ok"
+
+
 def record_completed(trade: dict) -> None:
-    """Called when a trade closes (confirm_fill.py's sell path). Stores
-    MAE/MFE for future learning."""
+    """Called when a trade closes (confirm_fill.py's and paper_trader.py's
+    sell paths). Stores MAE/MFE for future learning.
+
+    §15: the caller is expected to have overwritten pnl_pct/pnl/hold_hours
+    with close_position()'s figures before calling. Do not recompute them from
+    the trade row here - that second computation is exactly what recorded ADPT
+    as -1.88% over 6.34h in paper_trades and -3.20% over 5.0h in this table.
+    """
     db = Database()
+    mae = trade.get("max_adverse_excursion_pct") or 0
+    mfe = trade.get("max_favorable_excursion_pct") or 0
+    outcome = trade.get("pnl_pct", 0)
+    hold = trade.get("hold_hours", 0)
+    quality = _classify_quality(mae, mfe, outcome, hold)
+    if quality != "ok":
+        logger.warning(
+            f"mae_mfe: {trade.get('ticker')} recorded as data_quality="
+            f"{quality!r} (outcome {outcome}%, hold {hold}h, MAE {mae}, "
+            f"MFE {mfe}) - it will NOT train anything. If this came from a "
+            f"real trade, the bug is upstream in how those figures were set.")
     db.insert_mae_mfe({
         "trade_id": trade.get("id"),
         "ticker": trade["ticker"],
         "setup_type": trade.get("setup_type") or "unknown",
         "regime": trade.get("entry_regime") or "UNKNOWN",
-        "mae_pct": trade.get("max_adverse_excursion_pct") or 0,
-        "mfe_pct": trade.get("max_favorable_excursion_pct") or 0,
-        "outcome_pct": trade.get("pnl_pct", 0),
-        "hold_hours": trade.get("hold_hours", 0),
+        "mae_pct": mae,
+        "mfe_pct": mfe,
+        "outcome_pct": outcome,
+        "hold_hours": hold,
+        "data_quality": quality,
     })

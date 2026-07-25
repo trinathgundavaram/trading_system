@@ -895,6 +895,15 @@ class Database:
                                      "REAL DEFAULT 0")
         self._add_column_if_missing(conn, "daily_stats", "paper_running_drawdown",
                                      "REAL DEFAULT 0")
+        # §15: learning-data quarantine. Mirrors migrations/007's SCHEMA only.
+        # The sweep that classifies existing rows is a DATA change and stays in
+        # the .sql file, deliberately - re-running a data classification on
+        # every process start would re-quarantine rows an operator had
+        # examined and cleared by hand.
+        self._add_column_if_missing(conn, "mae_mfe_data", "data_quality",
+                                     "TEXT DEFAULT 'ok'")
+        self._add_column_if_missing(conn, "pattern_database", "data_quality",
+                                     "TEXT DEFAULT 'ok'")
 
     def _migrate_rotation_log(self, conn):
         """Portfolio Rotation Engine (engine/rotation.py, 2026-07-17): one row
@@ -2760,10 +2769,27 @@ class Database:
                       {win_col} = daily_stats.{win_col} + excluded.{win_col}""",
                 (today, pnl, 1 if pnl > 0 else 0),
             )
+            # §15: hold_hours is computed HERE and nowhere else.
+            #
+            # ADPT appeared in paper_trades as -1.88% over 6.34h and in
+            # mae_mfe_data as -3.20% over 5.0h - the same trade, two answers.
+            # The cause was two independent computations: close_position did
+            # the arithmetic for the ledger, and the MAE/MFE path redid it
+            # from a re-fetched row a few statements later, against a
+            # different clock reading and sometimes a different row. One
+            # definition, one caller, one answer.
+            hold_hours = 0.0
+            try:
+                entry_dt = datetime.fromisoformat(row["entry_time"])
+                hold_hours = (datetime.utcnow() - entry_dt).total_seconds() / 3600
+            except (TypeError, ValueError):
+                logger.warning(f"close_position({ticker}): unparseable entry_time "
+                               f"{row.get('entry_time')!r} - hold_hours recorded as 0")
             return {
                 "ticker": ticker, "entry_price": entry_price, "entry_time": row["entry_time"],
                 "shares": shares, "pattern_id": row.get("pattern_id"),
                 "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct,
+                "hold_hours": hold_hours,
                 "trade_mode": row.get("trade_mode"),
             }
 
@@ -3178,24 +3204,41 @@ class Database:
     # ---------- MAE/MFE learning ----------
     def query_mae_winners(self, setup_type: str, regime: str) -> list:
         """MAE values (as %) for historically winning trades of this setup_type/regime,
-        used to flag when a live position's drawdown looks anomalous vs. past winners."""
+        used to flag when a live position's drawdown looks anomalous vs. past winners.
+
+        §15: filtered to data_quality='ok'. mae_mfe_data contained rows that
+        are not trades - NVDA at +6.67% held for 12 milliseconds, MU at
+        +10.00% held for 10ms, a ticker literally named "AAA", all three with
+        MAE and MFE of exactly 0.0. This method feeds a percentile comparison
+        against "historical winners", and a synthetic +10% winner with zero
+        excursion makes every real position's drawdown look anomalous."""
         with self._conn() as conn:
             cur = conn.execute(
                 """SELECT mae_pct FROM mae_mfe_data
-                   WHERE setup_type = ? AND regime = ? AND outcome_pct > 0""",
+                   WHERE setup_type = ? AND regime = ? AND outcome_pct > 0
+                     AND COALESCE(data_quality, 'ok') = 'ok'""",
                 (setup_type, regime),
             )
             return [row[0] for row in cur.fetchall() if row[0] is not None]
 
-    def get_recent_mae_mfe(self, limit: int = 500) -> list:
+    def get_recent_mae_mfe(self, limit: int = 500, include_quarantined: bool = False) -> list:
         """Every recorded mae_mfe_data row (real closed trades only - see
         engine/mae_mfe_engine.py's record_completed(), called from
         confirm_fill.py's sell path) - used by analytics/trade_attribution.py
         to join a closed trade's MAE/MFE behavior against its
-        pattern_database entry features for win/loss-reason classification."""
+        pattern_database entry features for win/loss-reason classification.
+
+        §15: quarantined rows are excluded by default. `include_quarantined`
+        exists for forensics - the rows were MARKED rather than deleted
+        precisely so the evidence of how the contamination happened survives,
+        and an audit that cannot see them defeats the point of keeping them."""
+        q = "SELECT * FROM mae_mfe_data"
+        if not include_quarantined:
+            q += " WHERE COALESCE(data_quality, 'ok') = 'ok'"
+        q += " ORDER BY recorded_at DESC LIMIT ?"
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
-            cur = conn.execute("SELECT * FROM mae_mfe_data ORDER BY recorded_at DESC LIMIT ?", (limit,))
+            cur = conn.execute(q, (limit,))
             return [dict(r) for r in cur.fetchall()]
 
     def insert_mae_mfe(self, data: dict):
@@ -3203,11 +3246,17 @@ class Database:
         with self._conn() as conn:
             conn.execute(
                 """INSERT INTO mae_mfe_data
-                (id, trade_id, ticker, setup_type, regime, mae_pct, mfe_pct, outcome_pct, hold_hours, recorded_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (id, trade_id, ticker, setup_type, regime, mae_pct, mfe_pct, outcome_pct,
+                 hold_hours, recorded_at, data_quality)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (str(uuid.uuid4()), data.get("trade_id"), data.get("ticker"), data.get("setup_type"),
                  data.get("regime"), data.get("mae_pct"), data.get("mfe_pct"), data.get("outcome_pct"),
-                 data.get("hold_hours"), datetime.utcnow().isoformat()),
+                 data.get("hold_hours"), datetime.utcnow().isoformat(),
+                 # §15: the writer classifies. Defaulting to 'ok' here would
+                 # make the column a promise nothing checks - the caller
+                 # (engine/mae_mfe_engine.record_completed) applies the same
+                 # rules migration 007 applied to the existing rows.
+                 data.get("data_quality") or "ok"),
             )
 
     # ---------- re-entry cooldown ----------
@@ -3504,20 +3553,39 @@ class Database:
             )
 
     def get_patterns(self, mode: str = None, ticker: str = None, closed_only: bool = True,
-                      since: str = None) -> list:
+                      since: str = None, include_quarantined: bool = False) -> list:
         """`since`: ISO timestamp; only patterns with recorded_at >= it.
 
-        DEFAULTS ARE UNCHANGED ON PURPOSE (§17, Phase 1). engine/ev_engine.py
+        The `since` DEFAULT IS STILL UNCHANGED (§17, Phase 1): engine/ev_engine.py
         reaches this method through PatternDatabase.find_similar_trades on the
-        live decision path, so making the cutoff a default would change live
-        scoring - and Phase 1 ships decision_function_changed: false. Learning
-        callers opt in via get_closed_patterns() below; §15 (Phase 2) is where
-        the filter becomes universal."""
+        live decision path, and Phase 1 shipped decision_function_changed:
+        false, so learning callers opt into the cutoff via get_closed_patterns().
+
+        §15 (Phase 2) makes the data_quality filter universal instead, and
+        that IS a decision-function change - declared as such in the release
+        note, not slipped in. The distinction from §17's cutoff is the reason:
+        a `pre_stop_fix` row is a REAL trade taken under a system that no
+        longer exists, so excluding it from live EV is a judgement call worth
+        deferring. A row marked `synthetic` is not a trade at all - a 12ms
+        hold, or a non-zero outcome with arithmetically impossible zero
+        excursion - and there is no reading of "evidence" under which it
+        should inform a live decision. The sweep marks both, so both are
+        filtered; the honest consequence is that ev_engine will report
+        insufficient history until real post-fix trades accumulate, which is
+        the true state of the evidence rather than a regression.
+
+        `include_quarantined` is for forensics and for the UI's own audit
+        views. The rows were marked rather than deleted so that the evidence
+        of how the contamination happened survives; a reader that cannot see
+        them defeats the point of keeping them.
+        """
         import json
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             query = "SELECT * FROM pattern_database WHERE 1=1"
             params = []
+            if not include_quarantined:
+                query += " AND COALESCE(data_quality, 'ok') = 'ok'"
             if mode:
                 query += " AND mode = ?"
                 params.append(mode)
@@ -3549,7 +3617,11 @@ class Database:
         just get_patterns(closed_only=True) - and that is a bug in the caller,
         so it logs a warning rather than silently widening the sample.
 
-        §15 (Phase 2) adds the data_quality='ok' filter here.
+        §15 (Phase 2) added the data_quality='ok' filter - in get_patterns()
+        rather than here, so that it applies to every reader including the
+        live path, not only to callers that remembered to come through this
+        door. See get_patterns() for why that filter is universal while the
+        §17 cutoff is not.
         """
         if since is None and cfg is not None:
             since = ((cfg.get("learning", {}) or {}).get("min_pattern_recorded_at"))
