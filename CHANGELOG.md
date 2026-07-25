@@ -20,7 +20,7 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
-## [1.31] — v1.3.1 — 2026-07-25
+## [1.3.1] — v1.3.1 — 2026-07-25
 
 ### Decision function: unchanged — v1.3.0 trade data remains poolable
 
