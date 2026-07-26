@@ -22,7 +22,7 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
-## [2.4.0] — v2.4.0 — 2026-07-26
+## [2.4] — v2.4.0 — 2026-07-26
 
 ### Documentation audit: what the docs claimed was unbuilt, checked against the code
 
