@@ -30,14 +30,28 @@
 #  decision. Upgrading one of these invalidates the validation receipt and
 #  requires a full re-validation before live execution may be re-armed.
 # -----------------------------------------------------------------------------
-pandas==2.2.3
+pandas==2.3.3            # floor of >=2.3.2 is set by pandas-ta 0.4.71b0; 2.2.3 was
+                         # unsatisfiable against it (ResolutionImpossible, 2026-07-25).
+                         # Bumped from 2.2.3 - SCORE-AFFECTING, re-validate (§23).
 pandas-ta==0.4.71b0      # no wheel below Python 3.12 - see engine/ticker_analyzer.py,
                          # which now REFUSES to start on the hand-rolled fallback
-                         # unless TP_REQUIRE_REFERENCE_TA=0 is set deliberately
-numpy==2.2.6            # pandas-ta 0.3.14b still does `from numpy import NaN`,
-                         # removed in numpy>=1.24 - ticker_analyzer patches it back
-scipy==1.11.4            # Wilson / Clopper-Pearson CIs, two-proportion z-test
-                         # (analytics/, learning/) - moves confidence gating
+                         # unless TP_REQUIRE_REFERENCE_TA=0 is set deliberately.
+                         # Declares: numba==0.61.2, numpy>=2.2.6, pandas>=2.3.2,
+                         # tqdm>=4.67.1 - all pinned explicitly below.
+numpy==2.2.6            # upper bound is numba 0.61.2's numpy<2.3, lower bound is
+                         # pandas-ta's numpy>=2.2.6 - 2.2.x is the only window.
+                         # (The `from numpy import NaN` shim in ticker_analyzer is
+                         # for pandas-ta 0.3.14b, which is no longer on PyPI; it is
+                         # harmless on 0.4.x but no longer load-bearing.)
+numba==0.61.2            # transitive via pandas-ta, but it is an == pin upstream and
+                         # it is what constrains numpy - pinned here so drift is visible
+tqdm==4.67.1             # transitive via pandas-ta; progress bars only, not score-affecting
+scipy==1.16.3            # Wilson / Clopper-Pearson CIs, two-proportion z-test
+                         # (analytics/, learning/) - moves confidence gating.
+                         # Bumped from 1.11.4, which capped numpy<1.28 and so was
+                         # unsatisfiable against pandas-ta's numpy>=2.2.6.
+                         # analytics/confidence_intervals.py touches only
+                         # stats.norm and stats.beta - unchanged 1.11 -> 1.16.
 
 # -----------------------------------------------------------------------------
 #  ORDER PATH - never float this. A renamed method here is a failed or
