@@ -20,8 +20,19 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+Nothing.
+
+## [2.2] — v2.2.0 — 2026-07-26
+
+### The Phase 2.5 cutover, actually run
+
+Six defects, every one found by RUNNING the sequence rather than reading it.
+The migrations, the purge and the backup step had all been reasoned about
+carefully and never executed once.
+
 **Decision function: UNCHANGED.** Nothing here touches scoring, sizing, entry
-or exit logic. No config value a rule reads has moved.
+or exit logic. No config value a rule reads has moved; `config_fingerprint` is
+unchanged at `cc9a149613427f56`.
 
 ### Fixed — the cutover could not have completed
 
