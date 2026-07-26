@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from rich.console import Console
 from rich.layout import Layout
@@ -288,6 +289,36 @@ def run_ui():
                    "`python3 scheduler.py` separately, or use `./run.sh --ui`.")
 
     banner.print_banner(console, scheduler_module.load_config())
+
+    # Reclaim the port from a stale predecessor before binding (2026-07-26).
+    #
+    # This lives HERE, not only in scripts/services.py, because the process
+    # manager is not the only thing that starts this process. v2.3.1 put the
+    # reclaim in services.py's install/start/restart verbs, which fixed the
+    # human-initiated path and left the automatic one broken: launchd's
+    # KeepAlive (and systemd's Restart=, and Task Scheduler) relaunch
+    # `main.py --ui` DIRECTLY. They never re-enter services.py, so they never
+    # called it.
+    #
+    # The observable consequence was a self-sustaining loop. One orphaned UI
+    # held 8080; launchd relaunched a doomed child every few seconds; each one
+    # printed the full startup banner - including "Serving http://..." - and
+    # then died on [Errno 48]. The log therefore looked like a server starting
+    # normally, over and over, while the browser talked to the orphan. It ran
+    # 342 relaunches deep before anyone read far enough down the log, and
+    # survived the v2.3.1 fix untouched.
+    #
+    # Guarding the bind itself is the only placement that covers every launcher.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+        from services import _free_ui_port
+        _free_ui_port(port=8080)
+    except Exception as e:
+        # Never block startup on the cleanup. If it cannot run, the bind either
+        # succeeds anyway or fails with its own message.
+        console.print(f"[yellow]note: could not check port 8080 for a stale "
+                       f"holder ({e})[/yellow]")
+
     uvicorn.run(app, host=host, port=8080, log_level="warning")
 
 

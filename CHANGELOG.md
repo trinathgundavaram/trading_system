@@ -22,6 +22,39 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [2.3.2] — v2.3.2 — 2026-07-26
+
+### v2.3.1's port fix was in the wrong layer
+
+**Decision function: UNCHANGED.** `config_fingerprint` `cc9a149613427f56`;
+`classify_change.py` says PATCH.
+
+- **The reclaim only ran from `services.py`'s verbs, so launchd's relaunches
+  bypassed it and the loop v2.3.1 was written to stop was still running when
+  v2.3.1 was tagged.** `KeepAlive` re-executes `main.py --ui` directly — as do
+  systemd's `Restart=` and Task Scheduler — re-entering none of `services.py`.
+  One orphan held 8080, launchd spawned a replacement every few seconds, and
+  each printed the entire startup banner including `Serving http://...` before
+  dying on `[Errno 48]`. The log reads like a healthy server restarting, which
+  is why 342 iterations went unnoticed.
+
+  `_free_ui_port()` now guards the bind itself, in `main.py:run_ui()` between
+  the banner and `uvicorn.run()` — the one point every launcher passes through.
+  Wrapped so any failure (no `scripts/`, no `lsof`) prints a note and proceeds:
+  refusing to start because the cleanup could not run would be worse than the
+  bug.
+
+  Two new tests assert *placement* — that `_free_ui_port` precedes
+  `uvicorn.run(` and sits inside a `try`/`except`. v2.3.1's eight behavioural
+  tests all passed and missed this, because the function was correct and simply
+  unreachable from the path that mattered. Tests proving a helper works say
+  nothing about whether anything calls it.
+
+- Known behaviour change: running a launchd UI job **and** `run.sh --ui`
+  together now means they fight for the port, last one winning. Same as
+  `run.sh`'s behaviour since 2026-07-14, and better than a permanent loop.
+  Don't run both.
+
 ## [2.3.1] — v2.3.1 — 2026-07-26
 
 ### v2.3.0 was correct and never ran

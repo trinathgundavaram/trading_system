@@ -637,6 +637,39 @@ class TestStaleUiPortIsReclaimed:
              mock.patch.object(mod.subprocess, "run", side_effect=OSError("boom")):
             assert mod._port_holder_pids(8080) == []
 
+    def test_the_bind_itself_is_guarded_not_just_the_service_verbs(self):
+        """The gap that made v2.3.1 an incomplete fix.
+
+        Putting the reclaim in services.py's verbs covered `./service.sh
+        restart` and nothing else. launchd's KeepAlive - and systemd's
+        Restart=, and Task Scheduler - relaunch `main.py --ui` DIRECTLY,
+        re-entering none of it. So the relaunch loop that motivated the fix
+        survived the fix: one orphan held 8080 and launchd spawned a doomed
+        child every few seconds, each printing the full startup banner
+        including "Serving http://..." before dying on [Errno 48], which is why
+        the log read like a healthy server rather than a failing one.
+
+        Asserted against the source rather than by running run_ui(), which
+        would need uvicorn to actually bind. The property being locked in is
+        placement: the reclaim must sit between the banner and uvicorn.run, so
+        every launcher passes through it."""
+        src = (REPO / "main.py").read_text()
+        body = src[src.index("def run_ui("):]
+        reclaim = body.index("_free_ui_port")
+        bind = body.index("uvicorn.run(")
+        assert reclaim < bind, (
+            "the port reclaim must run BEFORE uvicorn binds - after it, the "
+            "bind has already failed and the process is about to exit")
+
+    def test_a_failing_reclaim_does_not_prevent_startup(self):
+        """The cleanup is a convenience, not a prerequisite. If scripts/ is
+        missing or lsof is absent, the UI must still try to bind - degrading to
+        the old behaviour, not refusing to start."""
+        src = (REPO / "main.py").read_text()
+        body = src[src.index("def run_ui("):]
+        segment = body[body.index("_free_ui_port") - 400:body.index("uvicorn.run(")]
+        assert "try:" in segment and "except Exception" in segment, segment
+
 
 # =============================================================================
 #  §13  the dependency guard reads metadata, not `pip freeze`
