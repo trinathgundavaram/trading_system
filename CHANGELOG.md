@@ -22,6 +22,42 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [3.2] — v3.2.0 — 2026-07-26
+
+### Decision function: UNCHANGED — learning-schema, live-safety-gate, and UI fixes
+
+`scripts/classify_change.py` reports MINOR and this ships as **minor**.
+`rules/swing_buy_rules.py`, `rules/sell_rules.py`, `rules/exit_scorer.py`,
+`rules/dynamic_thresholds.py`, `rules/hard_vetoes.py` and `config.yaml` are
+untouched — nothing about the strategy moved, so pre- and post-release trade
+history remains poolable.
+
+#### Fixed — external audit follow-through + the Learning tab's "Couldn't load this panel" error
+
+External audit (`trading_system_detailed_audit_v3_1_0` + executive summary)
+findings verified against the tree and fixed where still reproducible; a
+separately reported UI error root-caused to a silently-hanging OS keyring
+call. See `docs/releases/v3.2.0.md` for full detail.
+
+- **P1-01** `bucket7_score` (VOLATILITY_EXPANSION) computed by the scorer but
+  dropped by `learning/pattern_database.py`'s `NUMERIC_FEATURES` — the live
+  scorer and the learning/similarity engine saw different feature spaces.
+- **P1-07** `scheduler.py`'s portfolio-risk check failed OPEN on an
+  exception — a crashed risk engine silently let a live BUY through. Live
+  mode now fails CLOSED; paper mode stays advisory.
+- **P1-08** `daily_loss_limit()` excluded cash from live-book equity while
+  including it for paper — understated live equity, overly tight limit.
+  `engine/live_trader.py:account_cash` now supplies it, with the old
+  behaviour as a safe fallback.
+- Root cause of the reported Learning-tab error: a hung OS keyring probe
+  (`storage/secrets.py`) inside a freshly-spawned, non-interactive backtest
+  subprocess — evidenced by two real, completely empty subprocess logs from
+  production. Now timeout-guarded (`TP_KEYRING_TIMEOUT_S`, default 5s).
+- `ui/index.html`'s `renderLearningTab` only guarded the fetch, not the
+  render, against exceptions — same bug class already fixed for the
+  Strategy/Performance tabs, missed here. `ChampionChallenger.evaluate()`'s
+  "challenge not found" path now returns a shape the UI can render.
+
 ## [3.1.1] — v3.1.1 — 2026-07-26
 
 ### Decision function: UNCHANGED — service management only
