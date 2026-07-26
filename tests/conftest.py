@@ -62,6 +62,7 @@ is identical under both: the database name is never the production one, and
 `pytest_configure` enforces that before a connection can be opened.
 """
 import os
+import tempfile
 
 import pytest
 
@@ -115,13 +116,37 @@ def pytest_configure(config):
         + ("pytest-postgresql (ephemeral server)" if _HAVE_PYTEST_POSTGRESQL
            else "a scratch database on the local server"))
 
+    # ── The same isolation, for output (2026-07-26) ──────────────────────────
+    # The database guard above is thorough and the output directory had none,
+    # so every test run wrote its log lines into output/logs/scheduler.log -
+    # the PRODUCTION log, interleaved with the real scheduler's. 234 such lines
+    # had accumulated by the time anyone noticed.
+    #
+    # It is not merely untidy. That file is the audit trail you read after an
+    # incident, and it now contains fixture trades on synthetic tickers with
+    # round numbers, formatted identically to real ones. On 2026-07-26 it
+    # produced a concrete wrong conclusion: two fixture lines - `ASTS ... purse
+    # now $400.00` and `NEW ... purse now $1010.00` - were read as consecutive
+    # real trades and offered as evidence of a purse re-seed, during the
+    # investigation of a kill-switch trip. The reading was wrong. A log that
+    # cannot be trusted during an incident is worse than no log, because it is
+    # consulted precisely when care is scarcest.
+    #
+    # storage/paths.py routes every output path through TP_OUTPUT_DIR, so
+    # pinning it here moves logs, backtest results and prompt files together.
+    log_root = tempfile.mkdtemp(prefix="tp-test-output-")
+    os.environ["TP_OUTPUT_DIR"] = log_root
+    config._tp_output_dir = log_root
+
 
 def pytest_report_header(config):
     """State the database target on every run, at the top.
 
     Not decoration. The 2026-07-25 failure was invisible because nothing ever
     answered 'which database am I about to write to'."""
-    return f"trading_platform: {getattr(config, '_tp_db_note', 'target unknown')}"
+    return (f"trading_platform: {getattr(config, '_tp_db_note', 'target unknown')}\n"
+            f"trading_platform: output pinned to "
+            f"{getattr(config, '_tp_output_dir', 'UNPINNED - logs go to production')}")
 
 
 @pytest.fixture(autouse=True)

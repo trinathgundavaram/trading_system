@@ -1208,6 +1208,16 @@ function emptyBlock(icon, title, desc) {
   return `<div class="empty">${svg(icon,26)}<div class="title">${title}</div><div class="desc">${desc}</div></div>`;
 }
 
+// emptyBlock and most render helpers interpolate straight into innerHTML, which
+// is fine for the fixed strings they were written for. Use this for anything
+// that carries a server-side error message: those are exception text, and an
+// exception can contain a URL, a chunk of an HTTP response body, or angle
+// brackets that would otherwise be parsed as markup (2026-07-26).
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 function renderPositionsTable(pos) {
   if (!pos.length) return emptyBlock('inbox', 'No open positions', 'WATCH mode opens paper positions automatically on BUY signals; real fills are logged with confirm_fill.py buy TICKER PRICE SHARES.');
   return `<div class="table-wrap"><table><thead><tr>
@@ -2304,7 +2314,19 @@ async function renderRealPortfolioTab(el) {
           <div class="subtle" style="margin-top:10px;">${summary.account_source === 'agentic_configured'
             ? `Account: <b>${summary.account_number}</b> (from Control tab)`
             : `<span style="color:var(--yellow);">No account.robinhood_account_number configured on the Control tab - reading your PRIMARY Robinhood account, not the Agentic account.</span>`}</div>
-        ` : emptyBlock('alert', 'Robinhood not connected', 'Set ROBINHOOD_USERNAME/ROBINHOOD_PASSWORD in .env for a live account value + buying power read. Open real positions below still come from confirm_fill.py regardless.')}
+        ` : emptyBlock('alert',
+            summary.credentials_configured === false
+              ? 'Robinhood not configured'
+              : 'Robinhood read failed',
+            // Only tell them to set credentials when the credentials are
+            // actually the problem. Until 2026-07-26 this block said that
+            // unconditionally, so a resolvable account-number fault - or any
+            // other read error - presented as missing credentials and sent
+            // debugging in the wrong direction for a while.
+            (summary.credentials_configured === false
+              ? 'Set ROBINHOOD_USERNAME/ROBINHOOD_PASSWORD in .env for a live account value + buying power read.'
+              : `Credentials are set and the read still failed:<br><code style="font-size:11px;color:var(--yellow);">${escHtml(summary.read_error || 'no detail reported')}</code>`)
+            + ' Open real positions below still come from confirm_fill.py regardless.')}
       </div>
       <div class="panel">
         <div class="panel-head">${svg('journal',15)}<span class="panel-title">P&amp;L</span></div>

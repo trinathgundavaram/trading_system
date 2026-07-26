@@ -49,8 +49,16 @@ _last_sync = {"at": 0.0}
 
 
 def _account_number(cfg: dict) -> str | None:
-    acct = str((cfg.get("account", {}) or {}).get("robinhood_account_number", "") or "").strip()
-    return acct or None
+    """Delegates to engine/live_trader.py's version (2026-07-26).
+
+    This used to be a duplicate two-liner that read the config value straight,
+    which meant it inherited the ``${RH_ACCOUNT_NUMBER}`` placeholder bug when
+    called with server.py's raw-loaded config - see live_trader._account_number's
+    docstring. Two copies of "which account are we talking to" is exactly the
+    kind of thing that drifts, and the answer must be identical here and on the
+    order path or sync reconciles against a different account than it trades."""
+    from engine.live_trader import _account_number as _resolve
+    return _resolve(cfg)
 
 
 def enabled(cfg: dict) -> bool:

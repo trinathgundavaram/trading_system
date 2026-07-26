@@ -557,7 +557,8 @@ def _robinhood_account_probe(cfg: dict) -> dict:
     account orders would actually execute against, not a different one."""
     acct = None
     out = {"read_ok": None, "buying_power": None, "portfolio_value": None,
-           "account_number": None, "account_source": "agentic_configured"}
+           "account_number": None, "account_source": "agentic_configured",
+           "read_error": None}
     try:
         from engine import live_trader
         acct = live_trader._account_number(cfg)
@@ -566,18 +567,39 @@ def _robinhood_account_probe(cfg: dict) -> dict:
             out["account_source"] = "primary_no_account_configured"
         if not live_trader._login():
             out["read_ok"] = False
+            # _login() caches its own failure reason for 5 minutes; report it
+            # rather than making the UI guess. Its text is a robin_stocks
+            # message, not a secret - the credentials themselves never appear.
+            out["read_error"] = (live_trader._login_state.get("error")
+                                 or "Robinhood login failed")
             return out
         rh = live_trader._rh()
         profile = rh.profiles.load_account_profile(account_number=acct) or {}
         out["read_ok"] = bool(profile)
+        if not profile:
+            out["read_error"] = (
+                f"Logged in, but Robinhood returned no profile for account "
+                f"{acct or 'PRIMARY'}. Check account.robinhood_account_number "
+                f"on the Control tab / RH_ACCOUNT_NUMBER in .env.")
         for k in ("buying_power", "cash_available_for_withdrawal", "cash"):
             if profile.get(k) not in (None, ""):
                 out["buying_power"] = float(profile[k]); break
         for k in ("equity", "portfolio_cash", "total_equity", "market_value"):
             if profile.get(k) not in (None, ""):
                 out["portfolio_value"] = float(profile[k]); break
-    except Exception:
+    except Exception as e:
+        # 2026-07-26: this was a bare `except Exception: read_ok = False`, and
+        # that silence cost real debugging time. The account-number placeholder
+        # bug (see live_trader._account_number) threw HERE on every call, and
+        # the only thing the user ever saw was the Real Portfolio tab's
+        # "Robinhood not connected - set ROBINHOOD_USERNAME/PASSWORD in .env" -
+        # advice for a problem that did not exist, while the actual exception
+        # went nowhere. Log it and hand the text to the UI. A caught read
+        # failure must still not take the endpoint down, so this stays broad.
         out["read_ok"] = False
+        out["read_error"] = f"{type(e).__name__}: {e}"[:300]
+        logging.getLogger("trading").warning(
+            f"robinhood probe failed (account={acct or 'PRIMARY'}): {e}")
     return out
 
 
@@ -612,6 +634,9 @@ async def robinhood_status():
         out["portfolio_value"] = probe["portfolio_value"]
         out["account_number"] = probe["account_number"]
         out["account_source"] = probe["account_source"]
+        out["read_error"] = probe.get("read_error")
+    else:
+        out["read_error"] = "ROBINHOOD_USERNAME/ROBINHOOD_PASSWORD are not set in .env."
     return out
 
 
@@ -670,12 +695,17 @@ async def get_real_summary(live: bool = False):
     probe = _robinhood_account_probe(cfg) if configured else {
         "read_ok": False, "buying_power": None, "portfolio_value": None,
         "account_number": None, "account_source": "not_configured",
+        "read_error": "ROBINHOOD_USERNAME/ROBINHOOD_PASSWORD are not set in .env.",
     }
     connected = configured and bool(probe.get("read_ok"))
 
     daily = db.get_daily_stats()
     return {
         "connected": connected,
+        # Why the read failed, when it did (2026-07-26). "not connected" with
+        # no reason is the failure mode this whole endpoint was debugged out of.
+        "credentials_configured": configured,
+        "read_error": None if connected else probe.get("read_error"),
         "buying_power": probe.get("buying_power"),
         "account_value": probe.get("portfolio_value"),
         "account_number": probe.get("account_number"),

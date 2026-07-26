@@ -261,8 +261,34 @@ def _account_number(cfg: dict) -> str | None:
     Robinhood AGENTIC account number (2026-07-17, Akhil) so orders and
     buying-power checks target the account designated for agent trading,
     not the primary individual account robin_stocks defaults to. Empty =
-    primary account (old behavior)."""
-    acct = str((cfg.get("account", {}) or {}).get("robinhood_account_number", "") or "").strip()
+    primary account (old behavior).
+
+    Expands ``${VAR}`` here rather than trusting the caller (2026-07-26).
+    Phase 0 step 0.2 moved the account number out of the versioned
+    config.yaml and left ``${RH_ACCOUNT_NUMBER}`` in its place, expanded by
+    config_loader. server.py's ``_load_config()`` does NOT use config_loader -
+    it reads the YAML raw because it also writes the file back - so every
+    server-side caller was passing the literal placeholder string into
+    ``load_account_profile(account_number=...)``. That raised inside
+    ``_robinhood_account_probe()``'s bare except, which set read_ok=False,
+    which the Real Portfolio tab renders as "Robinhood not connected" - with
+    "set ROBINHOOD_USERNAME/PASSWORD in .env" as the suggested fix, even
+    though the credentials were fine and the login line in server.log says
+    "Robinhood login OK". Doing the expansion at the point of USE fixes the
+    probe, the order path and account_sync in one place and cannot be
+    reintroduced by a future caller that loads config some third way."""
+    from config_loader import expand_env_refs
+    raw = str((cfg.get("account", {}) or {}).get("robinhood_account_number", "") or "").strip()
+    acct = str(expand_env_refs(raw)).strip()
+    if "${" in acct:
+        # Unresolvable reference. Falling through would send the placeholder to
+        # Robinhood as an account number; None means "primary account", which
+        # is the documented empty-value behaviour and is at least a real read.
+        logger.warning(
+            f"live_trader: account.robinhood_account_number is {raw!r} and could "
+            f"not be resolved from the environment - falling back to the PRIMARY "
+            f"account. Set RH_ACCOUNT_NUMBER in .env.")
+        return None
     return acct or None
 
 

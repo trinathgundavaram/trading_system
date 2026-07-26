@@ -3008,6 +3008,46 @@ class Database:
                 (delta, realized_pnl_delta, datetime.utcnow().isoformat()),
             )
 
+    def credit_paper_capital(self, amount: float) -> dict:
+        """Add (or withdraw, if negative) CAPITAL to the paper purse - a
+        deposit, not a gain (2026-07-26, Akhil: raise the paper book to
+        $10,000 so it trades more and produces a usable sample sooner).
+
+        starting_cash and cash move together, by the same amount, in one
+        statement. That is the whole point of this method existing rather than
+        callers reaching for adjust_paper_cash():
+
+          - scripts/reconcile.py's headline invariant is
+            ``cash == starting_cash - net_buys_from_the_ledger``. Moving cash
+            alone breaks it, and that check exists precisely to catch silent
+            purse drift, so it would have started reporting a real-looking
+            accounting fault every run.
+          - paper_trader.snapshot() computes total_return_pct against
+            starting_cash. A $9,000 deposit onto a $1,000 basis would read as
+            roughly +900% return - a deposit is not performance.
+
+        realized_pnl is deliberately untouched: capital in is not P&L.
+
+        Does NOT write a paper_equity_history point. The next WATCH cycle
+        writes one, and the step up it produces is handled - update_drawdown()
+        measures against a running peak, so a jump raises the peak rather than
+        registering as a fall (the mirror-image case, a re-seed DOWNWARD, is
+        the one that caused the v1.3.1 false-drawdown incident; see
+        _paper_epoch_start's docstring).
+        """
+        if not amount:
+            return self.get_paper_account()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE paper_account SET starting_cash = starting_cash + ?, "
+                "cash = cash + ?, updated_at = ? WHERE id = 1",
+                (amount, amount, datetime.utcnow().isoformat()),
+            )
+        logger.info(f"paper account: capital {'credited' if amount > 0 else 'withdrawn'} "
+                    f"${abs(amount):,.2f} (starting_cash and cash both moved; "
+                    f"realized_pnl untouched)")
+        return self.get_paper_account()
+
     def reset_paper_account(self):
         """Wipes the purse, ledger, equity curve and every simulated position
         (open or closed) - a clean slate for the next WATCH session. Real book

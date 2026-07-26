@@ -22,6 +22,89 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [2.3] — v2.3.0 — 2026-07-26
+
+### A connectivity failure that reported the wrong cause
+
+**Decision function: UNCHANGED.** Nothing here touches scoring, sizing, entry
+or exit logic. `config_fingerprint` is unchanged at `cc9a149613427f56`,
+verified against `git show v2.2.0:config.yaml` rather than assumed. Trade
+history from earlier versions may be pooled with this one's.
+
+### Fixed — "Robinhood not connected" while the log said the login succeeded
+
+- **`account.robinhood_account_number` reached the engine as the literal
+  string `${RH_ACCOUNT_NUMBER}`.** Phase 0 step 0.2 moved that value out of
+  the versioned `config.yaml` and left a `${VAR}` reference behind for
+  `config_loader` to expand. `server.py:_load_config()` does not use
+  `config_loader` — it reads the YAML raw, deliberately, because it also
+  writes the file back and an expanded tree round-tripped through
+  `yaml.dump` would write the account number into a versioned file. So every
+  server-side caller passed the placeholder straight into
+  `rh.profiles.load_account_profile(account_number=...)`.
+
+  `config_loader.expand_env_refs()` is the new public single-value expander,
+  and `live_trader._account_number()` calls it at the point of USE — which
+  fixes the probe, the order path and `account_sync` together, and cannot be
+  reintroduced by a future caller that loads config some third way. An
+  unresolvable reference now returns `None` (primary account, the documented
+  empty-value behaviour) with a warning, instead of being sent to Robinhood
+  as an account number.
+
+  Same defect had been copy-pasted into `engine/account_sync.py`. It now
+  delegates rather than duplicating: sync must reconcile against the account
+  the order path trades.
+
+- **`_robinhood_account_probe()` discarded the exception that would have
+  named the cause.** It was `except Exception: read_ok = False`. Every call
+  threw, nothing was logged, and the only artifact was the Real Portfolio
+  tab's fallback message. It now logs and returns `read_error`, exposed by
+  both `/api/real/summary` and `/api/robinhood/status`.
+
+- **The UI told you to set credentials that were already set.** That message
+  was unconditional on `connected == false`, so a resolvable account-number
+  fault presented as missing credentials and pointed debugging away from the
+  actual problem. It is now shown only when the credentials are genuinely
+  unset; otherwise the tab prints the real error. `escHtml()` added and used
+  on that path — exception text can contain markup.
+
+### Changed — the paper book is $10,000, so the rules bind instead of the purse
+
+At $1,000, with a $500 position cap, two positions fully deployed the
+account and most BUY signals were declined for insufficient cash rather than
+on their merits. That makes the learning data a sample of whatever arrived
+first, not of whatever scored best.
+
+- `paper_trading.starting_cash` 1000 → 10000
+- `risk.max_trades_per_day` 10 → 30
+- `risk.max_position_size_usd` 500 → 1000
+
+`risk.max_daily_loss_pct` (2.0%) resolves against actual equity, so the daily
+loss limit moves from roughly $20 to roughly $200 on its own. It remains the
+tighter of the two daily-loss controls and is still what binds.
+
+### Added
+
+- **`Database.credit_paper_capital()`** — moves `starting_cash` and `cash`
+  together in a single statement. Capital in is a deposit, not a gain:
+  adjusting cash alone breaks `reconcile.py`'s
+  `cash == starting_cash - net_buys` invariant, and makes a $9,000
+  contribution read as roughly +900% in `snapshot()`'s `total_return_pct`.
+- **`scripts/topup_paper_account.py`** — applies the contribution in place.
+  `ensure_seeded()` returns early when a purse exists, so editing
+  `starting_cash` alone does nothing to a live account; the only other option
+  was `reset_paper_account()`, which deletes the ledger, the equity curve and
+  every simulated position — the wrong tool when the point of the change is to
+  accumulate more data. Dry-run by default, and refuses to run against a purse
+  that does not already reconcile with its own ledger.
+
+### Known limitation logged, not fixed
+
+`config_fingerprint` does not cover `risk.max_position_size_usd`, so this
+release doubles the maximum position size without moving the fingerprint.
+Widening the fingerprint now would invalidate comparability with every pattern
+ever recorded, so it is a Phase 4 decision. See `docs/releases/v2.3.0.md`.
+
 ## [2.2] — v2.2.0 — 2026-07-26
 
 ### The Phase 2.5 cutover, actually run
