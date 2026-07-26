@@ -517,6 +517,128 @@ class TestLaunchdRestartRace:
 
 
 # =============================================================================
+#  The stale UI port holder (2026-07-26)
+# =============================================================================
+class TestStaleUiPortIsReclaimed:
+    """`run.sh --ui` has reclaimed port 8080 from an orphaned UI process since
+    the 2026-07-14 incident. §45 moved service management into
+    scripts/services.py and did not carry that cleanup across, so
+    `./service.sh restart` reintroduced the same failure by a different route:
+    the old process keeps the port, the new one relaunch-loops on
+    `[Errno 48] address already in use`, and the browser goes on talking to
+    code you thought you had replaced.
+
+    It recurred on 2026-07-26 - a restart after tagging v2.3.0 served the
+    pre-v2.3.0 process 342 relaunches deep, and the fix under test looked
+    broken because it was never the code answering.
+
+    These tests exist because the regression was INVISIBLE: every service
+    verb reported success. Nothing asserted the port was actually free.
+    """
+
+    def _mod(self):
+        import importlib.machinery
+        import importlib.util
+
+        loader = importlib.machinery.SourceFileLoader(
+            "services", str(REPO / "scripts" / "services.py"))
+        spec = importlib.util.spec_from_loader("services", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+
+    def test_a_free_port_is_a_no_op(self):
+        """The normal path. Must not raise, must not kill anything."""
+        mod = self._mod()
+        with mock.patch.object(mod, "_port_holder_pids", return_value=[]), \
+             mock.patch.object(mod.os, "kill") as killer:
+            mod._free_ui_port(port=59990, wait_s=0.1)
+        killer.assert_not_called()
+
+    def test_a_stale_ui_process_is_terminated(self):
+        mod = self._mod()
+        # Held on the first look, gone once the signal lands.
+        looks = iter([[4242], [], [], []])
+        with mock.patch.object(mod, "_port_holder_pids", side_effect=lambda p: next(looks, [])), \
+             mock.patch.object(mod, "_describe_pid",
+                               return_value="/usr/bin/python3 /repo/main.py --ui"), \
+             mock.patch.object(mod.os, "kill") as killer:
+            mod._free_ui_port(port=8080, wait_s=1.0)
+        assert killer.call_args[0][0] == 4242, killer.call_args
+
+    def test_a_process_that_is_not_ours_is_left_alone(self):
+        """The one way this cleanup could do real damage. run.sh kills whatever
+        holds the port; this refuses unless the command line looks like our own
+        UI, because killing an unrelated service costs far more than a failed
+        bind with a comprehensible message."""
+        mod = self._mod()
+        with mock.patch.object(mod, "_port_holder_pids", return_value=[4242]), \
+             mock.patch.object(mod, "_describe_pid",
+                               return_value="/usr/local/bin/postgres -D /data"), \
+             mock.patch.object(mod.os, "kill") as killer:
+            mod._free_ui_port(port=8080, wait_s=0.1)
+        killer.assert_not_called()
+
+    def test_sigterm_is_escalated_to_sigkill(self):
+        """A UI that ignores SIGTERM still holds the socket, which is the entire
+        failure. Requesting termination is not the same as achieving it."""
+        mod = self._mod()
+        with mock.patch.object(mod, "_port_holder_pids", return_value=[4242]), \
+             mock.patch.object(mod, "_describe_pid",
+                               return_value="python3 main.py --ui"), \
+             mock.patch.object(mod.os, "kill") as killer:
+            mod._free_ui_port(port=8080, wait_s=0.3)
+        sent = [c[0][1] for c in killer.call_args_list]
+        assert mod.signal.SIGTERM in sent and mod.signal.SIGKILL in sent, sent
+
+    def test_this_process_is_never_a_target(self):
+        """_port_holder_pids can legitimately return our own pid. Signalling
+        ourselves would turn a cleanup into an outage."""
+        mod = self._mod()
+        with mock.patch.object(mod, "_port_holder_pids", return_value=[mod.os.getpid()]), \
+             mock.patch.object(mod.os, "kill") as killer:
+            mod._free_ui_port(port=8080, wait_s=0.1)
+        killer.assert_not_called()
+
+    def test_restart_frees_the_port_before_starting_the_ui(self):
+        """The integration point. The unit above can be perfect and the bug
+        still ships if main() never calls it - which is precisely what §45 did.
+        Order matters too: stop, then reclaim, then start."""
+        mod = self._mod()
+        order = []
+        mgr = mock.Mock()
+        mgr.stop.side_effect = lambda n: order.append(f"stop:{n}")
+        mgr.start.side_effect = lambda n: order.append(f"start:{n}")
+        with mock.patch.object(mod, "manager", return_value=mgr), \
+             mock.patch.object(mod, "_commands", return_value={"ui": ["python", "main.py", "--ui"]}), \
+             mock.patch.object(mod, "_free_ui_port",
+                               side_effect=lambda *a, **k: order.append("free_port")):
+            mod.main(["restart", "ui"])
+        assert order == ["stop:ui", "free_port", "start:ui"], order
+
+    def test_plain_stop_does_not_kill_a_port_holder(self):
+        """`stop` has no bind to protect. Reclaiming a port nobody asked us to
+        listen on would be a side effect the verb does not advertise."""
+        mod = self._mod()
+        mgr = mock.Mock()
+        with mock.patch.object(mod, "manager", return_value=mgr), \
+             mock.patch.object(mod, "_commands", return_value={"ui": ["python", "main.py", "--ui"]}), \
+             mock.patch.object(mod, "_free_ui_port") as freer:
+            mod.main(["stop", "ui"])
+        freer.assert_not_called()
+
+    def test_holder_lookup_never_raises(self):
+        """This feeds a cleanup step. It must not become the reason a start
+        fails - no lsof, no netstat, a timeout: all mean 'cannot tell'."""
+        mod = self._mod()
+        with mock.patch.object(mod.subprocess, "run", side_effect=FileNotFoundError):
+            assert mod._port_holder_pids(8080) == []
+        with mock.patch.object(mod.shutil, "which", return_value="/usr/bin/lsof"), \
+             mock.patch.object(mod.subprocess, "run", side_effect=OSError("boom")):
+            assert mod._port_holder_pids(8080) == []
+
+
+# =============================================================================
 #  §13  the dependency guard reads metadata, not `pip freeze`
 # =============================================================================
 class TestDependencyCheck:

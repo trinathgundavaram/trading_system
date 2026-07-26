@@ -17,7 +17,7 @@ instead of stdio.
 Credentials: TRAYD_MCP_URL (required) + TRAYD_AUTH_TOKEN (optional) from .env.
 If not configured, all methods return empty dicts/lists and log once.
 
-Setup: See TRAYD_MCP_SETUP.md for full integration steps.
+Setup: See docs/trayd.md for full integration steps.
 """
 import logging
 import os

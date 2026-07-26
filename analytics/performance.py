@@ -31,11 +31,30 @@ def win_rate_by(patterns: list[dict], group_field: str) -> dict:
     return result
 
 
-def profit_factor(outcomes_pct: list[float]) -> float:
+def profit_factor(outcomes_pct: list[float]) -> float | None:
+    """Gross win / gross loss. ``None`` when there is no loss to divide by.
+
+    Returned None rather than ``float("inf")`` as of 2026-07-26. The infinity
+    was mathematically honest and operationally fatal: Starlette's JSONResponse
+    calls ``json.dumps(..., allow_nan=False)``, so ANY route whose payload
+    contained it raised ``ValueError: Out of range float values are not JSON
+    compliant`` and answered HTTP 500. ``/api/analytics/performance`` therefore
+    500'd for every book with no losing trade, and the Performance tab - which
+    had no error handling - sat on "Loading..." forever.
+
+    Reachable on a small sample, and note the grouping: gross_loss sums
+    ``o <= 0``, so a single break-even trade among winners triggers it too.
+    A freshly installed version whose first closed trade wins hits it
+    immediately, which is exactly when someone is watching that tab.
+
+    None is also the more truthful answer. "Infinite profit factor" reads as a
+    spectacular result; it means "not enough evidence to compute a ratio", and
+    callers must render it as such rather than as a number.
+    """
     gross_win = sum(o for o in outcomes_pct if o > 0)
     gross_loss = abs(sum(o for o in outcomes_pct if o <= 0))
     if gross_loss == 0:
-        return float("inf") if gross_win > 0 else 0.0
+        return None if gross_win > 0 else 0.0
     return gross_win / gross_loss
 
 

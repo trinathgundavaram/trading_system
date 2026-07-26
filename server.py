@@ -38,7 +38,7 @@ from typing import Optional
 import yaml
 from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
                      Request)
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
 from storage import banner, secrets
@@ -47,7 +47,67 @@ from storage.log_setup import setup_logging, tail_log_lines
 
 setup_logging("server")
 
-app = FastAPI(title="Trading Platform v8.3")
+
+class SafeJSONResponse(JSONResponse):
+    """JSONResponse that cannot 500 on a non-finite float (2026-07-26).
+
+    Starlette's JSONResponse renders with ``json.dumps(..., allow_nan=False)``.
+    That is the correct strictness - ``Infinity`` and ``NaN`` are not valid JSON
+    and ``JSON.parse`` rejects them - but the failure mode is brutal: the
+    exception is raised while RENDERING, after the handler has returned
+    successfully, so a route that computed a perfectly good answer answers
+    HTTP 500 and the traceback names json.dumps rather than whatever produced
+    the value.
+
+    That is what happened to ``/api/analytics/performance``:
+    ``profit_factor()`` returned ``float("inf")`` for a book with no losing
+    trade and the tab sat on "Loading..." forever. That specific source is
+    fixed at its origin (see analytics/performance.py), which is where a known
+    sentinel belongs. This class is for the ones nobody has hit yet -
+    ``engine/ta_fallback.py`` alone divides by ``.replace(0, np.nan)`` in seven
+    places to guard against divide-by-zero, and any NaN that survives into a
+    response payload would take the endpoint down the same way.
+
+    Non-finite becomes ``null``, which every consumer already handles: these
+    payloads are full of legitimately-null metrics, and the UI guards them.
+    Sanitising is LOGGED rather than silent - a NaN reaching this point is
+    still a bug worth finding, and this must not become the reason nobody
+    notices it.
+    """
+
+    def render(self, content) -> bytes:
+        cleaned, hits = _finite_only(content)
+        if hits:
+            logging.getLogger("trading").warning(
+                f"SafeJSONResponse: replaced {len(hits)} non-finite float(s) with "
+                f"null at {', '.join(hits[:5])}"
+                f"{' ...' if len(hits) > 5 else ''} - the endpoint answered "
+                f"instead of returning HTTP 500, but the source is still a bug")
+        return super().render(cleaned)
+
+
+def _finite_only(obj, path: str = "$"):
+    """Recursively replace inf/-inf/NaN with None. Returns (cleaned, paths)."""
+    hits: list = []
+
+    def walk(o, p):
+        if isinstance(o, float):
+            if o != o or o in (float("inf"), float("-inf")):
+                hits.append(p)
+                return None
+            return o
+        if isinstance(o, dict):
+            return {k: walk(v, f"{p}.{k}") for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [walk(v, f"{p}[{i}]") for i, v in enumerate(o)]
+        return o
+
+    return walk(obj, path), hits
+
+
+# default_response_class applies to every route that returns a dict/list, which
+# is all of them bar the explicitly-typed HTML/text ones.
+app = FastAPI(title="Trading Platform v8.3", default_response_class=SafeJSONResponse)
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
@@ -1299,6 +1359,8 @@ async def get_performance():
     outcomes = [p["outcome_pct"] for p in patterns if p.get("outcome_pct") is not None]
     return {
         "n_closed_patterns": len(outcomes),
+        # profit_factor returns None when there is no losing trade to divide by
+        # - "not computable yet", not a number. The UI renders that as "n/a".
         "profit_factor": profit_factor(outcomes) if outcomes else 0.0,
         "sharpe_ratio": sharpe_ratio(outcomes) if outcomes else 0.0,
         "win_rate_by_regime": win_rate_by(patterns, "regime"),

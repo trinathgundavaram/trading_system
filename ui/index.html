@@ -1881,6 +1881,14 @@ function renderPositionsTab(el) {
 const fmtUSD = v => (v == null ? "—" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(2));
 const pnlClass = v => (v || 0) >= 0 ? "positive" : "negative";
 
+// Ratio metrics (profit factor, Sharpe) where null means "not computable yet"
+// rather than zero. Guards .toFixed against null/undefined/non-finite, which is
+// how the Performance tab used to throw: profit_factor is legitimately null
+// until the book has a losing trade to divide by, and `null.toFixed(2)` ends a
+// render. "n/a" is the honest label - a profit factor with no losses in the
+// denominator is an absence of evidence, not an infinite result.
+const fmtRatio = v => (v == null || !isFinite(v)) ? "n/a" : Number(v).toFixed(2);
+
 // Which trading mode (SWING/DAY/HYBRID) was active when the buy was made -
 // stamped on every position and ledger row (positions.trade_mode /
 // paper_trades.trade_mode). SEED = cloned from the real book at purse start.
@@ -2187,7 +2195,23 @@ async function renderPortfolioTab(el, prefetched) {
   const openPos = summary.open_positions || [];
   const ret = summary.total_return_pct || 0;
 
+  // config.yaml's starting_cash was edited but never applied to the live purse.
+  // Shown at the top of the tab because the symptom on its own ("the paper cash
+  // was not updated") gives no hint that a separate, deliberate step is
+  // required - ensure_seeded() reads that value only when CREATING a purse, so
+  // no amount of restarting will pick it up. See paper_trader.snapshot().
+  const drift = summary.basis_drift;
   el.innerHTML = `
+    ${drift ? `<div class="panel" style="margin-bottom:14px;border-color:var(--yellow);">
+      <div class="panel-head">${svg('alert',15)}<span class="panel-title" style="color:var(--yellow);">Paper basis not applied</span></div>
+      <p class="field-desc" style="margin-top:8px;">config.yaml asks for
+        <b>${fmtUSD(drift.configured)}</b> but this account's basis is
+        <b>${fmtUSD(drift.actual)}</b> (${drift.delta >= 0 ? 'short by' : 'over by'}
+        <b>${fmtUSD(Math.abs(drift.delta))}</b>).
+        ${escHtml(drift.why)}</p>
+      <p class="field-desc" style="margin-top:6px;">Apply it with:
+        <code style="font-size:11px;">${escHtml(drift.fix)}</code></p>
+    </div>` : ``}
     <div class="grid grid-3">
       <div class="panel">
         <div class="panel-head">${svg('performance',15)}<span class="panel-title">${withTip('Portfolio Value', 'pf_value')}</span><span class="fill"></span><span class="subtle" id="pf-updated" style="font-size:10px;">live · updated ${new Date().toLocaleTimeString()}</span></div>
@@ -2780,19 +2804,33 @@ async function toggleKillSwitch() {
 }
 
 /* ============================== PERFORMANCE TAB ============================== */
+// 2026-07-26: this was the only async renderer with NO try/catch, and it used
+// raw fetch().then(r=>r.json()) rather than fetchJSON - so no HTTP status check
+// and no timeout either. Any failure left the panel on "Loading…" forever with
+// nothing but a console error, which is the same symptom as the Journal tab's
+// 2026-07-23 hang. It was reachable: /api/analytics/performance returned 500
+// whenever the book had no losing trade (profit_factor was float('inf'), which
+// Starlette refuses to serialise), and summary.profit_factor.toFixed(2) would
+// have thrown on the null that endpoint now legitimately returns.
 async function renderPerformanceTab(el) {
   el.innerHTML = `<div class="panel"><div class="panel-head">${svg('performance',15)}<span class="panel-title">Performance by Regime</span></div><div id="perf-body">Loading…</div></div>`;
-  const [regimeData, summary] = await Promise.all([
-    fetch("/api/analytics/regime_performance").then(r=>r.json()),
-    fetch("/api/analytics/performance").then(r=>r.json()),
-  ]);
-  const entries = Object.entries(regimeData);
+  let regimeData, summary;
+  try {
+    [regimeData, summary] = await Promise.all([
+      fetchJSON("/api/analytics/regime_performance"),
+      fetchJSON("/api/analytics/performance"),
+    ]);
+  } catch (e) {
+    document.getElementById("perf-body").innerHTML = tabErrorHTML(e);
+    return;
+  }
+  const entries = Object.entries(regimeData || {});
   const body = document.getElementById("perf-body");
   body.innerHTML = `
     <div class="metrics-row" style="margin-bottom:16px;">
-      <div class="metric"><div class="metric-label">Closed patterns</div><div class="metric-value">${summary.n_closed_patterns}</div></div>
-      <div class="metric"><div class="metric-label">Profit factor</div><div class="metric-value">${summary.profit_factor.toFixed(2)}</div></div>
-      <div class="metric"><div class="metric-label">Sharpe</div><div class="metric-value">${summary.sharpe_ratio.toFixed(2)}</div></div>
+      <div class="metric"><div class="metric-label">Closed patterns</div><div class="metric-value">${summary.n_closed_patterns ?? 0}</div></div>
+      <div class="metric"><div class="metric-label">Profit factor</div><div class="metric-value">${fmtRatio(summary.profit_factor)}</div></div>
+      <div class="metric"><div class="metric-label">Sharpe</div><div class="metric-value">${fmtRatio(summary.sharpe_ratio)}</div></div>
     </div>
     ${entries.length ? `<div class="table-wrap"><table><thead><tr><th>Regime</th><th class="num">Trades</th><th class="num">Win Rate</th><th class="num">Avg Outcome</th></tr></thead><tbody>
       ${entries.map(([regime, s]) => `<tr>

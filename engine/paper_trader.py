@@ -482,6 +482,43 @@ def snapshot(db, prices: dict = None, cfg: dict = None) -> dict:
     # Unpriced positions are carried at cost so total value never silently
     # drops just because a quote was unavailable this cycle.
     total_value = account["cash"] + market_value + (invested_cost - priced_cost)
+    # Does config.yaml's starting_cash still describe the account that exists?
+    # (2026-07-26.) ensure_seeded() returns early once a purse row exists, so
+    # editing paper_trading.starting_cash on a live account changes NOTHING -
+    # by design, since silently re-basing a book mid-flight would corrupt every
+    # return figure computed against it. The failure is that this was also
+    # invisible: after the value was raised 1000 -> 10000, the config said one
+    # thing, the purse said another, and the only symptom was "the paper cash
+    # was not updated" with nothing anywhere explaining why.
+    #
+    # Reported, never acted on. The fix is a deliberate capital contribution
+    # (scripts/topup_paper_account.py), because moving cash without moving the
+    # basis breaks reconcile.py's ledger invariant.
+    configured_cash = None
+    if cfg is not None:
+        try:
+            configured_cash = float((cfg.get("paper_trading", {}) or {})
+                                    .get("starting_cash", 0) or 0)
+        except (TypeError, ValueError):
+            configured_cash = None
+    basis_drift = None
+    if configured_cash and abs(configured_cash - float(account["starting_cash"])) > 0.01:
+        basis_drift = {
+            "configured": round(configured_cash, 2),
+            "actual": round(float(account["starting_cash"]), 2),
+            "delta": round(configured_cash - float(account["starting_cash"]), 2),
+            "fix": "python3 scripts/topup_paper_account.py --apply",
+            "why": ("config.yaml's paper_trading.starting_cash does not match this "
+                    "account's basis. ensure_seeded() only reads that value when "
+                    "CREATING a purse, so the edit has not been applied and will "
+                    "not be by a restart."),
+        }
+        logger.warning(
+            f"paper account basis drift: config.yaml says "
+            f"${configured_cash:,.2f}, the purse says "
+            f"${float(account['starting_cash']):,.2f} - run "
+            f"scripts/topup_paper_account.py --apply to apply it")
+
     return {
         "seeded": True,
         "starting_cash": account["starting_cash"],
@@ -495,4 +532,5 @@ def snapshot(db, prices: dict = None, cfg: dict = None) -> dict:
                                    / account["starting_cash"] * 100, 2) if account["starting_cash"] else 0.0,
         "open_positions": pos_details,
         "n_open": len(positions),
+        "basis_drift": basis_drift,
     }

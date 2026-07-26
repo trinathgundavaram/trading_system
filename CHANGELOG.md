@@ -22,6 +22,95 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [2.3.1] — v2.3.1 — 2026-07-26
+
+### v2.3.0 was correct and never ran
+
+**Decision function: UNCHANGED.** `config_fingerprint` verified at
+`cc9a149613427f56`; `classify_change.py` says PATCH. Trade history pools with
+v2.2.0 and v2.3.0.
+
+### Fixed — `./service.sh restart` did not replace the running process
+
+- **`scripts/services.py` had no port-conflict handling, so the old UI kept
+  port 8080 and the new code never served.** launchd relaunched the new process
+  342 times against `[Errno 48] address already in use`, the browser went on
+  talking to the pre-v2.3.0 build, and the Robinhood fix looked broken because
+  the code under test was never the code answering. Every service verb reported
+  success; the only evidence was in `launchd_ui.log`.
+
+  `run.sh --ui` has reclaimed the port since the 2026-07-14 incident, whose
+  comment describes this exactly — *"looked exactly like a frontend bug ...
+  when it was really 'you have two of these running.'"* §45 moved service
+  management into `services.py` and left the cleanup behind.
+
+  `_free_ui_port()` now runs on `install`/`start`/`restart`, ordered
+  stop → reclaim → start. Stricter than `run.sh`: it checks the holder's
+  command line and **refuses** to kill a process that is not ours, since
+  killing an unrelated service costs far more than a failed bind with a
+  readable message. SIGTERM escalates to SIGKILL — a UI that ignores SIGTERM
+  still holds the socket.
+
+  Eight regression tests in `TestStaleUiPortIsReclaimed`, one of which asserts
+  `main()` calls the cleanup in the right order: the unit can be perfect and
+  the bug still ship if nothing invokes it, which is what §45 did.
+
+- **`/api/analytics/performance` returned HTTP 500 for any book with no losing
+  trade.** `profit_factor()` returned `float("inf")`; Starlette renders with
+  `json.dumps(allow_nan=False)`, so it raised at render time — after the
+  handler returned successfully — and the route 500'd with a traceback naming
+  json.dumps rather than the source. It now returns `None`, matching
+  `backtest_engine.py:569` for the same case. `gross_loss` sums `o <= 0`, so a
+  single break-even trade among winners triggers it too, and a fresh install
+  whose first closed trade wins hits it immediately.
+
+- **The Performance tab could not recover from that 500.** It was the only
+  async renderer with no `try`/`catch`, and used raw
+  `fetch().then(r=>r.json())` rather than `fetchJSON` — no status check, no
+  timeout. It sat on "Loading…" forever, the same symptom as the Journal tab's
+  2026-07-23 hang. Now matches the other twelve renderers, and `fmtRatio()`
+  renders a null ratio as "n/a" instead of throwing on `null.toFixed()`.
+
+### Added
+
+- **`SafeJSONResponse`** (`server.py`, now `default_response_class`) — a
+  non-finite float becomes `null` rather than a 500. For the sources nobody has
+  hit yet: `engine/ta_fallback.py` divides by `.replace(0, np.nan)` in seven
+  places. Sanitising is logged, not silent — it must not become the reason a
+  stray NaN goes unnoticed.
+- **`snapshot()` reports `basis_drift`**, shown as a banner on the Portfolio
+  tab. `ensure_seeded()` reads `paper_trading.starting_cash` only when creating
+  a purse, so editing it on a live account does nothing — correct, but until now
+  invisible: config said $10,000, the purse said $1,000, and the only symptom
+  was "the paper cash was not updated". Reported with the exact command, never
+  applied automatically.
+
+### Removed
+
+- The four `TRAYD_*.md` files (1,041 lines) → **`docs/trayd.md`**. All four
+  walked through the same three setup steps in four voices, written while the
+  integration was being built and now describing completed work. The
+  consolidation states what none of them did: Trayd is integrated but on no live
+  path, deliberately, because it can place orders and the only sanctioned order
+  path is `live_trader.py` behind `is_live_mode()`.
+- `requirements.txt.pre-phase0.bak`, `postgres_cutover_runbook.md` (superseded
+  by `scripts/phase2_5_cutover.sh`).
+- `ticker_selection_research.md` and `position_tier_evaluation.md` **moved** to
+  `docs/archive/`, not deleted — both were flagged stale on zero references, and
+  both hold findings never implemented. Zero references is a weak proxy for
+  irrelevance in a repo whose analysis lives in Markdown.
+
+Retained despite looking stale: `repair_test_damage.py` and
+`assess_test_damage.py` are named in `migrations/012`'s own `RAISE EXCEPTION`
+text; `phase2_5_cutover.sh` is read by `tests/test_review_followups.py`;
+`scripts/tp.sh.bak` and `service.launchd.sh.bak` are documented keeps.
+
+### Known issue, not fixable by a release
+
+`UI_AUTH_TOKEN` is unset on this machine, so every write endpoint answers 500.
+§4 correctly made this fail closed rather than default to empty; the value was
+never provisioned. Run `./scripts/tp secrets set UI_AUTH_TOKEN`.
+
 ## [2.3] — v2.3.0 — 2026-07-26
 
 ### A connectivity failure that reported the wrong cause

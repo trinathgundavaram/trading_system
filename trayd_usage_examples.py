@@ -5,7 +5,7 @@ Trayd MCP Usage Examples
 This file demonstrates how to integrate trayd-mcp into your trading platform.
 Copy/adapt these examples into your main.py, scheduler.py, or engine code.
 
-Setup: See TRAYD_MCP_SETUP.md first (link Robinhood account, update .env)
+Setup: See docs/trayd.md first (link Robinhood account, update .env)
 """
 
 from mcp_clients.trayd_mcp import TraydMCP
@@ -22,7 +22,7 @@ def check_setup():
     """Verify trayd is properly configured."""
     if not trayd.configured():
         print("⚠️  Trayd not configured - TRAYD_MCP_URL missing from .env")
-        print("   See TRAYD_MCP_SETUP.md for setup instructions")
+        print("   See docs/trayd.md for setup instructions")
         return False
     print("✓ Trayd configured")
     return True

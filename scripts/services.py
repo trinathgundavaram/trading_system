@@ -48,6 +48,7 @@ import argparse
 import getpass
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -88,6 +89,138 @@ def _service_env() -> dict:
         # that was not explicitly promoted must not arm live execution.
         "TP_FORCE_PAPER": os.getenv("TP_FORCE_PAPER", "1"),
     }
+
+
+# The port main.py binds for the web UI. Hardcoded there (uvicorn.run(...,
+# port=8080)); named here so the stale-holder cleanup below and that bind
+# cannot drift apart silently.
+UI_PORT = int(os.getenv("TP_UI_PORT", "8080"))
+
+
+def _port_holder_pids(port: int) -> list:
+    """PIDs listening on ``port``, or [] if that cannot be determined.
+
+    Deliberately best-effort and never raises: this feeds a cleanup step that
+    must not be the reason a start fails. An empty list means EITHER nothing is
+    listening or we could not tell, and the caller treats those the same way -
+    it proceeds, and the bind either works or reports its own error.
+    """
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["netstat", "-ano"], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except Exception:
+            return []
+        pids = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP" \
+                    and parts[1].endswith(f":{port}") and parts[3].upper() == "LISTENING":
+                if parts[4].isdigit() and parts[4] != "0":
+                    pids.append(int(parts[4]))
+        return sorted(set(pids))
+    for argv in (["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                 # Containers and slim Linux images routinely have no lsof.
+                 ["fuser", f"{port}/tcp"]):
+        if not shutil.which(argv[0]):
+            continue
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        except Exception:
+            continue
+        pids = [int(t) for t in r.stdout.replace(":", " ").split() if t.isdigit()]
+        if pids:
+            return sorted(set(pids))
+    return []
+
+
+def _describe_pid(pid: int) -> str:
+    """Best-effort command line for ``pid``, for the log line and the ownership
+    check below. Empty string when it cannot be read."""
+    try:
+        if os.name == "nt":
+            r = subprocess.run(
+                ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine"],
+                capture_output=True, text=True, timeout=10)
+        else:
+            r = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=10)
+        return " ".join(r.stdout.split())
+    except Exception:
+        return ""
+
+
+def _free_ui_port(port: int = UI_PORT, wait_s: float = 5.0) -> None:
+    """Kill a STALE previous UI process still holding ``port``, then wait for it.
+
+    Why this exists (2026-07-26). `run.sh --ui` has done this since the
+    2026-07-14 incident, where an orphaned `main.py --ui` kept holding 8080
+    invisibly: the new process failed to bind, the browser kept talking to the
+    OLD one, and - in run.sh's own words - it "looked exactly like a frontend
+    bug ... when it was really 'you have two of these running.'"
+
+    §45 moved service management from service.sh to this file and did NOT bring
+    that cleanup along, so `./service.sh restart` reintroduced the identical
+    failure through a different door. It recurred on 2026-07-26: a restart
+    after tagging v2.3.0 left the pre-v2.3.0 process on 8080, launchd
+    relaunch-looped the new one 342 times, and the fix being tested appeared
+    not to work because the code under test was never the code serving.
+
+    Stricter than run.sh's version in one respect. run.sh kills whatever holds
+    the port, reasoning that on a single-user dev machine it is always our own
+    leftover. That is usually true and occasionally expensive, so this checks
+    the command line first and REFUSES to kill a process that is not one of
+    ours - the cost of being wrong (killing an unrelated service) is much
+    higher than the cost of printing an explanation and letting the bind fail
+    with a message that now makes sense.
+    """
+    pids = [p for p in _port_holder_pids(port) if p != os.getpid()]
+    if not pids:
+        return
+    for pid in pids:
+        desc = _describe_pid(pid)
+        ours = ("main.py" in desc and "--ui" in desc) or "uvicorn" in desc
+        if not ours:
+            print(f"  WARNING: port {port} is held by PID {pid}, which does not look")
+            print(f"           like this platform's UI process:")
+            print(f"             {desc or '(command line unavailable)'}")
+            print(f"           NOT killing it. The UI will fail to bind until you")
+            print(f"           free the port or set TP_UI_PORT to something else.")
+            continue
+        print(f"  port {port} still held by a previous UI process (PID {pid}) - "
+              f"terminating it")
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=10)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue          # already gone between the scan and the signal
+        except PermissionError:
+            print(f"  WARNING: not permitted to terminate PID {pid} - free port "
+                  f"{port} manually")
+            continue
+        except Exception as e:
+            print(f"  WARNING: could not terminate PID {pid}: {e}")
+            continue
+
+    # A SIGTERM is a request. Poll rather than sleeping a fixed amount, then
+    # escalate once - a process that ignores SIGTERM will still be holding the
+    # socket when uvicorn tries to bind, which is the whole failure being fixed.
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if not [p for p in _port_holder_pids(port) if p != os.getpid()]:
+            return
+        time.sleep(0.25)
+    for pid in [p for p in _port_holder_pids(port) if p != os.getpid()]:
+        desc = _describe_pid(pid)
+        if ("main.py" in desc and "--ui" in desc) or "uvicorn" in desc:
+            print(f"  PID {pid} ignored SIGTERM after {wait_s:.0f}s - sending SIGKILL")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
 
 
 def _commands() -> dict:
@@ -504,6 +637,19 @@ def main(argv=None) -> int:
             continue
         if args.action != "status":
             print(f"{args.action} {name}")
+        # Free the port BEFORE any action that ends in a running UI. `stop`
+        # alone is excluded: it has no bind to protect, and killing a holder we
+        # were not asked to start would be a surprise.
+        #
+        # Runs on install/start/restart because all three end with mgr.start(),
+        # and the stale holder is just as fatal in each case. It is a no-op when
+        # the port is free, which is the normal path.
+        if name == "ui" and args.action in ("install", "start", "restart"):
+            if args.action == "restart":
+                mgr.stop(name)          # stop first, so the port is usually
+                                        # already free by the time we look
+            _free_ui_port()
+
         if args.action == "install":
             mgr.install(name, cmds[name], env, REPO_DIR, _log_path(name))
             mgr.start(name)
@@ -514,7 +660,10 @@ def main(argv=None) -> int:
         elif args.action == "stop":
             mgr.stop(name)
         elif args.action == "restart":
-            mgr.stop(name)
+            # `ui` already stopped above so the port check saw a settled state;
+            # everything else stops here.
+            if name != "ui":
+                mgr.stop(name)
             mgr.start(name)
         elif args.action == "status":
             print(f"  {name}: {mgr.status(name)}")
