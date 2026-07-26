@@ -22,6 +22,150 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [3.0] — v3.0.0 — 2026-07-26
+
+### Decision function: CHANGED — re-validation required before arming live
+
+`scripts/classify_change.py` reports MAJOR and this ships as **major**. The two
+agree, which is the uninteresting case; what is worth recording is that
+`classify_change.py`'s own docstring uses this exact change as its worked
+example — *"Deleting `* b.qual_mult` from the weighted sum (§19) is a one-line
+change that a conventional scheme would call a patch. It re-scores every
+candidate in the system... That is a major bump."* That is precisely what
+happened here, arrived at from the opposite direction: a zero-trades audit
+rather than a release review.
+
+**`config_fingerprint` is UNCHANGED at `cc9a149613427f56`, and that is a gap,
+not a reassurance.** The fingerprint hashes `config.yaml` values only. Every
+change below moved the decision function in *code*, touching no config key, so
+the mechanism §17 built to make strategy changes self-partitioning does not fire
+here. Nothing automatically distinguishes a pattern row scored before this
+release from one scored after it.
+
+> **Pattern rows recorded before v3.0.0 must NOT be pooled with rows recorded
+> after it.** The partition is the release boundary, not the fingerprint. Any
+> analysis spanning 2026-07-26 has to filter on `app_version` by hand.
+
+Trade history is unaffected in the sense that no *closed trade* changes
+retroactively — but every score, every threshold and every exit in the backtest
+corpus was produced by a different function than the one now running.
+
+### The scoring ceiling: 29,882 candidate-days, 0 trades, and why that was not the strategy
+
+A 3-year Stage 1 replay over 60 tickers scored 29,882 candidate-days and
+produced **zero** trades, with the score distribution showing a hard right edge
+at 52.94% that did not move between runs. A distribution whose maximum is
+identical across two runs is a ceiling, not a signal. Three compounding
+compressions, in `rules/swing_buy_rules.py`:
+
+- **The 1.25× redistribution clamp could not do the job it was added for, and
+  cost 17pp of ceiling doing it.** The 2026-07-21 review asked that no bucket be
+  able to "dominate the entire score" when several go dark simultaneously. The
+  implementation clamped `scale` — but `scale` multiplies every available bucket
+  uniformly, so it cancels out of the share ratio entirely:
+  `share_b = (w_b − unavail_b)·scale / (w_avail·scale)`. Relative dominance was
+  exactly the same at 1.25 as at 1.54. The clamp guarded nothing and lowered the
+  reachable ceiling from 89.5% to 72.5%. Replaced with a real per-bucket share
+  guard (`MAX_BUCKET_SHARE`), which — because share is scale-invariant, so an
+  over-concentrated composite *cannot* be repaired by rescaling — surfaces as a
+  confidence dock and telemetry rather than as a silently lower ceiling.
+
+- **`_qualification_multiplier` was applied twice.** Bucket contribution was
+  `(points/max_points) × weight × qual_mult`, where `qual_mult` is itself a
+  function of `points/max_points` — so the effective contribution was ≈ pct². A
+  bucket at 80% completion contributed 0.704, at 60% contributed 0.420. Real
+  candidates sit at 70–85% and essentially never at 100%, making this the
+  dominant real-world compressor (mean score 21.7% against a 50% bar). It was
+  also not the documented design: that function's docstring says it exists to
+  *replace* a binary qualification cliff, not to compose on top of an
+  already-proportional term. Now applied once, via the anchor curve, recomputed
+  from `_effective_bucket_pct` so EXTERNAL's partial-outage handling still feeds
+  it.
+
+- **The threshold never learned that the score scale had shrunk.** 25% of an
+  unavailable bucket's weight is deliberately left dead, but `dynamic_thresholds.py`
+  returns a bar on a fixed 0–100 scale, so the dead weight was charged twice —
+  once by compressing the score, once by leaving the bar where full coverage
+  would need it. A nominal 50% bar was really demanding 55.9% of measurable
+  evidence, and got stricter every time a data source went down. Every outage was
+  quietly becoming a regime nobody chose. The threshold is now rescaled by the
+  achievable ceiling; `final_score_pct` keeps its existing meaning so stored
+  `final_score` rows stay comparable, and the rescale is a no-op at full
+  coverage.
+
+This is the same defect class as the VOLATILITY_EXPANSION drag fixed on
+2026-07-15 (its 7% weight capped every non-squeeze stock at 93%), at four times
+the magnitude and reached by a different mechanism. `tests/test_scoring_sanity.py`
+gains 5 tests pinning the ceiling under every availability combination — the
+missing test both times.
+
+### The backtest was not replaying the exit policy the system actually runs
+
+With trades finally flowing, the first result was 302 trades at profit factor
+1.10 — a thin-to-nonexistent edge. It was mostly an artifact.
+`simulate_forward_exit` held **one** stop price for a whole 20-day hold, while
+production runs `engine/stop_state_machine.py`'s 6-state ratcheting stop on
+every cycle. Of 302 trades, 213 reached `breakeven_r` (0.5R) and **123 of those
+still recorded a full stop-out**, because nothing ever moved the stop up.
+Production would have exited them near flat. The 208 losers were not going
+straight down — 53.8% reached +3% first and 17.8% reached +10% first, then
+round-tripped. Losers that rally first and winners that never dip is the
+signature of a missing trailing stop, not a bad entry.
+
+`engine/backtest_engine.py` now replays `stop_state_machine.calculate()`
+bar-by-bar with production's `should_advance()` ratchet. Win rate **29.8% →
+53.5%**, PF **1.10 → 1.23**, on an unchanged ticker set.
+
+The subtle part is point-in-time discipline, and it has its own test. The stop
+in force during bar *i* is priced off bar *i−1*'s close. Re-pricing from bar
+*i*'s own close and then testing that bar's low against it would be look-ahead
+that flatters trailing stops **specifically** — it would manufacture the exact
+improvement the change is meant to measure.
+`tests/test_backtest_exit_replay.py` (9 tests).
+
+Also: `summarize()` now reports **expectancy in R**. The replay equal-weights
+percentage returns, so a stop-width comparison read on `avg_outcome_pct` rewards
+wider stops for taking more risk per trade. Exit vocabulary moved to
+`rules/common.py`'s canonical `EXIT_KINDS` — a stop hit in `TREND_FOLLOWING` is
+a `trailing_stop` protecting profit, not a `stop_loss`, and collapsing the two
+made every trailing exit read as a failure.
+
+### What the measurements say, and what they do not
+
+Swept as full re-runs (entries are path-dependent — `i = exit_idx + 1` — so
+nothing can be re-filtered from a saved trade list), read on expectancy_R:
+
+| Config | n | win | PF | exp_R |
+|---|---|---|---|---|
+| stop=8 (current) | 396 | 53.5% | 1.23 | 0.119 |
+| **stop=16** | 330 | 58.8% | 1.48 | **0.202** |
+| stop=16, trail=0.75 | 370 | 56.8% | 1.28 | 0.157 |
+| stop=16, r=4.0 | 324 | 58.3% | 1.44 | 0.202 |
+| stop=16, threshold=62 | 257 | 59.5% | 1.44 | 0.178 |
+
+Only the stop cap matters: it was binding on 94 of 181 stop-outs, clamping
+tighter than the ATR justified. Trail and `r_multiple` are already at optimum,
+and **raising the threshold makes things worse** — the opposite of what the
+broken exit model implied, where ≥65 looked like PF 1.60. Acting on that earlier
+reading would have degraded the system.
+
+**No `config.yaml` value is changed in this release.** The sweep ran on
+`engine/ta_fallback.py`, not the `pandas_ta` backend every threshold in
+`config.yaml` was derived on, and `engine/ticker_analyzer.py` fails closed on
+that for exactly this reason. Tuning against fallback numbers is how a threshold
+derived on one backend gets replaced by one derived on another.
+
+On a mega-cap holdout (MSFT, GOOGL, BAC, PFE, CMCSA, F) the stop change is
+byte-identical — median risk 2.66%, so the 8% cap never binds — which is the
+right property for a targeted fix. The same run shows **PF 1.01, expectancy
+0.004R**: no edge at all on liquid large-caps. The entire measured edge sits in
+high-volatility names over a 2023–2026 window containing a large crypto/momentum
+run. That is one volatility bucket in one favourable period, not a validated
+strategy, and `learning/walk_forward.py` exists and has never been pointed at it.
+
+Full analysis: [docs/backtest_eval_2026-07-26.md](docs/backtest_eval_2026-07-26.md).
+Sweep harness: `scripts/sweep_exit_params.py`.
+
 ## [2.4] — v2.4.0 — 2026-07-26
 
 ### Documentation audit: what the docs claimed was unbuilt, checked against the code

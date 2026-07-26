@@ -527,3 +527,129 @@ if __name__ == "__main__":
     test_day_position_gets_tighter_stop_than_swing()
     test_day_position_sizing_applies_multiplier()
     print("ALL SCORING SANITY TESTS PASS")
+
+
+# ---------------------------------------------------------------------------
+# Score-ceiling regression tests (2026-07-26).
+#
+# The Stage 1 backtest scored 29,882 candidate-days and produced 0 trades with
+# a hard 52.94% right edge in the distribution. Root cause was not the
+# strategy: two independent mechanisms were compressing the reachable score
+# scale while dynamic_thresholds.py still compared against a fixed 0-100 bar
+# (the 1.25x redistribution clamp cost 17pp of ceiling, the deliberate 25%
+# dead weight another 10.5pp). See docs/backtest_eval_2026-07-26.md.
+#
+# This exact defect class had already shipped once before - VOLATILITY_
+# EXPANSION's weight capped every non-squeeze stock at a 93% maximum until
+# 2026-07-15 - and both times it was found only by a zero-trades audit rather
+# than by a test. These are that missing test.
+# ---------------------------------------------------------------------------
+
+def _all_dark(td):
+    """Every bucket that has no point-in-time-safe historical source, dark -
+    exactly what engine/backtest_engine.py feeds on every replayed day."""
+    return dict(td, external_data_available=False,
+                sentiment_macro_data_available=False)
+
+
+def test_perfect_setup_reaches_ceiling_under_full_outage():
+    """A candidate that maxes every MEASURABLE bucket must still score near
+    the achievable ceiling, whatever is dark. Before the 2026-07-26 fix this
+    topped out at 72.5% - a bar of 50 was then really asking for 69% of
+    available evidence, and no candidate in 3 years of history cleared it."""
+    cfg = _cfg()
+    mkt = dict(_maxed_market(), breadth_stale=True)
+    res = sbr.score(_all_dark(_maxed_ticker()), mkt, FakeRegime(), cfg, mode="swing")
+    dc = res.threshold_result["data_coverage"]
+    assert set(dc["unavailable_buckets"]) == {
+        "EXTERNAL", "SENTIMENT_MACRO", "MARKET_BREADTH"}, dc["unavailable_buckets"]
+    ceiling = dc["achievable_ceiling"] * 100
+    # 0.58 available weight x 1.5431 pro-rata scale = 89.5%.
+    assert 89.0 <= ceiling <= 90.0, ceiling
+    # And a perfect measurable setup must actually GET there (the volatility
+    # bonus is additive on top, so allow >=).
+    assert res.final_score_pct >= ceiling - 0.5, (res.final_score_pct, ceiling)
+
+
+def test_threshold_rescales_so_the_bar_means_the_same_thing():
+    """The bar must ask for the same FRACTION of measurable evidence
+    regardless of coverage. Without this the dead weight is charged twice -
+    once in the score, once by leaving the bar where full data would need it -
+    so every outage silently became a stricter regime nobody chose."""
+    cfg = _cfg()
+    full = sbr.score(_maxed_ticker(), _maxed_market(), FakeRegime(), cfg, mode="swing")
+    dark = sbr.score(_all_dark(_maxed_ticker()),
+                     dict(_maxed_market(), breadth_stale=True),
+                     FakeRegime(), cfg, mode="swing")
+    # Full coverage: no rescale at all (ceiling 1.0), so nothing changes for
+    # a normal live cycle.
+    assert full.threshold_result["data_coverage"]["achievable_ceiling"] == 1.0
+    assert full.threshold == full.threshold_result["nominal_threshold_full_coverage"]
+    # Dark: bar scaled down by exactly the ceiling.
+    ceiling = dark.threshold_result["data_coverage"]["achievable_ceiling"]
+    assert ceiling < 1.0
+    assert abs(dark.threshold
+               - dark.threshold_result["nominal_threshold_full_coverage"] * ceiling) < 0.01
+    # The invariant that matters: identical evidence quality -> identical
+    # verdict, whatever the coverage.
+    assert full.passed and dark.passed, (full.final_score_pct, full.threshold,
+                                         dark.final_score_pct, dark.threshold)
+
+
+def test_qual_mult_applied_once_not_squared():
+    """_qualification_multiplier's docstring says it REPLACES a binary
+    qualification cliff with a smooth curve - it was never meant to be
+    composed on top of the already-proportional points/max_points term.
+    Applying both made a bucket at 80% completion contribute 0.704, which
+    was the dominant real-world compressor (backtest mean 21.7% vs a 50%
+    bar). Pin single application: a bucket at pct completion contributes
+    exactly qual_mult(pct) x weight, never pct x qual_mult(pct) x weight."""
+    cfg = _cfg()
+    res = sbr.score(_maxed_ticker(), _maxed_market(), FakeRegime(), cfg, mode="swing")
+    for b in res.buckets:
+        if not b.max_points or b.name == "VOLATILITY_EXPANSION":
+            continue
+        pct = b.points / b.max_points
+        expected = sbr._qualification_multiplier(pct, b.min_pct)
+        assert abs(b.qual_mult - expected) < 1e-9, (b.name, b.qual_mult, expected)
+        # The squared form must NOT be what lands in the composite.
+        assert abs(pct * expected - expected) < 1e-9 or pct >= 0.999, (
+            f"{b.name}: fixture is not maxed, so this test cannot distinguish "
+            f"single from double application (pct={pct})")
+
+
+def test_share_guardrail_docks_confidence_not_the_ceiling():
+    """The 2026-07-21 review asked that no bucket be able to 'dominate the
+    entire score'. The old implementation clamped `scale`, which is share-
+    invariant (a uniform multiplier cancels in the share ratio) and so
+    guarded nothing while costing 17pp of ceiling. The replacement measures
+    the real share; because an over-concentrated composite cannot be fixed
+    by rescaling, it must surface as reduced confidence, never as a lower
+    ceiling."""
+    cfg = _cfg()
+    mkt = dict(_maxed_market(), breadth_stale=True)
+    dark = sbr.score(_all_dark(_maxed_ticker()), mkt, FakeRegime(), cfg, mode="swing")
+    dc = dark.threshold_result["data_coverage"]
+    shares = dc["bucket_shares"]
+    # 1e-3, not 1e-6: bucket_shares is rounded to 4dp for telemetry.
+    assert abs(sum(shares.values()) - 1.0) < 1e-3, shares
+    # Shares must be independent of the redistribution scale - that is the
+    # whole reason the old clamp could not have worked.
+    assert abs(shares["TREND"] - 0.225 / 0.58) < 1e-3, shares["TREND"]
+    assert dc["max_bucket_share"] == max(shares.values())
+    # Legacy telemetry keys must survive for existing signals-row consumers.
+    assert dc["redistribution_scale_capped"] is False
+    assert "weight_redistribution_scale_uncapped" in dc
+
+
+def test_full_coverage_scoring_is_unchanged_by_the_ceiling_work():
+    """Guard against the fix leaking into normal live cycles: with every
+    bucket live, redistribution is a no-op and a perfect setup still scores
+    ~100 against an unmodified bar."""
+    cfg = _cfg()
+    res = sbr.score(_maxed_ticker(), _maxed_market(), FakeRegime(), cfg, mode="swing")
+    dc = res.threshold_result["data_coverage"]
+    assert dc["unavailable_buckets"] == [], dc["unavailable_buckets"]
+    assert dc["weight_redistribution_scale"] == 1.0
+    assert dc["achievable_ceiling"] == 1.0
+    assert res.final_score_pct >= 99.0, res.final_score_pct

@@ -953,26 +953,47 @@ def score(ticker_data: dict, market_data: dict, regime, config: dict, mode: str 
     w_unavail = sum(unavail_weight.values())
     w_avail = sum(b.weight for b in decision_buckets) - w_unavail
     scale_uncapped = 1.0 + (0.75 * w_unavail / w_avail) if (w_unavail and w_avail) else 1.0
-    # GUARDRAIL (2026-07-21, external review - "cap the final effective
-    # weight of any bucket. Otherwise, simultaneous EXTERNAL and another
-    # outage could unintentionally make TREND or MOMENTUM dominate the
-    # entire score"): scale is applied uniformly to every available bucket,
-    # so capping scale itself caps every bucket's post-redistribution weight
-    # at the same multiple of its configured weight - "no active bucket may
-    # exceed 1.25x its configured weight after redistribution." Originally
-    # only EXTERNAL could carry unavailable weight (w_unavail at most ~16%
-    # of the stock profile), so this rarely bound in live production - a
-    # forward guard, not a live behavior change, until 2026-07-24 added
-    # SENTIMENT_MACRO/MARKET_BREADTH to the same treatment above. In the
-    # Stage 1 backtest specifically, all three ARE simultaneously
-    # unavailable every cycle (w_unavail ~42% of the stock profile), so this
-    # guardrail now genuinely binds there (scale caps at 1.25x instead of
-    # the ~1.54x uncapped pro-rata would otherwise give) - exactly the
-    # scenario this comment originally flagged as a forward guard. Any
-    # amount the cap prevents from being redistributed joins the deliberate
-    # 25% dead weight below (still not scored, still not treated as
-    # bearish) - recorded in data_coverage so it's auditable.
-    scale = min(scale_uncapped, 1.25)
+    # GUARDRAIL, REBUILT (2026-07-26, Stage 1 zero-trades root-cause - see
+    # docs/backtest_eval_2026-07-26.md). The 2026-07-21 review asked to "cap
+    # the final effective weight of any bucket. Otherwise, simultaneous
+    # EXTERNAL and another outage could unintentionally make TREND or
+    # MOMENTUM dominate the entire score." That was a real concern, but the
+    # implementation - scale = min(scale_uncapped, 1.25) - could not address
+    # it, because `scale` multiplies EVERY available bucket by the same
+    # factor. A uniform multiplier is share-invariant:
+    #
+    #     share_b = (w_b - unavail_b) * scale / (w_avail * scale)
+    #             = (w_b - unavail_b) / w_avail            <- scale cancels
+    #
+    # so clamping `scale` left every bucket's RELATIVE dominance exactly
+    # where it was and only lowered the achievable ceiling. With all three
+    # data-dark buckets unavailable (w_unavail = 42% of the stock profile)
+    # the clamp cost 17 points of ceiling - it pinned the maximum reachable
+    # composite at 72.5% while dynamic_thresholds.py still compared against
+    # a 0-100 bar, which is what produced 0 trades on 29,882 candidate-days
+    # with a hard 52.94% right edge in the score distribution. This is the
+    # same defect class as the VOLATILITY_EXPANSION drag fixed on
+    # 2026-07-15 (see VOL_EXP_BONUS_MAX_PTS above), at 4x the magnitude.
+    #
+    # The concern is now guarded where it actually lives - on the relative
+    # share - and the ceiling is left intact. Because share is scale-
+    # invariant, an exceeded share CANNOT be fixed by rescaling: it means
+    # too few buckets have real data for the composite to be well-spread,
+    # regardless of arithmetic. So it is surfaced (data_coverage +
+    # confidence dock in the threshold section below), not silently
+    # "corrected" by shrinking everyone's ceiling. The deliberate 25% dead
+    # weight below is untouched - missing evidence still costs something.
+    scale = scale_uncapped
+    _eff_w = {b.name: (b.weight - unavail_weight.get(b.name, 0.0)) * scale
+              for b in decision_buckets}
+    _eff_total = sum(_eff_w.values())
+    bucket_shares = {n: (w / _eff_total if _eff_total else 0.0) for n, w in _eff_w.items()}
+    max_bucket_share = max(bucket_shares.values()) if bucket_shares else 0.0
+    # 0.45: no single bucket should carry near-half the decision on its own.
+    # Never binds when all six buckets are live (TREND, the heaviest, is
+    # 22.5%); trips only in a genuine multi-bucket outage.
+    MAX_BUCKET_SHARE = 0.45
+    bucket_share_exceeded = max_bucket_share > MAX_BUCKET_SHARE
     # Per-bucket effective weights (2026-07-21, external review round 2 -
     # "record effective weights for every decision"): the scalar `scale`
     # above tells you THAT redistribution happened and by how much overall,
@@ -1019,8 +1040,37 @@ def score(ticker_data: dict, market_data: dict, regime, config: dict, mode: str 
             return min(1.0, b.points / measured_max)
         return (b.points / b.max_points) if b.max_points else 0.0
 
+    # BUCKET CONTRIBUTION (2026-07-26 - the qual_mult double-count, see
+    # docs/backtest_eval_2026-07-26.md). This used to be
+    #     _effective_bucket_pct(b) * effective_weight * b.qual_mult
+    # which applied the completion ratio TWICE: _effective_bucket_pct is
+    # points/max_points, and b.qual_mult is _qualification_multiplier() of
+    # that same ratio. The product is ~pct^2, so a bucket at 80% completion
+    # contributed 0.704, at 70% contributed 0.560, at 60% contributed 0.420.
+    # Real candidates live at 70-85% bucket completion and essentially never
+    # at 100%, so this was the dominant real-world compressor of the score
+    # distribution (mean 21.7% against a 50% bar).
+    #
+    # It was also not what the code intended. _qualification_multiplier's own
+    # docstring says it exists so that "above min_pct contributes
+    # proportionally (not a sudden jump to 1.0)" - i.e. it was written to
+    # REPLACE a binary qualification cliff with a smooth curve, not to be
+    # composed on top of an already-proportional term. Applying it once is
+    # the documented design; applying it twice was the bug.
+    #
+    # Resolved (2026-07-26, Akhil) in favour of the anchor curve alone: the
+    # deliberate concavity the table encodes ("a half-complete bucket is
+    # worth less than half a complete one") is kept, just applied once.
+    # qual_mult is recomputed here rather than read off b.qual_mult so that
+    # EXTERNAL's partial-unavailability measured-max adjustment in
+    # _effective_bucket_pct (2026-07-22) still feeds it - b.qual_mult was
+    # computed in bucket_score() from the RAW points/max_points and knows
+    # nothing about confirmed-dark rules being excluded from the denominator.
+    def _bucket_contribution_factor(b):
+        return _qualification_multiplier(_effective_bucket_pct(b), b.min_pct)
+
     weighted_sum = sum(
-        _effective_bucket_pct(b) * ((b.weight - unavail_weight.get(b.name, 0.0)) * scale) * b.qual_mult
+        _bucket_contribution_factor(b) * ((b.weight - unavail_weight.get(b.name, 0.0)) * scale)
         for b in decision_buckets
     )
     # NOTE (2026-07-22, resolved): temporary debug logging lived here while
@@ -1043,10 +1093,13 @@ def score(ticker_data: dict, market_data: dict, regime, config: dict, mode: str 
     # buy-regime). Deliberately uses the NAIVE ratio (not _effective_bucket_pct)
     # since this baseline's whole purpose is representing what the score
     # would have been with NONE of today's outage handling applied.
-    _baseline_sum = sum(
-        (b.points / b.max_points) * b.weight * b.qual_mult
-        for b in decision_buckets
-    )
+    # 2026-07-26: tracks the single-application change above. b.qual_mult is
+    # already _qualification_multiplier(b.points / b.max_points, b.min_pct),
+    # so this stays the NAIVE ratio (no measured-max adjustment, no
+    # redistribution) as intended, just without the doubled factor - a
+    # baseline computed on the old doubled formula would no longer be a
+    # like-for-like comparison against weighted_sum.
+    _baseline_sum = sum(b.qual_mult * b.weight for b in decision_buckets)
     final_pct = weighted_sum * 100
     if b7_score.max_points:
         vol_exp_bonus = (b7_score.points / b7_score.max_points) * VOL_EXP_BONUS_MAX_PTS
@@ -1213,6 +1266,57 @@ def score(ticker_data: dict, market_data: dict, regime, config: dict, mode: str 
         quote_freshness_unknown=not bool(ticker_data.get("quote_age_is_measured", False)),
     )
 
+    # THRESHOLD RESCALE TO THE ACHIEVABLE CEILING (2026-07-26 - see
+    # docs/backtest_eval_2026-07-26.md). final_pct's denominator is not a
+    # constant: when buckets go dark, 25% of their weight is deliberately
+    # left dead (the "missing evidence must cost something" rule above), so
+    # the maximum reachable composite drops below 100. calc_threshold above
+    # knows nothing about that - it returns a bar on a fixed 0-100 scale.
+    # Comparing a compressed score against an uncompressed bar charged the
+    # dead-weight penalty TWICE: once by shrinking the score, and again by
+    # leaving the bar where a full-data score would have had to reach it.
+    #
+    # With all three data-dark buckets unavailable the ceiling is 89.5%, so
+    # a nominal 50% bar was really demanding 55.9% of achievable evidence -
+    # silently a much harder test than TURBO's configured 50%, and one that
+    # got harder every time a data source went down. Every outage was
+    # quietly becoming a stricter regime nobody had chosen.
+    #
+    # Rescaling by the ceiling makes the bar mean the same thing regardless
+    # of coverage: "50% of the evidence that could actually be measured
+    # today." The dead weight still costs - it just costs once, in the score,
+    # which is where it was designed to be paid.
+    #
+    # Resolved (2026-07-26, Akhil) in favour of rescaling the THRESHOLD
+    # rather than normalizing the score: final_score_pct keeps the meaning
+    # every already-stored row in learning/pattern_database.py's final_score
+    # column was written with, so trade history stays comparable across the
+    # change. No-op when all buckets are live (ceiling == 1.0), so live
+    # full-coverage cycles and every existing test are unaffected.
+    _w_total = sum(b.weight for b in decision_buckets)
+    achievable_ceiling = (w_avail * scale / _w_total) if _w_total else 1.0
+    # Never scale the bar UP: a challenger/odd weight profile that somehow
+    # produced a >1.0 ceiling should not be able to raise the bar via this
+    # path, which exists only to undo a compression.
+    achievable_ceiling = min(1.0, achievable_ceiling)
+    _nominal_threshold = threshold_result["final_threshold"]
+    threshold_result["final_threshold"] = round(_nominal_threshold * achievable_ceiling, 2)
+    threshold_result["nominal_threshold_full_coverage"] = _nominal_threshold
+    threshold_result["achievable_ceiling_pct"] = round(achievable_ceiling * 100, 2)
+    if achievable_ceiling < 1.0:
+        threshold_result["breakdown"] += (
+            f" | rescaled x{achievable_ceiling:.3f} to achievable ceiling "
+            f"({achievable_ceiling * 100:.1f}%) = {threshold_result['final_threshold']:.1f}%"
+        )
+    # Share guardrail (see the MAX_BUCKET_SHARE block above): an over-
+    # concentrated composite cannot be repaired by arithmetic, so it docks
+    # CONFIDENCE in the decision rather than silently moving the bar. -10
+    # matches the existing dock for hitting the adjustment cap in
+    # dynamic_thresholds.py.
+    if bucket_share_exceeded:
+        threshold_result["confidence"] = max(0.0, threshold_result["confidence"] - 10.0)
+        threshold_result["bucket_share_dock"] = 10.0
+
     # data_coverage (external review, 2026-07-15): a buy decision should be
     # explainable as "N% real data / M% degraded" - not just a score. Rides
     # inside threshold_result so it's persisted in the signals table's
@@ -1273,12 +1377,29 @@ def score(ticker_data: dict, market_data: dict, regime, config: dict, mode: str 
         "sentiment_macro_unavail_fraction": round(sentiment_macro_unavail_fraction, 4),
         "market_breadth_unavail_fraction": round(market_breadth_unavail_fraction, 4),
         "weight_redistribution_scale": round(scale, 4),
-        # Guardrail telemetry (2026-07-21, external review) - see the
-        # scale/scale_uncapped comment above. redistribution_scale_capped is
-        # True only if the 1.25x guardrail actually clipped something this
-        # cycle; uncapped is what pure 75%-pro-rata would have used.
+        # Guardrail telemetry. 2026-07-26: the 1.25x scale clamp is gone (it
+        # was share-invariant and only cut the ceiling - see the
+        # MAX_BUCKET_SHARE block above), so scale always equals the pure
+        # 75%-pro-rata value now. Both legacy keys are retained, with
+        # redistribution_scale_capped pinned False, so existing UI /
+        # analytics/decision_replay.py / learning consumers that read them
+        # keep working instead of KeyError-ing on an old signals row.
         "weight_redistribution_scale_uncapped": round(scale_uncapped, 4),
-        "redistribution_scale_capped": bool(scale_uncapped > scale + 1e-9),
+        "redistribution_scale_capped": False,
+        # Replacement guardrail (2026-07-26): the largest single bucket's
+        # share of total effective decision weight, and whether it breached
+        # MAX_BUCKET_SHARE. Unlike the old clamp this measures the thing the
+        # 2026-07-21 review actually asked about ("could TREND or MOMENTUM
+        # dominate the entire score"), and it docks confidence rather than
+        # lowering the ceiling - see the threshold section below.
+        "bucket_shares": {n: round(s, 4) for n, s in bucket_shares.items()},
+        "max_bucket_share": round(max_bucket_share, 4),
+        "max_bucket_share_limit": MAX_BUCKET_SHARE,
+        "bucket_share_exceeded": bool(bucket_share_exceeded),
+        # Maximum composite reachable given today's coverage (1.0 = full
+        # data). The threshold is rescaled by this - see the THRESHOLD
+        # RESCALE block - so a score must always be read against it.
+        "achievable_ceiling": round(achievable_ceiling, 4),
         # Per-bucket configured vs. effective weight (2026-07-21, external
         # review round 2) - see effective_weights' definition above.
         "effective_weights": effective_weights,
@@ -1421,16 +1542,18 @@ def score(ticker_data: dict, market_data: dict, regime, config: dict, mode: str 
             }
             _ch_unavail = sum(_ch_unavail_weight.values())
             _ch_avail = sum(_ch_w.values()) - _ch_unavail
-            # Same 1.25x guardrail as the champion's `scale` above
-            # (2026-07-21, external review) - a challenger profile that
-            # concentrates more weight into fewer buckets shouldn't be able
-            # to bypass the cap the champion is held to.
-            ch_scale = min(
-                1.0 + (0.75 * _ch_unavail / _ch_avail) if (_ch_unavail and _ch_avail) else 1.0,
-                1.25,
-            )
+            # 2026-07-26: mirrors the champion's guardrail rebuild above -
+            # the 1.25x clamp is gone (it was share-invariant and only cut
+            # the ceiling; see that comment), so the challenger is held to
+            # the same uncapped pro-rata scale. Keeping the old clamp here
+            # would make the challenger look worse than the champion purely
+            # from stale arithmetic rather than from its weight profile,
+            # which is the one thing this shadow is supposed to measure.
+            ch_scale = (1.0 + (0.75 * _ch_unavail / _ch_avail)
+                        if (_ch_unavail and _ch_avail) else 1.0)
+            # Same single-application contribution factor as the champion.
             ch_sum = sum(
-                _effective_bucket_pct(b) * ((_ch_w[b.name] - _ch_unavail_weight.get(b.name, 0.0)) * ch_scale) * b.qual_mult
+                _bucket_contribution_factor(b) * ((_ch_w[b.name] - _ch_unavail_weight.get(b.name, 0.0)) * ch_scale)
                 for b in decision_buckets
             )
             _adjustments_delta = final_pct - weighted_sum * 100  # vol bonus + penalties, additive
@@ -1605,7 +1728,12 @@ def _bucket_diagnostic_detail(b) -> str:
     here - b.max_points (71 for TREND) IS the real max; see this module's
     top-of-file note for why."""
     pct_of_max = (b.points / b.max_points * 100) if b.max_points else 0.0
-    contribution = (b.points / b.max_points) * b.weight * b.qual_mult * 100 if b.max_points else 0.0
+    # 2026-07-26: single-application, matching score()'s weighted_sum (the
+    # doubled ratio*qual_mult product is gone - see the BUCKET CONTRIBUTION
+    # note there). This display line existing on the OLD formula while the
+    # real score used a new one is exactly how the 2026-07-22 "Score: 0.0%"
+    # discrepancy hid for so long, so it tracks deliberately.
+    contribution = b.qual_mult * b.weight * 100 if b.max_points else 0.0
     max_contribution = b.weight * 100
     return (
         f"Raw {b.points:.0f}/{b.max_points:.0f} pts ({pct_of_max:.0f}% of this bucket's own max) | "

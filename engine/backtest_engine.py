@@ -54,11 +54,23 @@ correctness, otherwise mark those features unavailable"):
     no intraday data this session.
 
 KNOWN SIMPLIFICATIONS (documented, not hidden):
-  - Exit modeling uses a fixed ATR-tiered initial stop + fixed R-multiple
-    take-profit target (simulate_forward_exit below), NOT a full replay of
-    engine/stop_state_machine.py's 6-state trailing stop. A faithful replay
-    of the trailing-stop state machine bar-by-bar is a real Stage-1.5
-    enhancement, not built here.
+  - Exit modeling REPLAYS engine/stop_state_machine.py's 6-state ratcheting
+    stop bar-by-bar (2026-07-26 - this used to be a fixed stop held for the
+    whole hold, listed here as a Stage-1.5 gap). It was not a small gap: on
+    the first run where trades actually flowed, 213 of 302 reached
+    breakeven_r and 123 of those still recorded a full stop-out because
+    nothing ever moved the stop up. Fixing it moved the win rate from 29.8%
+    to 53.5% on an unchanged ticker set. See simulate_forward_exit's
+    docstring for the point-in-time rule that keeps the trailing stop honest
+    (the stop in force during a bar is priced off the PREVIOUS bar's close),
+    and for what is still simplified: exit_score is passed 0 so
+    THESIS_BROKEN never fires, and avwap_earnings/recent_swing_low are
+    absent so TRADE_CONFIRMING never triggers.
+  - Position sizing is NOT modelled: every trade is equal-weighted by
+    percentage return. That makes avg_outcome_pct misleading across configs
+    with different stop widths (a wider stop should mean a smaller
+    position), which is why summarize() also reports expectancy_r - see
+    _exit_result's outcome_r note. Read a stop-width comparison on R.
   - hard_vetoes.check()'s two DB-coupled checks (cooldown, already-open) are
     served by _BacktestFakeDB below rather than a live Postgres connection -
     every OTHER veto/scoring/threshold function is the exact unmodified
@@ -314,48 +326,175 @@ def _entry_tier(pct_score: float) -> str:
     return "weak"
 
 
+def atr_series(bars: pd.DataFrame, length: int = 14) -> list:
+    """Per-bar ATR over the whole frame, computed through the SAME df.ta.atr
+    accessor engine/ticker_analyzer.py's _calc_indicators uses (real pandas_ta
+    when importable, engine/ta_fallback.py otherwise - see that module's
+    docstring). Deliberately not a hand-rolled Wilder loop: a third ATR
+    implementation that disagrees with production's by a hair is exactly the
+    kind of drift this codebase keeps paying for elsewhere.
+
+    Used by simulate_forward_exit below so a trailing stop re-prices against
+    the volatility of the bar it is actually trailing on, rather than being
+    frozen at whatever ATR happened to hold on the entry date - a 20-day
+    swing hold through a volatility regime change would otherwise trail at a
+    distance the market no longer justifies in either direction.
+    """
+    import engine.ticker_analyzer  # noqa: F401 - registers the .ta accessor
+    df = bars[["high", "low", "close"]].copy()
+    try:
+        df.ta.atr(length=length, append=True)
+        col = next((c for c in df.columns if c.upper().startswith("ATR")), None)
+        if col is None:
+            raise KeyError("no ATR column produced")
+        return [None if pd.isna(v) else float(v) for v in df[col]]
+    except Exception as e:  # noqa: BLE001 - a missing ATR must not kill the replay
+        logger.warning(f"atr_series: falling back to entry-time ATR ({e})")
+        return [None] * len(bars)
+
+
 def simulate_forward_exit(ticker_bars: pd.DataFrame, entry_idx: int, entry_price: float,
                            atr: float, pct_score: float, stop_loss_swing_pct: float,
-                           r_multiple: float = 3.0, max_hold_days: int = 20) -> dict:
-    """SIMPLIFIED exit model - see module docstring. Fixed ATR-tiered initial
-    stop (same multipliers config.yaml's stop_machine.SWING uses) + fixed
-    R-multiple take-profit (config.yaml's sell_rules.take_profit.r_multiple),
-    checked bar-by-bar. If a bar's low and high both cross their respective
-    levels the same day, the stop is assumed to hit first (standard,
-    conservative backtesting convention)."""
-    tier = _entry_tier(pct_score)
-    atr_mult = _ATR_MULT_BY_TIER[tier]
-    atr_dist = atr_mult * atr if atr > 0 else entry_price * (stop_loss_swing_pct / 100.0)
-    cap_dist = entry_price * (stop_loss_swing_pct / 100.0)
-    stop_dist = min(atr_dist, cap_dist) if cap_dist > 0 else atr_dist
-    stop_price = entry_price - stop_dist
+                           r_multiple: float = 3.0, max_hold_days: int = 20,
+                           cfg: dict = None, atrs: list = None) -> dict:
+    """Bar-by-bar replay of the REAL production stop machine
+    (engine/stop_state_machine.py's calculate(), the same function
+    engine/position_management.py calls every live cycle), plus a fixed
+    R-multiple take-profit.
+
+    2026-07-26: this REPLACES a fixed-stop/fixed-target model that held one
+    stop price for the whole hold. That simplification was listed in this
+    module's docstring as a known Stage-1.5 gap, and once the scoring-ceiling
+    fix let trades actually flow it turned out to be the dominant term in the
+    result rather than a rounding error: of 302 trades, 213 reached
+    breakeven_r (0.5R) and 123 of THOSE still recorded a full stop-out, because
+    nothing ever moved the stop up. Production would have exited them at
+    roughly flat. Measured PF on the old model was 1.10 - not a strategy
+    verdict, an artifact of modelling an exit policy the system does not use.
+
+    POINT-IN-TIME DISCIPLINE (the subtle part). The stop in force during bar i
+    is computed from bar i-1's CLOSE and cannot see bar i. Recomputing the stop
+    from bar i's own close and then testing bar i's low against it would let
+    the stop ratchet up on information that did not exist when the low printed
+    - a look-ahead that flatters trailing stops specifically, which is exactly
+    the mechanism under test here. So each iteration: test the CARRIED stop,
+    then advance the watermark and re-price the stop for the NEXT bar.
+
+    Remaining simplifications, unchanged and still documented:
+      - exit_score is passed 0, so StopState.THESIS_BROKEN (exit_score >= 90)
+        never fires. Stage 1 has no historical sell-side scoring to replay; a
+        thesis-break exit would need rules/swing_sell_rules.py driven off the
+        same point-in-time window, which is its own piece of work.
+      - avwap_earnings and recent_swing_low are absent (no intraday/earnings
+        history wired in), so TRADE_CONFIRMING never triggers and Stage 5's
+        swing-low floor is skipped. Both simply leave the stop where the other
+        stages put it - neither invents a level.
+      - Same-bar tie: if a bar's low hits the stop and its high hits the
+        target, the stop is assumed first (conservative convention, unchanged).
+    """
+    from engine import stop_state_machine as ssm
+
+    cfg = cfg or {}
+    n = len(ticker_bars)
+    entry_atr = atr if atr and atr > 0 else entry_price * 0.015
+
+    def _atr_at(i):
+        if atrs is not None and 0 <= i < len(atrs) and atrs[i]:
+            return float(atrs[i])
+        return entry_atr
+
+    # Day 0: the stop machine's own Stage-1 initial-risk stop. This replaces
+    # the old local _ATR_MULT_BY_TIER/stop_loss_swing_pct arithmetic - the
+    # multipliers were copied from config.yaml's stop_machine.SWING and the
+    # risk-% cap re-derived by hand, so the two could silently disagree with
+    # production after any config edit. Now there is one implementation.
+    position = {
+        "entry_price": entry_price,
+        "entry_signal_score": pct_score,
+        "trade_mode": "SWING",
+        "high_watermark_price": entry_price,
+        "stop_state": None,
+    }
+    td0 = {"price": entry_price, "atr": entry_atr}
+    initial = ssm.calculate(position, td0, 0.0, cfg)
+    stop_price = initial.stop_price
+    stop_state = initial.state
     risk_per_share = entry_price - stop_price
+    if risk_per_share <= 0:  # degenerate ATR/config - fall back to the % cap
+        risk_per_share = entry_price * (stop_loss_swing_pct / 100.0)
+        stop_price = entry_price - risk_per_share
+    position["risk_per_share"] = risk_per_share
+    position["stop_state"] = stop_state.value
     target_price = entry_price + risk_per_share * r_multiple
 
+    tier = _entry_tier(pct_score)
     mae_pct, mfe_pct = 0.0, 0.0
-    n = len(ticker_bars)
+    high_watermark = entry_price
     last_idx = entry_idx
+
     for i in range(entry_idx + 1, min(entry_idx + 1 + max_hold_days, n)):
         bar = ticker_bars.iloc[i]
         low_, high_, close_ = float(bar["low"]), float(bar["high"]), float(bar["close"])
         mae_pct = min(mae_pct, (low_ / entry_price - 1) * 100)
         mfe_pct = max(mfe_pct, (high_ / entry_price - 1) * 100)
         last_idx = i
+
+        # 1. Test the stop CARRIED INTO this bar (priced off bar i-1's close).
         if low_ <= stop_price:
-            return _exit_result(i, stop_price, entry_price, entry_idx, mae_pct, mfe_pct, "stop_loss", tier)
+            return _exit_result(i, stop_price, entry_price, entry_idx, mae_pct, mfe_pct,
+                                stop_state.exit_kind, tier,
+                                stop_state=stop_state.value, risk_per_share=risk_per_share)
         if high_ >= target_price:
-            return _exit_result(i, target_price, entry_price, entry_idx, mae_pct, mfe_pct, "take_profit", tier)
+            return _exit_result(i, target_price, entry_price, entry_idx, mae_pct, mfe_pct,
+                                "take_profit", tier, stop_state=stop_state.value,
+                                risk_per_share=risk_per_share)
+
+        # 2. Bar survived - advance the watermark and re-price for the NEXT bar.
+        high_watermark = max(high_watermark, high_)
+        position["high_watermark_price"] = high_watermark
+        candidate = ssm.calculate(
+            position, {"price": close_, "atr": _atr_at(i)}, 0.0, cfg)
+        # should_advance() is production's own ratchet: a stop never widens.
+        # Without it a pullback would hand back protection the trade already
+        # earned - the precise bug config.yaml's stage ratchet exists to stop.
+        if ssm.should_advance(stop_price, candidate):
+            stop_price = candidate.stop_price
+            stop_state = candidate.state
+            position["stop_state"] = stop_state.value
 
     exit_price = float(ticker_bars.iloc[last_idx]["close"])
-    return _exit_result(last_idx, exit_price, entry_price, entry_idx, mae_pct, mfe_pct, "time_based_close", tier)
+    return _exit_result(last_idx, exit_price, entry_price, entry_idx, mae_pct, mfe_pct,
+                        "time_stop", tier, stop_state=stop_state.value,
+                        risk_per_share=risk_per_share)
 
 
-def _exit_result(exit_idx, exit_price, entry_price, entry_idx, mae_pct, mfe_pct, reason, tier):
+def _exit_result(exit_idx, exit_price, entry_price, entry_idx, mae_pct, mfe_pct, reason, tier,
+                 stop_state=None, risk_per_share=None):
     outcome_pct = (exit_price / entry_price - 1) * 100
+    # R-MULTIPLE (2026-07-26). outcome_pct alone is not comparable ACROSS
+    # configs with different stop widths: this replay equal-weights every
+    # trade's percentage return, but a position sized to risk a fixed
+    # fraction of capital (which is what engine/position_sizing.py actually
+    # does) would take a proportionally SMALLER position behind a wider stop.
+    # Comparing raw % across a stop-width sweep therefore flatters wide stops
+    # mechanically - the winners' percentages grow with the stop while the
+    # sweep pretends the capital at risk did not. Expectancy in R is the
+    # scale-free quantity, and it is what a stop-width decision must be made
+    # on. Recorded per trade so summarize() can report both.
+    outcome_r = (outcome_pct / (risk_per_share / entry_price * 100)
+                 if risk_per_share and entry_price and risk_per_share > 0 else None)
     return {
         "exit_idx": exit_idx, "exit_price": round(exit_price, 4),
         "outcome_pct": round(outcome_pct, 2), "mae_pct": round(mae_pct, 2), "mfe_pct": round(mfe_pct, 2),
         "hold_days": exit_idx - entry_idx, "exit_reason": reason, "entry_tier": tier,
+        "risk_pct": round(risk_per_share / entry_price * 100, 3) if risk_per_share else None,
+        "outcome_r": round(outcome_r, 3) if outcome_r is not None else None,
+        # 2026-07-26: which stop-machine stage the position was in when it
+        # exited. A stop hit in TREND_FOLLOWING is a profit being protected,
+        # not a loss being capped - collapsing both into "stop_loss" is the
+        # exact conflation rules/common.py's STOP_STATE_EXIT_KINDS exists to
+        # prevent, and it would make every trailing exit read as a failure.
+        "exit_stop_state": stop_state,
     }
 
 
@@ -410,6 +549,11 @@ def run_replay(tickers: list, start: str, end: str, cfg: dict,
                 logger.warning(f"{ticker}: skipped, bar fetch failed ({e})")
                 continue
 
+            # Per-bar ATR for the trailing stop (2026-07-26) - computed once
+            # per ticker over the full frame, not per trade, so a 300-trade
+            # run costs one ATR pass per ticker instead of one per hold.
+            bar_atrs = atr_series(bars)
+
             start_date = pd.to_datetime(start).date()
             start_idx = int((bars["date"] >= start_date).idxmax()) if (bars["date"] >= start_date).any() else None
             if start_idx is None or start_idx < 20:
@@ -455,6 +599,10 @@ def run_replay(tickers: list, start: str, end: str, cfg: dict,
                     exit_info = simulate_forward_exit(
                         bars, i, entry_price, td.atr, result.final_score_pct,
                         stop_loss_swing_pct, r_multiple, max_hold_days,
+                        # 2026-07-26: cfg carries stop_machine.SWING + the
+                        # risk-level stop cap into the real stop machine;
+                        # bar_atrs lets a trailing stop re-price per bar.
+                        cfg=cfg, atrs=bar_atrs,
                     )
                     trade = {
                         "ticker": ticker,
@@ -569,6 +717,33 @@ def summarize(trades: list) -> dict:
         "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else None,
         "avg_hold_days": round(sum(t["hold_days"] for t in trades) / len(trades), 1),
         "exit_reason_counts": by_reason,
+        # R-based expectancy (2026-07-26) - see the outcome_r note in
+        # _exit_result. THIS is the number a stop-width comparison must be
+        # read on: avg_outcome_pct equal-weights percentage returns and so
+        # rewards a wider stop for taking more risk per trade, while
+        # expectancy_r holds risk constant at 1R per trade the way
+        # engine/position_sizing.py would. When the two disagree across a
+        # sweep, expectancy_r is the one telling the truth.
+        **_r_stats(trades),
+    }
+
+
+def _r_stats(trades: list) -> dict:
+    """R-multiple expectancy over the trades that recorded a risk basis."""
+    rs = [t["outcome_r"] for t in trades if t.get("outcome_r") is not None]
+    if not rs:
+        return {"expectancy_r": None, "profit_factor_r": None, "n_with_r": 0}
+    w = [r for r in rs if r > 0]
+    l = [r for r in rs if r <= 0]
+    gl = abs(sum(l))
+    risks = [t["risk_pct"] for t in trades if t.get("risk_pct") is not None]
+    return {
+        "expectancy_r": round(sum(rs) / len(rs), 4),
+        "profit_factor_r": round(sum(w) / gl, 2) if gl else None,
+        "avg_win_r": round(sum(w) / len(w), 2) if w else 0.0,
+        "avg_loss_r": round(sum(l) / len(l), 2) if l else 0.0,
+        "median_risk_pct": round(sorted(risks)[len(risks) // 2], 2) if risks else None,
+        "n_with_r": len(rs),
     }
 
 
