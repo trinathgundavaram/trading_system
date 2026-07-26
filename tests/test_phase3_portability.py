@@ -137,6 +137,47 @@ class TestProcessTreeKill:
             if p.poll() is None:
                 p.kill()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX group semantics")
+    def test_posix_path_survives_eperm_on_an_unreaped_child(self):
+        """The macOS failure this test exists for: the child dies on SIGTERM
+        but stays a zombie until its parent reaps it, and Darwin/BSD answer a
+        signal aimed at an exited process with EPERM, not ESRCH. Linux answers
+        0, so without this test the bug is invisible on CI and shows up only
+        on the machine that ships releases.
+
+        Uncaught it escaped run_supervised()'s TimeoutExpired handler before
+        mark_cycle_killed() ran - a killed cycle logged as a clean finish -
+        and made /api/cycle/cancel return 500. Simulated rather than staged
+        with a real zombie, because whether a given kernel returns EPERM or
+        ESRCH is the very thing that is not portable."""
+        from engine import cycle_supervisor as cs
+
+        calls = []
+
+        def _killpg(pgid, sig):
+            calls.append(sig)
+            if sig == 0:
+                raise PermissionError(1, "Operation not permitted")
+
+        with mock.patch.object(cs.os, "getpgid", lambda pid: pid), \
+                mock.patch.object(cs.os, "killpg", _killpg):
+            cs._kill_process_tree(4242, reason="eperm")
+
+        assert calls[0] == cs.signal.SIGTERM
+        assert cs.signal.SIGKILL not in calls, \
+            "EPERM means no member of the group could be signalled - escalating is pointless"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX group semantics")
+    def test_posix_path_survives_eperm_from_getpgid(self):
+        """Same reasoning one call earlier: a pid that is not ours at all."""
+        from engine import cycle_supervisor as cs
+
+        def _boom(pid):
+            raise PermissionError(1, "Operation not permitted")
+
+        with mock.patch.object(cs.os, "getpgid", _boom):
+            cs._kill_process_tree(4242, reason="not ours")
+
     def test_psutil_path_is_importable(self):
         """psutil is what gives Windows any hang protection at all. If it is
         missing, that is a real finding, not a skip."""

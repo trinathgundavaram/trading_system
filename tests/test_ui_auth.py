@@ -119,7 +119,9 @@ def test_every_write_route_is_guarded():
     that were left open through v1.1.0 (run_now, cancel, validate,
     evaluate_now, backtest/run, alerts/resolve, prompt/copy,
     threshold_regret/run) are now guarded too, and the UI sends the header via
-    authFetch().
+    authFetch(). One of those eight, POST /api/prompt/copy, no longer exists:
+    §47.5 replaced its pbcopy shell-out with GET /api/prompt/raw, which the
+    browser copies client-side. That is why the floor below moved 15 -> 14.
 
     Deliberately written as "no write route lacks the dependency" rather than
     a fixed allow-list: a list has to be remembered, which is the same failure
@@ -138,8 +140,17 @@ def test_every_write_route_is_guarded():
 
     assert not unguarded, f"write route(s) with no auth dependency: {unguarded}"
     # Sanity floor: if the app ever stops registering routes, the assertion
-    # above would pass vacuously.
-    assert len(write_routes) >= 15, f"only {len(write_routes)} write routes found"
+    # above would pass vacuously. Deliberately a floor and not an equality -
+    # adding a write route must not fail this test, only leaving one
+    # unguarded must. Lower it (with a note above) when a route is genuinely
+    # retired; never to make a red test green.
+    assert len(write_routes) >= 14, f"only {len(write_routes)} write routes found"
+    # Named floor for the routes that move money or state, which is what the
+    # count was standing in for. A number can be quietly lowered; these can't.
+    for critical in ("/api/paper/sell", "/api/real/sell", "/api/live_execution",
+                     "/api/kill_switch", "/api/config", "/api/cycle/run_now",
+                     "/api/cycle/cancel"):
+        assert critical in write_routes, f"{critical} is no longer a registered write route"
 
 
 def test_no_inline_token_comparisons_remain():

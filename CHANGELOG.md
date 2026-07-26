@@ -56,6 +56,24 @@ identically. This is what makes Phase 4 provable rather than hopeful.
   atomic; Windows gets a psutil tree walk, which is racier and is the only
   mechanism the OS offers.
 
+  **`EPERM` is an exit condition, not an error — caught before tagging.** The
+  POSIX path's alive-check (`killpg(pgid, 0)`) treated `PermissionError` as
+  unexpected. A child dies on SIGTERM but stays a zombie until its parent reaps
+  it, and `run_supervised()` reaps only *after* the kill call returns — so for
+  the whole grace loop the group holds one unreaped member. Darwin and the BSDs
+  clear a process's credentials on exit and answer that signal with `EPERM`
+  rather than `ESRCH`; Linux answers `0`, which is why only the release machine
+  ever saw it, and why it surfaced in `release.sh`'s own test gate rather than
+  in CI. Uncaught, the exception escaped `run_supervised()`'s
+  `except subprocess.TimeoutExpired` block *before* `mark_cycle_killed()` ran:
+  a cycle killed at the 15-minute ceiling would have been recorded as a clean
+  finish, and `/api/cycle/cancel` would have returned 500 to the UI while
+  having in fact killed the cycle. `killpg()` reports `EPERM` only when it
+  could signal no member of the group, so there is by definition nothing left
+  to escalate to; it now returns exactly as `ESRCH` does, at all three call
+  sites. Regression tests simulate `EPERM` rather than staging a real zombie,
+  because which errno a kernel returns here is precisely the non-portable part.
+
 - secrets no longer fall back to plaintext off macOS — `storage/secrets.py` — §44
 
   The `security` binary exists only on macOS. Everywhere else the keychain tier
@@ -113,6 +131,13 @@ identically. This is what makes Phase 4 provable rather than hopeful.
   server and the human were the same machine. That was already false over an
   SSH tunnel. Replaced by `navigator.clipboard` and `/api/prompt/raw` — two
   features improved, two shell-outs removed, and both now work from a phone.
+
+  Retiring that POST took the write-route count from 15 to 14, which tripped
+  `test_ui_auth.py`'s vacuity floor (`>= 15`). The floor is stale, not the app:
+  the assertion that matters — no write route lacks the `require_token`
+  dependency — passed throughout. Lowered to 14 and now backed by an explicit
+  list of the routes that move money or state, since a bare count can be
+  quietly decremented to turn a red test green and a named route cannot.
 
 - `deploy/com.tradingplatform.stack.plist` — §47.6
 

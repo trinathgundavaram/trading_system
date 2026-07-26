@@ -77,28 +77,43 @@ def _kill_process_group_posix(pid: int, *, reason: str) -> None:
     POSIX keeps this path rather than using the psutil tree walk below: a
     process group is killed atomically by the kernel, so a grandchild that
     re-parented itself away from the child (which uvx and npx wrappers do)
-    still dies. Walking a tree cannot promise that."""
+    still dies. Walking a tree cannot promise that.
+
+    EPERM IS AN EXIT CONDITION HERE, NOT AN ERROR (2026-07-25, found by
+    test_phase3_portability.py on macOS). The child dies on SIGTERM but stays
+    a zombie until its parent reaps it, and run_supervised() only calls
+    proc.wait() AFTER this function returns - so for the whole grace loop the
+    group still contains one unreaped member. Darwin/BSD clear a process's
+    credentials on exit, so signalling that group returns EPERM rather than
+    ESRCH; Linux returns 0, which is why this only ever failed on the Mac.
+    Uncaught, the PermissionError escaped run_supervised()'s
+    `except subprocess.TimeoutExpired` block before mark_cycle_killed() ran,
+    so a timed-out cycle was recorded as a normal finish, and it turned
+    /api/cycle/cancel into a 500. killpg() only reports EPERM when it could
+    signal NO member of the group, so there is by definition nothing further
+    this function could kill: treat it exactly like ESRCH and return."""
+    _GONE = (ProcessLookupError, PermissionError)
     try:
         pgid = os.getpgid(pid)
-    except ProcessLookupError:
+    except _GONE:
         return
     try:
         os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
+    except _GONE:
         return
     logger.warning(f"cycle_supervisor: sent SIGTERM to cycle process group {pgid} (pid {pid}) - {reason}")
     deadline = time.time() + TERM_GRACE_SECONDS
     while time.time() < deadline:
         try:
             os.killpg(pgid, 0)  # signal 0 = alive-check only, raises once the group is gone
-        except ProcessLookupError:
+        except _GONE:
             return
         time.sleep(0.3)
     try:
         os.killpg(pgid, signal.SIGKILL)
         logger.warning(f"cycle_supervisor: process group {pgid} (pid {pid}) still alive after "
                         f"{TERM_GRACE_SECONDS}s grace - sent SIGKILL")
-    except ProcessLookupError:
+    except _GONE:
         pass
 
 
