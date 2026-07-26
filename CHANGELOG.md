@@ -22,6 +22,113 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [2.4.0] — v2.4.0 — 2026-07-26
+
+### Documentation audit: what the docs claimed was unbuilt, checked against the code
+
+**Decision function: UNCHANGED.** `config_fingerprint` `cc9a149613427f56` —
+deliberately unchanged; see the feature-schema note below for why the pattern
+encoding change is handled per-row rather than by invalidating the fingerprint.
+`classify_change.py` says MINOR.
+
+Every "not implemented" / "placeholder" / "not wired" / "deferred" claim across
+`README.md`, `CHANGELOG.md`, `BUILD_FROM_SCRATCH_GUIDE.md`,
+`pre_selection_criteria_and_trading_modes.md`, `prod_readiness_plan.md` and
+`docs/` was re-read against the code it describes. `BUILD_FROM_SCRATCH_GUIDE.md`
+and `docs/trayd.md` came back clean. The rest did not.
+
+- **README.md opened with three false statements about live execution, and had
+  since `engine/live_trader.py` landed.** It said `auto_trade` was "not
+  implemented at all", that "nothing in this codebase places live orders", and
+  that this code "never places, modifies, or cancels an order." `live_trader.py`
+  submits fractional market buys and sells against the real Robinhood account
+  through `robin_stocks`. The word `live_trader` did not appear in README.md at
+  all. `docs/trayd.md` and this CHANGELOG had it right the whole time — README
+  was the outlier, and it is the file a new reader opens first. Replaced with
+  the actual gate table (`TP_FORCE_PAPER`, `live_execution_enabled`, validation
+  receipt, `watch_execute: EXECUTE`, `auto_trade`) and an explicit note that the
+  old claim was wrong, rather than a silent edit.
+
+- **`engine/pattern_features.py` was still writing constants for seven features
+  whose real sources had gone live sessions earlier.** ADX, CMF, sector RS (1d
+  and 1m), the TTM squeeze, unusual-options flow and the opex calendar were all
+  wired into `engine/ticker_data_adapter.py` as each became real; this module
+  was never updated and kept recording `0.0` / `False` / `"normal"`. README
+  described this as "the source data is a placeholder", which stopped being true
+  some time ago — the sources were real and the writer simply was not asking.
+  Now read from the caller's already-built `ticker_dict`/`market_dict`, so the
+  fix costs zero extra fetches. `tests/test_pattern_feature_wiring.py`.
+
+- **Fixing that writer would have corrupted every existing row, so the reader
+  was fixed too.** While every row held `adx = 0.0` the column's standard
+  deviation was zero, `_encode_patterns` clamped it to 1.0, and every row
+  encoded to 0.0 — useless but symmetric. Once real ADX readings (15–40) start
+  landing, the column acquires a mean and every historical `0.0` z-scores to a
+  large negative number: the old rows stop being uninformative and start
+  asserting *"extremely low ADX"*, a measurement nobody took. Rows are now
+  stamped `feature_schema`, and unstamped rows have those seven features
+  treated as **missing** — numeric ones mean-imputed (z = 0, "this row tells us
+  nothing"), categorical ones routed to a distinct `__unrecorded__` bucket so a
+  stale `False` cannot pass for a measured one.
+  `tests/test_feature_schema_migration.py` includes a test that disables the
+  guard and asserts the misreading reappears, so the guard cannot be deleted as
+  dead code once every row carries the stamp.
+
+- **`config_fingerprint` deliberately not touched.** It answers "was this row
+  produced by a different strategy", and the strategy did not move — only the
+  fidelity of what was recorded about it. Folding the schema in would have
+  discarded the entire pattern history for what is, handled correctly, a
+  recoverable gap.
+
+- **`scripts/classify_change.py` could not see this class of change.**
+  `learning/pattern_database.py` and `engine/pattern_features.py` were in
+  neither `DECISION_PATHS` nor `BEHAVIOUR_PATHS`, so a change to what the
+  learning backend records classified as PATCH. Added to `BEHAVIOUR_PATHS` —
+  not `DECISION_PATHS`, because MAJOR would wrongly declare the whole pattern
+  history unpoolable every time a feature is added, and that question now has a
+  better home in `FEATURE_SCHEMA_VERSION`.
+
+- **`prod_readiness_plan.md` listed the platform's three biggest infrastructure
+  gaps as open; all three had shipped.** The Postgres migration, the persistent
+  connection pool (`_get_pool()`, `ThreadedConnectionPool`) and external
+  alerting (`engine/notifications.py`'s desktop → webhook → log chain) were all
+  marked "not attempted, needs your call" from 2026-07-21 onward. Struck through
+  and annotated rather than deleted. Its §2.2 — the SQLite `open()` stall behind
+  the 90-minute hang on 7/20 — is marked resolved-by-architecture: there is no
+  per-call file `open()` left to stall.
+
+- **Smaller corrections.** `rules/hard_vetoes.py` has 13 active vetoes, not 15
+  (slots run 1–16, #6 was never filled, §54 removed `DAILY_LOSS` and
+  `PROFIT_LOCK`). The UI has 13 tabs; README said 9 in one place and 10 in
+  another. The "NVIDIA NIM fallback cascade" entry pointed at
+  `engine/claude_brain.py` as though it existed and merely needed wiring — that
+  file appears nowhere in the git history; the true part of the claim is that
+  the pipeline calls no LLM automatically.
+
+- **Portfolio heat: claim true, stated reason false.** `db.get_portfolio_heat()`
+  is genuinely still un-normalized against account equity. The reason given in
+  README, the docstring and the UI tooltip — "no Robinhood balance API is called
+  from Python by design" — is not: `engine/account_sync.py`, `robinhood_sync.py`
+  and `live_trader._buying_power()` all read it. Corrected in all three places.
+  The behaviour is left alone on purpose: heat feeds sizing, so re-basing its
+  denominator changes position sizes on a system that is already trading, and
+  that is a decision to take deliberately rather than as a side effect of a
+  documentation pass.
+
+**Verified as still accurate, no change:** `momentum_screen` and
+`insider_buying` remain honest stubs (no market-wide screening tool exists on
+any connected MCP); `options_expected_move_pct` and
+`historical_earnings_move_avg_pct` remain placeholders, so `EARNINGS_RISK` is in
+practice a pure days-to-earnings check; the 11-metric strategy health score and
+the named 10-step orchestration layer were never built.
+
+**Still genuinely unbuilt after this pass**, and now an exhaustive list for the
+pattern database: `vix_percentile_1y`, `vix_percentile_3m` (need VIX history;
+`market_context.py` fetches spot only), and `gap_pct`, `premarket_gap`,
+`premarket_rvol` (need a premarket session the scheduler does not run in).
+
+Tests: 413 passing, up from 403.
+
 ## [2.3.2] — v2.3.2 — 2026-07-26
 
 ### v2.3.1's port fix was in the wrong layer

@@ -34,15 +34,37 @@ pass (marked accordingly) — those still need your explicit go-ahead.
 | Unrotated `launchd_*.log` growth | `setup_logging()` was attaching a console handler unconditionally, duplicating every log line into launchd's unrotated stdout capture file even though the same content already goes to the properly-rotated `scheduler.log`/`server.log`. Now only attaches the console handler when stdout is a real interactive terminal (`sys.stdout.isatty()`) — interactive `./run.sh` use is unaffected, launchd-managed runs stop double-logging. | `storage/log_setup.py` |
 
 **Still out of scope, needs your call:**
-- **Persistent DB connection pool** (replacing open-per-call) — real
+
+> **All three of these shipped. Corrected 2026-07-26 (documentation audit).**
+> This list was accurate on 2026-07-21 and was never revisited, so a document
+> titled "production readiness" has spent several weeks listing the platform's
+> three biggest infrastructure gaps as open when all three were closed. Struck
+> through rather than deleted — the point of this file is the 7/20–7/21 incident
+> record, and an item silently vanishing from a readiness list reads worse than
+> one marked done.
+
+- ~~**Persistent DB connection pool** (replacing open-per-call) — real
   architecture change to `_conn()`/`_open_with_timeout()`'s threading model,
   wants dedicated testing before touching the live-trading DB path. Not
-  attempted.
-- **Postgres migration** — a bigger infra decision than a code fix; not
-  attempted.
-- **External alerting** (SMS/Slack/email on a stale cycle) — the heartbeat
+  attempted.~~ **DONE.** `storage/database.py` `_get_pool()` holds a
+  process-wide `psycopg2.pool.ThreadedConnectionPool` shared by every
+  `Database()` instance, sized by `PG_POOL_MIN`/`PG_POOL_MAX`.
+- ~~**Postgres migration** — a bigger infra decision than a code fix; not
+  attempted.~~ **DONE.** `storage/database.py` runs on psycopg2 against
+  Postgres; `migrate_to_postgres.py` performs the move. This also retired 2.2
+  below — the OS-level `open()` stall that motivated the WAL/busy_timeout work
+  cannot occur against a client-server database, which is the real fix for the
+  7/20 incident rather than a mitigation of it.
+- ~~**External alerting** (SMS/Slack/email on a stale cycle) — the heartbeat
   *detection* now exists and logs clearly, but wiring it to an actual
-  notification channel needs credentials/config only you can provide.
+  notification channel needs credentials/config only you can provide.~~
+  **DONE** (§43.3, Phase 3). `engine/notifications.py` tries transports in the
+  order set by `notifications.transports` in `config.yaml`: desktop
+  (osascript/notify-send/win10toast) → webhook (ntfy.sh, Slack, Discord,
+  Pushover — anything accepting a POST) → log, which always succeeds, so a
+  notification is never silently dropped the way the old single-`osascript`
+  path dropped it. The credentials note still stands in one narrow sense: the
+  webhook transport does nothing until you put a URL in the config.
 
 ### 2.1 Scheduler not firing automatically (the issue you hit this morning)
 
@@ -80,7 +102,17 @@ incident on 7/20 — 90+ minutes hung before you caught it manually).
 
 ### 2.2 SQLite DB open stalls (the 90-minute hang from 7/20)
 
-**Status:** root cause still not fully confirmed. Spotlight, Time Machine,
+> **Resolved by the Postgres migration, 2026-07-26 audit.** Everything below is
+> kept as the incident record, but it describes a failure mode that no longer
+> has a mechanism: `storage/database.py` no longer opens a SQLite file per call,
+> so there is no `open()` to stall. The diagnosis in the paragraph below —
+> "the app's own concurrency … starving itself of OS resources" — turned out to
+> be right, and moving to a pooled client-server database removed the resource
+> being contended rather than raising the limit on it. Do not spend more time on
+> the numbered recommendations; they were written for an architecture that has
+> since been replaced.
+
+**Status (as of 2026-07-21):** root cause still not fully confirmed. Spotlight, Time Machine,
 local snapshots, and antivirus/EDR are all ruled out. ~4,000 stall warnings
 over 3 days is too frequent to be an external one-off — it looks more like
 the app's own concurrency (up to 6 tickers × 9 concurrent MCP calls + a

@@ -534,7 +534,7 @@ const TIPS = {
   pos_stop: "Current stop-loss price from engine/stop_state_machine.py - moves up as the position matures, never down.",
   pos_health: "Position health score (0-100) - see the Health badge tooltip. Expected: 70+ healthy, 55-70 caution, below 55 weak.",
   pos_stop_state: "Current stage in the stop machine's progression (e.g. INITIAL_RISK → BREAKEVEN → TRAILING) - see engine/stop_state_machine.py.",
-  portfolio_heat: "Approximate dollar risk of open positions vs. your max_portfolio_risk_pct budget. Not normalized against real account equity (no Robinhood balance API is called from Python by design). Expected: stay under 100% of max - the bar turns yellow above 60%, red above 90%.",
+  portfolio_heat: "Approximate dollar risk of open positions vs. your max_portfolio_risk_pct budget. Not normalized against real account equity - the balance data is available, but heat feeds position sizing, so re-basing it is a deliberate change rather than a fix. Expected: stay under 100% of max - the bar turns yellow above 60%, red above 90%.",
   monitor_market: "Whether scheduler.py's is_market_open() gate is currently open - Mon-Fri, 9:30am-4:00pm ET, narrowed by config.yaml's market_open_buffer_minutes/market_close_buffer_minutes.",
   scan_interval: "How often scheduler.py runs a cycle while the market is open, from config.yaml's trading.scan_interval_minutes. \"Run cycle now\" bypasses this - it can run any time.",
   risk_buy_threshold: "Minimum weighted score (0-100%) a ticker needs to qualify as a BUY at this risk level, before the dynamic adjustments on the Strategy tab (regime/VIX stress, calendar, EV bonus) are applied.",
@@ -3588,7 +3588,7 @@ function renderRiskTab(el) {
       <div class="panel-head">${svg('risk',15)}<span class="panel-title">${withTip('Portfolio Heat', 'portfolio_heat')}</span></div>
       <div class="stat"><div class="value">${heat.current_heat_pct}%<span style="font-size:13px;color:var(--text-2);"> / ${heat.max_heat_pct}% max</span></div></div>
       <div class="heat-track" style="margin-top:10px;"><div class="heat-fill" style="width:${pct}%;background:${pct>90?'var(--red)':pct>60?'var(--yellow)':'var(--green)'}"></div></div>
-      <p class="field-desc" style="margin-top:12px;">Approximate — dollar risk of open positions vs. dollars deployed. Not normalized against real account equity (no Robinhood balance API is called from Python by design).</p>
+      <p class="field-desc" style="margin-top:12px;">Approximate — dollar risk of open positions vs. dollars deployed. Not normalized against real account equity - the balance data is available, but heat feeds position sizing, so re-basing it is a deliberate change rather than a fix.</p>
     </div>
   `;
 }

@@ -864,6 +864,13 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
         score_result = None
         position_size = None
         portfolio_risk_result = None
+        # ticker_dict is only built in the else-branch below (an already-held
+        # ticker is never re-evaluated as an entry). Bound to None here so the
+        # build_pattern_features call further down can pass it unconditionally
+        # without a NameError on the already-open path - that path cannot
+        # reach the call today (already_open() pins should_buy False), and
+        # this makes that a property of the code rather than of the reader.
+        ticker_dict = None
         if position:
             # Already holding this ticker - not evaluated as a new entry.
             # Exit logic (sell_result above) is what governs open positions.
@@ -1062,8 +1069,17 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
 
         new_pattern_id = None
         if buy_result.should_buy and not _has_open_pattern(ticker):
+            # ticker_dict/market_dict (2026-07-26, documentation audit): both
+            # were already built for this ticker this cycle, and passing them
+            # is what makes adx/cmf/sector RS/squeeze/unusual-options/opex
+            # reach the pattern database as REAL values rather than the
+            # constants this call used to record. Zero extra fetches - see
+            # engine/pattern_features.py's module docstring for what the
+            # constants were doing to similarity search.
             features = build_pattern_features(ticker, td, mkt, buy_result, cfg,
-                                               regime=regime, score_result=score_result)
+                                               regime=regime, score_result=score_result,
+                                               ticker_dict=ticker_dict,
+                                               market_dict=market_dict)
             # 2026-07-22 (EV mode-keying fix): used to hardcode "SWING" here
             # regardless of trading_mode/effective_mode, so every DAY or
             # HYBRID-configured account's patterns were ALL stored under

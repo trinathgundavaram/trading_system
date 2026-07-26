@@ -61,6 +61,18 @@ BEHAVIOUR_PATHS = (
     "engine/learning_loop.py",
     "rules/risk_rules.py",
     "storage/database.py",
+    # Added 2026-07-26 (documentation audit). These two were in neither list,
+    # which is how a change to what the learning backend records could be
+    # classified PATCH. They feed engine/ev_engine.py, which IS a decision
+    # path - so they are not neutral - but they belong here rather than in
+    # DECISION_PATHS: changing what is RECORDED about a strategy is not the
+    # same as changing the strategy, and MAJOR would wrongly declare the whole
+    # pattern history unpoolable every time a feature is added. The
+    # comparability question those changes raise is answered inside
+    # pattern_database.py's FEATURE_SCHEMA_VERSION, which is the right place
+    # for it - per-row, rather than per-release.
+    "learning/pattern_database.py",
+    "engine/pattern_features.py",
 )
 
 

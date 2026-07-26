@@ -3705,9 +3705,19 @@ class Database:
     def get_portfolio_heat(self) -> dict:
         """Approximate portfolio heat = sum of open positions' dollar risk
         (entry - stop, if a stop is set) as a % of total dollars deployed.
-        NOTE: this is NOT normalized against real account equity - no
-        Robinhood account-balance data source is wired into Python (by
-        design, see README). Treat current_heat_pct as directional, not exact."""
+        NOT normalized against real account equity - treat current_heat_pct as
+        directional, not exact.
+
+        2026-07-26 (documentation audit): the reason this docstring used to
+        give for that - "no Robinhood account-balance data source is wired
+        into Python (by design)" - stopped being true a while ago.
+        engine/account_sync.py reads equity and buying power,
+        robinhood_sync.py reads portfolio value, and
+        live_trader._buying_power() checks it before every buy. The
+        denominator could be real equity today. It is not, because heat feeds
+        position sizing, so changing it changes trade sizes on a live system -
+        that is a deliberate decision, not a missing data source. Kept
+        approximate on purpose until someone chooses to change it."""
         positions = self.get_all_positions()
         total_deployed = sum(p.get("dollar_amount") or 0 for p in positions)
         total_risk = 0.0

@@ -6,23 +6,58 @@ web UI, position management, confirm_fill.py wiring). This README describes what
 **actually built and verified**, not the full spec that was discussed at any point.
 Read this before assuming any feature exists.
 
-`auto_trade` is not implemented at all — nothing in this codebase places live orders.
-The active pipeline produces a `trade_prompt.md` you paste into Claude Desktop
-(which has the Robinhood MCP connected) to execute manually.
+> **Corrected 2026-07-26 (documentation audit).** The three paragraphs that used
+> to open this file said `auto_trade` was "not implemented at all", that "nothing
+> in this codebase places live orders", and that this code "never places,
+> modifies, or cancels an order." All three were true when written and have been
+> false since `engine/live_trader.py` landed. They are replaced below rather than
+> quietly deleted, because a reader who had internalised the old claim needs to
+> know it changed. `docs/trayd.md` and `CHANGELOG.md` had the accurate version
+> the whole time; this file was the outlier, and it is the file people read first.
+
+**This codebase can place real orders.** `engine/live_trader.py` submits
+fractional market buys and sells against the real Robinhood account via
+`robin_stocks`. It is disarmed by default and by several independent gates, but
+"disarmed" is a different statement from "not built", and only one of them is
+still true here.
+
+`live_trader.is_live_mode()` requires **all** of the following, and any single
+one being off means no order is placed:
+
+| Gate | Where | Default |
+|---|---|---|
+| `TP_FORCE_PAPER` unset | env; `scripts/tp` sets it for every version except the one in `~/tp/PRIMARY` | set (vetoed) for non-primary |
+| `trading.live_execution_enabled` | `config.yaml`, Control tab (typed phrase + `UI_AUTH_TOKEN`) | `false` |
+| A current validation receipt | written by `run_backtest.py` only on a passing run, max 30 days old (§2) | absent |
+| `trading.watch_execute: EXECUTE` | `config.yaml` | `WATCH` |
+| `trading.auto_trade: true` | `config.yaml` | `false` |
+
+The env veto is checked *above* config on purpose: v1.0.0's own committed
+`config.yaml` has all three trading gates open, so `tp run v1.0.0` to reproduce
+an old backtest would otherwise arm live trading against the real account.
+
+With the gates as shipped, the pipeline produces a `trade_prompt.md` you paste
+into Claude Desktop (which has the Robinhood MCP connected) to execute manually
+— that remains the normal operating mode, but it is now a *configuration*, not a
+property of the code.
 
 ## What's built and verified
 
 **Data layer** (`mcp_clients/`) — direct calls to the MCP Python SDK (`pip install mcp`),
 sync-wrapped so the rest of the code doesn't need to be async. Talks to 7 MCP servers:
 fear-greed, yfinance, stock-scanner, maverick, finviz, fred, and (2026-07-15, optional)
-robinhood — READ-ONLY only. Robinhood trade EXECUTION is still intentionally excluded —
-it stays Claude-Desktop-only, and this code never places, modifies, or cancels an order.
+robinhood — READ-ONLY only. **No order is placed through the MCP layer**: every
+client in `mcp_clients/` is read-only, and the `robinhood-mcp` server exposes zero
+trading tools, so that property holds by construction rather than by discipline.
+Orders, when the gates above are open, go through `engine/live_trader.py` and
+`robin_stocks` directly — a separate path on purpose, so there is exactly one
+place in the tree that can reach the account.
 
 **Robinhood (read-only)** (`mcp_clients/robinhood_mcp.py` + `robinhood_sync.py`) —
 wraps the [`robinhood-mcp`](https://github.com/verygoodplugins/robinhood-mcp) PyPI
 server (spawned via `uvx robinhood-mcp`, stdio, same pattern as every other client).
-That server exposes zero trading tools, so this integration physically cannot break
-the no-local-execution rule — it only reads real account state: positions with cost
+That server exposes zero trading tools, so *this integration* cannot place an
+order regardless of configuration — it only reads real account state: positions with cost
 basis, portfolio value, buying power, dividends. Activated by `ROBINHOOD_USERNAME`/
 `ROBINHOOD_PASSWORD` in `.env` (plus `ROBINHOOD_TOTP_SECRET` only for authenticator-app
 logins); with no credentials everything degrades silently and the platform runs as
@@ -401,7 +436,8 @@ stress"). `TIPS` is a single glossary object rather than inline strings scattere
 across every render function, so it's one place to update if wording drifts from
 the code. Same mechanism `tickerLabel()` already used for company-name-on-hover -
 a native `title` attribute, with a `.hint` CSS class (dotted underline) as the
-visual cue that a field has more info on hover. Covers: all 10 nav tabs, the
+visual cue that a field has more info on hover. Covers: every nav tab (10 at the
+time this was written, 13 now — see "Explicitly NOT built" below), the
 top-bar Regime/Health/Mode/Watch badges (the Regime badge's format - `DOMINANT ·
 bull%/bear%/choppy%` - was previously unexplained anywhere in the UI), Dashboard
 stats, the Positions table headers, Risk tab, Monitor tab, Control tab risk-level
@@ -415,30 +451,62 @@ earlier this session.
 
 ## Explicitly NOT built (deferred, not started)
 
-- **10-step decision framework / hard-veto framework beyond the 15 implemented** —
-  only the 15 vetoes in `rules/hard_vetoes.py` exist; the fuller "4-layer/10-step"
-  framework from earlier spec messages was never built as a distinct orchestration
-  layer (its pieces — vetoes, scoring, thresholds — exist, just not as one named
-  10-step function).
+> **Audited 2026-07-26.** Every entry below was re-checked against the code. Four
+> were stale — the live-execution claim (moved to the top of this file), the tab
+> count, the NVIDIA cascade, and the pattern-database placeholder list — and are
+> corrected in place. The rest verified as still true.
+
+- **10-step decision framework / hard-veto framework beyond the vetoes implemented** —
+  `rules/hard_vetoes.py` has **13** active vetoes, not the 15 this line used to
+  claim: the slots are numbered 1–16, #6 was never filled, and §54 (Phase 2.5)
+  removed `DAILY_LOSS` and `PROFIT_LOCK` because they duplicated the kill-switch
+  path. The fuller "4-layer/10-step" framework from earlier spec messages was
+  never built as a distinct orchestration layer (its pieces — vetoes, scoring,
+  thresholds — exist, just not as one named 10-step function).
 - **Confidence decay, re-entry engine (beyond the cooldown gate), immutable trade
   snapshots, news classification engine, strategy health score (11-metric version)**
   — none of these were part of the 4-phase incremental spec and weren't built.
   `db.get_latest_health_score()` exists but is a much smaller thing: the average of
   `position_health.py`'s per-position score, not the original spec's 11-metric
   strategy-level score.
-- **Portfolio heat** — `db.get_portfolio_heat()` is a rough approximation (open
-  positions' dollar risk vs. dollars deployed), not normalized against real account
-  equity, since no Robinhood balance API is called from Python by design.
-- **9-screen React UI** — `ui/index.html` is a single vanilla-JS/HTML file with 9
-  tabs, not a React build. Matches the "no build step" requirement, not the original
-  React spec.
-- **NVIDIA NIM model fallback cascade** (`engine/claude_brain.py`) — still not wired
-  into the active `scheduler.py` flow. The current pipeline doesn't call any LLM
-  automatically at all.
-- **PatternDatabase regime/bucket features are placeholders where their source data
-  is** — see "Honesty note on inputs" above; ADX, CMF, market breadth, anchored
-  VWAP, industry RS, unusual options, VIX percentile, and sector RS are still 0.0/
-  neutral defaults throughout the codebase, not just in the pattern database.
+- **Portfolio heat, normalized against real equity** — `db.get_portfolio_heat()`
+  is still a rough approximation (open positions' dollar risk vs. dollars
+  deployed) rather than a fraction of account equity, which is the part that is
+  genuinely not built. The *reason* this line used to give — "no Robinhood
+  balance API is called from Python by design" — is no longer true:
+  `engine/account_sync.py` reads equity and buying power, `robinhood_sync.py
+  status` prints portfolio value, and `live_trader._buying_power()` checks it
+  before every buy. So the data is now available and the normalization simply
+  has not been done. Left alone deliberately: heat feeds sizing, so changing its
+  denominator changes position sizes on a system that is already trading, and
+  that is a decision to make on purpose rather than as a documentation fix.
+- **9-screen React UI** — `ui/index.html` is a single vanilla-JS/HTML file, not a
+  React build. Matches the "no build step" requirement, not the original React
+  spec. It now has **13** tabs (`TABS` in `ui/index.html`): dashboard, signals,
+  positions, portfolio, control, performance, learning, strategy, risk, journal,
+  monitor, logs, news. This line said 9 and a paragraph further up said 10; both
+  were counts taken at different times and never updated.
+- **NVIDIA NIM model fallback cascade** — this line used to point at
+  `engine/claude_brain.py` and say it was "still not wired into the active
+  `scheduler.py` flow", which implied the module existed and merely needed
+  connecting. **`engine/claude_brain.py` does not exist and never has** — it
+  appears nowhere in the git history. The accurate statement is the last
+  sentence of the original entry, which was always true: the pipeline calls no
+  LLM automatically at any point.
+- **PatternDatabase features whose sources are still placeholders** — this entry
+  was substantially stale and is now narrower. ADX, CMF, market breadth, swing-low
+  anchored VWAP, sector RS and unusual options **are real** and have been for
+  several sessions (`engine/ticker_analyzer.py`'s `_calc_indicators`,
+  `engine/market_breadth.py`); "industry RS" was renamed
+  `sector_rs_1m_positive_proxy` in 2026-07-21 precisely because calling it
+  industry RS overstated it. What was true until 2026-07-26 is that
+  `engine/pattern_features.py` had not been updated as each source went live and
+  was still writing constants — that is now fixed and covered by
+  `tests/test_pattern_feature_wiring.py`. The features that remain genuine
+  placeholders are exactly five: `vix_percentile_1y`, `vix_percentile_3m`,
+  `gap_pct`, `premarket_gap`, `premarket_rvol`. The first two need VIX history
+  nothing in this stack stores; the last three need a premarket session the
+  scheduler does not run in.
 
 ## 2026-07-15: Zero-trades-in-a-bull-market recalibration
 

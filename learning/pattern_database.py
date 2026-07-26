@@ -38,6 +38,52 @@ CATEGORICAL_FEATURES = [
 ]
 ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
+# ── Feature schema versioning (2026-07-26, documentation audit) ─────────────
+#
+# THE PROBLEM THIS SOLVES. Until 2026-07-26, engine/pattern_features.py wrote
+# literal constants for the seven features below - 0.0 for the numeric ones,
+# False/False/"normal" for the categorical ones - long after their real data
+# sources went live. Fixing the writer is necessary but, on its own, actively
+# harmful to every row already in the table.
+#
+# Why it is harmful rather than merely uneven: `_encode_patterns` z-scores each
+# numeric column across the candidate set at QUERY time. While every row held
+# 0.0 for adx, the column's std was 0, the guard below forced it to 1.0, and
+# every row encoded to exactly 0.0 - dead weight, but harmless and symmetric.
+# The moment real ADX readings (typically 15-40) start landing, the column mean
+# jumps and every historical row's 0.0 z-scores to a large NEGATIVE number. The
+# old rows do not become uninformative; they start actively asserting
+# "extremely low ADX", which is a claim nobody ever measured. Same for the
+# categorical three, where a stale "False" is a definite claim rather than an
+# absent one.
+#
+# THE FIX. Rows are stamped with the schema that produced them. Anything
+# without the stamp is schema 1, and its seven affected features are treated as
+# MISSING rather than as measurements: numeric ones are imputed to the column
+# mean (which z-scores to 0.0 - "this row tells us nothing about ADX", the
+# honest encoding), and categorical ones are mapped to a distinct "unrecorded"
+# bucket so they cannot masquerade as a real False.
+#
+# Note this is deliberately NOT folded into config_fingerprint(). That hash
+# answers "was this row produced by a different strategy", and the strategy did
+# not change here - only the fidelity of what was recorded about it. Conflating
+# the two would discard the entire pattern history for what is, correctly
+# handled, a recoverable gap.
+FEATURE_SCHEMA_VERSION = 2
+
+# The seven features that were constants under schema 1.
+SCHEMA_1_UNRECORDED_NUMERIC = ("adx", "cmf", "sector_rs_1d", "sector_rs_1m")
+SCHEMA_1_UNRECORDED_CATEGORICAL = ("squeeze_active", "unusual_options", "opex_status")
+
+# Sentinel for a categorical value that was never actually observed. A plain
+# empty string would collide with `_encode_patterns`'s own default for a key
+# that is simply absent, which is a different situation.
+UNRECORDED = "__unrecorded__"
+
+
+def _row_schema(feats: dict) -> int:
+    return int(feats.get("feature_schema") or 1)
+
 # Adaptive similarity threshold - tighter as more candidate matches exist.
 SIMILARITY_THRESHOLD_BY_COUNT = [
     (15, 0.90), (30, 0.80), (100, 0.75), (float("inf"), 0.70),
@@ -59,30 +105,67 @@ def _encode_patterns(patterns: list[dict], query_features: dict) -> tuple[np.nda
     """Builds a shared vector space from `patterns` + the query, and returns
     (query_vector, [pattern_vectors]). Numeric features z-scored across the
     pattern set (query included so it's on the same scale); categorical
-    features one-hot encoded over the union of observed categories."""
+    features one-hot encoded over the union of observed categories.
+
+    Schema-1 rows (see FEATURE_SCHEMA_VERSION above) carry constants for seven
+    features that were never actually measured. Those are encoded as MISSING
+    here - NaN through the z-score, which mean-imputation turns into 0.0 - so
+    an unmeasured row contributes nothing on that axis instead of asserting an
+    extreme value. Mean and std are computed with nan-aware reductions so the
+    unmeasured rows also do not drag the real distribution.
+    """
     all_feature_dicts = [p["features"] for p in patterns] + [query_features]
 
     numeric_matrix = []
     for feats in all_feature_dicts:
-        numeric_matrix.append([float(feats.get(f) or 0.0) for f in NUMERIC_FEATURES])
+        stale = _row_schema(feats) < 2
+        row = []
+        for f in NUMERIC_FEATURES:
+            if stale and f in SCHEMA_1_UNRECORDED_NUMERIC:
+                row.append(np.nan)
+                continue
+            v = feats.get(f)
+            try:
+                row.append(float(v) if v is not None else 0.0)
+            except (TypeError, ValueError):
+                row.append(0.0)
+        numeric_matrix.append(row)
     numeric_matrix = np.array(numeric_matrix, dtype=float)
-    means = numeric_matrix.mean(axis=0)
-    stds = numeric_matrix.std(axis=0)
+
+    # A column that is ALL-NaN (every candidate predates the schema bump, which
+    # is the normal case right after it lands) would make nanmean emit a
+    # RuntimeWarning and produce NaN. Handle it explicitly: the whole column
+    # carries no information, so it encodes to zero for everyone.
+    all_nan = np.isnan(numeric_matrix).all(axis=0)
+    means = np.where(all_nan, 0.0, np.nanmean(
+        np.where(all_nan, 0.0, numeric_matrix), axis=0))
+    stds = np.where(all_nan, 1.0, np.nanstd(
+        np.where(all_nan, 0.0, numeric_matrix), axis=0))
     stds[stds == 0] = 1.0
     numeric_z = (numeric_matrix - means) / stds
+    # Mean-imputation, applied after standardising: a missing value sits at the
+    # column mean, which is exactly z = 0.
+    numeric_z = np.nan_to_num(numeric_z, nan=0.0)
+
+    def _cat(feats, f):
+        """The categorical value for one feature, with schema-1's unmeasured
+        constants routed to their own bucket rather than counted as a real
+        observation of False/'normal'."""
+        if _row_schema(feats) < 2 and f in SCHEMA_1_UNRECORDED_CATEGORICAL:
+            return UNRECORDED
+        return str(feats.get(f, ""))
 
     cat_vocab = {}
     for f in CATEGORICAL_FEATURES:
-        values = sorted({str(feats.get(f, "")) for feats in all_feature_dicts})
-        cat_vocab[f] = values
+        cat_vocab[f] = sorted({_cat(feats, f) for feats in all_feature_dicts})
 
     cat_vectors = []
     for feats in all_feature_dicts:
         row = []
         for f in CATEGORICAL_FEATURES:
             values = cat_vocab[f]
-            one_hot = [1.0 if str(feats.get(f, "")) == v else 0.0 for v in values]
-            row.extend(one_hot)
+            v = _cat(feats, f)
+            row.extend([1.0 if v == val else 0.0 for val in values])
         cat_vectors.append(row)
     cat_vectors = np.array(cat_vectors, dtype=float)
 

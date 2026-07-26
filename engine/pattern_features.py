@@ -11,12 +11,40 @@ signals. Once the deferred engines exist, replace the placeholder block with
 real values and the pattern database will pick up the improvement immediately
 (nothing else needs to change - similarity search just uses whatever is in
 `features`).
+
+2026-07-26 (documentation audit): that "once the deferred engines exist"
+sentence had come due and nobody collected. ADX, CMF, sector RS, the TTM
+squeeze, unusual-options flow and the opex calendar all went REAL over
+several sessions - in engine/ticker_analyzer.py's _calc_indicators, in
+engine/market_breadth.py's get_sector_return()/_opex_status() - and
+engine/ticker_data_adapter.py was updated each time. This module was not,
+so seven of the 40 encoded features were still being written as literal
+0.0/False/"normal" while the real values sat in the caller's scope.
+
+Why that was worse than merely wasteful. The four numeric ones (adx, cmf,
+sector_rs_1d, sector_rs_1m) z-score to exactly 0.0 for every row - dead
+weight, no harm. The three CATEGORICAL ones (squeeze_active,
+unusual_options, opex_status) are one-hot encoded over the union of observed
+values, so a constant means every pattern pair matches on those dimensions.
+That inflates the cosine similarity of every comparison uniformly and pushes
+unrelated setups over the SIMILARITY_THRESHOLD_BY_COUNT bar - the similarity
+search was quietly getting LESS discriminating, not just no better.
+
+Values are taken from the caller's already-built ticker_dict/market_dict
+(engine/ticker_data_adapter.py) when passed, so this costs zero extra MCP
+calls or recomputation. Both arguments are optional: confirm_fill.py and any
+older caller that omits them falls back to the TickerData attributes, and
+then to the original neutral defaults. What remains genuinely placeholder is
+now a short and specific list - see the block at the bottom of `features`.
 """
 from datetime import datetime
 
+from learning.pattern_database import FEATURE_SCHEMA_VERSION
+
 
 def build_pattern_features(ticker: str, td, mkt, buy_result, cfg: dict,
-                            regime=None, score_result=None) -> dict:
+                            regime=None, score_result=None,
+                            ticker_dict=None, market_dict=None) -> dict:
     """
     regime: engine/regime_engine.py's RegimeState, or None if the caller hasn't
         run the Phase 1 regime engine for this cycle (falls back to the old
@@ -24,7 +52,39 @@ def build_pattern_features(ticker: str, td, mkt, buy_result, cfg: dict,
     score_result: rules/swing_buy_rules.py's SwingScoreResult, or None if the
         caller is still using the simple 15-rule rules/buy_rules.py engine
         (falls back to buy_result.top_signals/rules_passed instead).
+    ticker_dict / market_dict: the flat dicts engine/ticker_data_adapter.py
+        already built for this ticker this cycle (ticker_to_dict /
+        market_to_dict). Optional - passing them is how adx/cmf/sector RS/
+        squeeze/unusual-options/opex reach the pattern database as REAL
+        values instead of the pre-2026-07-26 constants. Omitting them is
+        safe and falls back to TickerData attributes, then to neutral
+        defaults; nothing raises on a missing key.
     """
+    _tdict = ticker_dict or {}
+    _mdict = market_dict or {}
+
+    def _num(key, attr=None, default=0.0):
+        """ticker_dict first, then the TickerData attribute, then default.
+        A present-but-None value counts as absent - `or` is deliberately
+        avoided so a real 0.0 reading is not mistaken for a missing one."""
+        v = _tdict.get(key)
+        if v is None and attr is not None:
+            v = getattr(td, attr, None)
+        if v is None:
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    # unusual_options is tri-state on purpose. td.unusual_options_bullish is
+    # True / False / None, and None means "stock-scanner MCP did not answer
+    # this cycle" - which is NOT the same claim as "no unusual flow". It is a
+    # categorical feature, so the encoder one-hots "None" as its own bucket
+    # and an outage cohort stops being silently pooled with a quiet-tape
+    # cohort. See engine/ticker_data_adapter.py's note on the same field.
+    _unusual = _tdict.get("unusual_options_bullish",
+                          getattr(td, "unusual_options_bullish", None))
     if score_result is not None:
         top_signal = score_result.rules_fired[0] if score_result.rules_fired else "unspecified"
         rules_passed = score_result.rules_fired
@@ -59,6 +119,14 @@ def build_pattern_features(ticker: str, td, mkt, buy_result, cfg: dict,
         and (score_result.threshold_result or {}).get("data_coverage", {}).get("unavailable_buckets")
     )
     features = {
+        # feature_schema (2026-07-26): stamps this row as carrying REAL adx/
+        # cmf/sector RS/squeeze/unusual-options/opex. Rows written before this
+        # date have no stamp, and learning/pattern_database.py's
+        # _encode_patterns treats their constants as missing rather than as
+        # measurements - see FEATURE_SCHEMA_VERSION there for why encoding
+        # them as real 0.0s would have been worse than leaving the bug alone.
+        "feature_schema": FEATURE_SCHEMA_VERSION,
+
         # ---- real, currently-computed values ----
         "external_outage": _external_outage,
         "vix_raw": mkt.vix_level,
@@ -88,14 +156,37 @@ def build_pattern_features(ticker: str, td, mkt, buy_result, cfg: dict,
         "choppy_pct": regime.choppy_pct if regime else 0.0,
         "transition_prob": regime.transition_probability if regime else 0.0,
 
-        # ---- still placeholders: no data source wired yet (ADX/CMF,
-        # premarket, VIX percentile, sector RS, options-expiry calendar) ----
+        # ---- REAL as of 2026-07-26 (see the module docstring for why these
+        # spent several sessions as constants after their sources went live).
+        # adx/cmf: engine/ticker_analyzer.py's _calc_indicators, from the same
+        # daily OHLCV bars as every other indicator. sector_rs_1d/1m: the
+        # ticker's sector ETF vs SPY, from the price history
+        # engine/market_breadth.py already fetches. squeeze_active: TTM
+        # squeeze fired. opex_status: a pure calendar calculation
+        # (market_breadth._opex_status), never needed a data source at all.
+        # unusual_options: tri-state, see the note above. ----
+        "adx": _num("adx", "adx"),
+        "cmf": _num("cmf", "cmf"),
+        "sector_rs_1d": _num("sector_rs_1d"),
+        "sector_rs_1m": _num("sector_rs_1m"),
+        "squeeze_active": bool(_tdict.get("squeeze_active",
+                                          getattr(td, "squeeze_active", False))),
+        "unusual_options": _unusual,
+        "opex_status": _mdict.get("opex_status", "normal"),
+
+        # ---- still genuine placeholders, and now an exhaustive list ----
+        # vix_percentile_1y/3m: engine/market_context.py fetches SPOT VIX
+        #   only (_get_vix -> yfinance). A percentile needs 1y/3m of VIX
+        #   history, which nothing in this stack stores or fetches yet.
+        # premarket_gap/premarket_rvol/gap_pct: the scheduler runs inside
+        #   regular market hours only (features["session"] is hardcoded
+        #   "regular" three lines up for the same reason), so there is no
+        #   premarket observation to record. gap_pct is overnight
+        #   open-vs-prior-close, which is derivable from daily bars but is
+        #   not currently computed anywhere - left honest rather than
+        #   half-wired.
         "vix_percentile_1y": 0.0, "vix_percentile_3m": 0.0,
         "gap_pct": 0.0, "premarket_gap": 0.0, "premarket_rvol": 0.0,
-        "adx": 0.0, "cmf": 0.0,
-        "sector_rs_1d": 0.0, "sector_rs_1m": 0.0,
-        "squeeze_active": False, "unusual_options": False,
-        "opex_status": "normal",
 
         # ---- bookkeeping (not part of NUMERIC/CATEGORICAL_FEATURES, ignored
         # by the similarity encoder, used only by scheduler's close-out logic) ----
