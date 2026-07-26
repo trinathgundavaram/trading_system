@@ -89,9 +89,23 @@ grep -q "^## \[$SHORT\]" CHANGELOG.md || {
   echo "FAIL: CHANGELOG.md has no '## [$SHORT]' entry for $NEXT"; exit 1; }
 
 # ── 6. Stamp the version into the code so a running process knows it ────────
+# The commit is conditional because a "release prep" commit that already
+# stamped VERSION, wrote the CHANGELOG entry and added the note leaves nothing
+# to stage - and `git commit` on an empty index exits non-zero, which under
+# `set -e` killed this script one line BEFORE `git tag`. That is not a
+# hypothetical: it is why v2.0.0 has a release note, a CHANGELOG entry and a
+# VERSION bump but no tag, and why the next release computed its version from
+# v1.3.1. A release that half-happens and reports failure is the worst case -
+# the tag, which is the thing everything else keys off, is the part that got
+# skipped.
 echo "$NEXT" > VERSION
 git add VERSION CHANGELOG.md "$NOTE"
-git commit -m "release: $NEXT ($SHORT)"
+if git diff --cached --quiet; then
+  echo "note: VERSION, CHANGELOG and $NOTE were already committed (release prep)."
+  echo "      Nothing to commit - tagging $NEXT on HEAD as-is."
+else
+  git commit -m "release: $NEXT ($SHORT)"
+fi
 git tag -a "$NEXT" -F "$NOTE"
 
 # ── 7. Cut a release branch on a major/minor so patches have a home ─────────
