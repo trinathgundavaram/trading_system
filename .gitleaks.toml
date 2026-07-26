@@ -1,0 +1,39 @@
+# gitleaks config (2026-07-26).
+#
+# WHY THIS FILE EXISTS. `tp doctor` runs gitleaks over the whole history and
+# reported one finding:
+#
+#   generic-api-key  tests/test_ui_auth.py:27  a91a47cc  2026-07-25
+#
+# That is `TOKEN = "K3f9pQ..."` in tests/test_ui_auth.py - a fixture value
+# monkeypatched into `server._auth_token` so the UI auth tests have a known
+# token to assert against. It never authenticated anything outside a pytest
+# process and there is nothing to rotate.
+#
+# The judgement is not new. scripts/hooks/check_no_secrets.sh has excluded
+# `^tests/` since Phase 0 (§34.4) for exactly this reason: a test that proves
+# auth REJECTS a bad token has to contain a token, and a scanner that cannot
+# tell a fixture from a credential will otherwise be silenced by whoever is
+# in a hurry. This file gives gitleaks the same exclusion the project's own
+# hook already applies, so the two agree instead of one of them being
+# routinely ignored.
+#
+# THE TRADEOFF, stated rather than hidden: a real credential pasted into
+# tests/ will not be caught here. That is the same exposure check_no_secrets.sh
+# already accepts. `.env` remains gitignored, `detect-private-key` in
+# .pre-commit-config.yaml still runs against every file including tests, and
+# tp doctor's own "history is clean" check (which looks for .env/.db/.pickle
+# ever being ADDED, regardless of path) is unaffected by this allowlist.
+#
+# Prefer a narrower fix if you add a second fixture secret: pin the specific
+# finding with a fingerprint in .gitleaksignore
+# (`<commit>:<file>:<rule>:<line>`) rather than widening this path list.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures are not credentials - see the header, and scripts/hooks/check_no_secrets.sh which excludes the same path"
+paths = [
+    '''^tests/''',
+]
