@@ -22,6 +22,45 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [3.3] — v3.3.0 — 2026-07-26
+
+### Decision function: UNCHANGED — service-management and provider-key resolution fixes
+
+`scripts/classify_change.py` reports MINOR and this ships as **minor**.
+`rules/swing_buy_rules.py`, `rules/sell_rules.py`, `rules/exit_scorer.py`,
+`rules/dynamic_thresholds.py`, `rules/hard_vetoes.py` and `config.yaml` are
+untouched — nothing about the strategy moved, so pre- and post-release trade
+history remains poolable.
+
+#### Fixed — duplicate service registrations + provider keys invisible to promoted versions
+
+Two related infrastructure bugs, both external reports: the UI intermittently
+showed "Failed to fetch" on multiple pages, and the Monitor tab showed
+several data providers as `NOT_CONFIGURED` despite data having just been
+fetched from them. See `docs/releases/v3.3.0.md` for full detail.
+
+- `scripts/services.py` — a bare `install`/`start` (no `--suffix`) could
+  install an unsuffixed service registration alongside a `tp promote`-managed
+  suffixed one; both fought forever for the same port. `install`/`start`/
+  `restart` now detect any other registration of the same service and REFUSE
+  with the exact removal commands, for all three platform managers.
+- `scripts/services.py` — `_service_env()` now resolves and bakes every
+  configured secret into an installed service's environment (it previously
+  injected only 6 fixed variables), matching what `tp run` already did for
+  foreground processes. A promoted service's worktree has no local `.env`
+  (`git worktree add` never checks out a gitignored path), so this was the
+  only credential source such a service ever had.
+- `mcp_clients/market_data.py`, `robinhood_mcp.py`, `engine/live_trader.py`,
+  `server.py` — every provider-key/credential check switched from a bare
+  `os.getenv()` to `storage.secrets`, which additionally checks the OS
+  Keychain (machine-wide, not per-directory) so a key mirrored in with
+  `tp secrets import .env` resolves identically from any installed version.
+
+**Action required after upgrading:** existing installed services do not pick
+up the new secret injection automatically — run
+`python3 scripts/services.py install ui` (and `scheduler`, `maverick`) once
+to rewrite their registrations with resolved secrets baked in.
+
 ## [3.2] — v3.2.0 — 2026-07-26
 
 ### Decision function: UNCHANGED — learning-schema, live-safety-gate, and UI fixes
