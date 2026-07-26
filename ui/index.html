@@ -4,31 +4,104 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Trading Platform</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<!-- Chart.js was loaded here from a CDN on every page load and never used:
+     the file contains exactly one occurrence of the string "Chart", and it
+     was this script tag. The one chart in this UI (the paper equity curve)
+     is hand-rolled SVG in equityCurveSVG(). Removed 2026-07-26 (UI audit) -
+     that is ~200 KB and a third-party network round trip on every load of a
+     dashboard whose entire point is to run on your own machine, and it made
+     the page fail to render promptly when offline. -->
 <style>
+  /* ==========================================================================
+     THEME — "indigo on warm paper" (2026-07-26).
+
+     The first pass of this audit ported Robinhood's palette fairly literally.
+     Trinath's read: the reference was right but the result was too close to a
+     replica, and the TEXT tone in particular should differentiate it. This is
+     the second pass.
+
+     What changed and why:
+
+     ACCENT is deep indigo, not green. Robinhood uses one green for both "this
+     is selected" and "this made money", which works in an app that shows you
+     one number at a time and is actively unhelpful in a dense table where a
+     green nav item, a green Buy button and a green P&L cell all compete. So:
+     indigo owns interaction (active nav, primary buttons, focus rings, links),
+     green and red own money, and the two never collide.
+
+     SURFACES are warm, not cool. #FDFDFC and #F5F4F1 rather than pure white
+     and blue-grey — a paper cast that reads calmer under long sessions and is
+     the most immediately distinguishing choice on the page.
+
+     TEXT is warm near-black (#1C1B1A) on a warm slate ramp, not the cool
+     blue-black most fintech UIs use. This was the specific ask: the text tone
+     carries most of a UI's character precisely because it is everywhere.
+
+     GAIN/LOSS stay green/red — semantic, not stylistic. A trader reads those
+     before reading anything else, and being novel about them costs real
+     comprehension. They are contrast-corrected for small text (the 10px table
+     figures this UI is full of) rather than being brand hues.
+
+     Every colour is a token. Re-theming again is this block and nothing else.
+     ========================================================================= */
   :root {
-    --bg-0: #0a0c11;
-    --bg-1: #10131b;
-    --bg-2: #151925;
-    --bg-3: #1b2030;
-    --border: #262c3d;
-    --border-soft: #1e2330;
-    --text-0: #eef0f6;
-    --text-1: #aab0c4;
-    --text-2: #6b7286;
-    --blue: #5b8def;
-    --blue-dim: #223050;
-    --green: #34d399;
-    --green-dim: #113228;
-    --red: #f87171;
-    --red-dim: #3a1a1e;
-    --yellow: #fbbf24;
-    --yellow-dim: #332608;
-    --purple: #a78bfa;
-    --purple-dim: #241f42;
+    /* Surfaces — warm paper, not clinical white */
+    --bg-0: #fdfdfc;
+    --bg-1: #ffffff;
+    --bg-2: #f5f4f1;
+    --bg-3: #edebe6;
+    --bg-hover: #e4e2dc;
+    --border: #e4e2dc;
+    --border-soft: #efedE8;
+
+    /* Text — warm near-black on a warm slate ramp */
+    --text-0: #1c1b1a;
+    --text-1: #57544e;
+    --text-2: #8c877e;
+    --on-accent: #ffffff;
+
+    /* Money. Semantic, contrast-corrected for small text. */
+    --green: #0f8a4d;
+    --green-bright: #12a75e;
+    --green-dim: #e8f5ed;
+    --green-border: #b3ddc6;
+
+    --red: #c8341b;
+    --red-bright: #e04327;
+    --red-dim: #fceeeb;
+    --red-border: #f2c2b7;
+
+    /* Informational only — banners, links. Never the accent. */
+    --blue: #1f5fb0;
+    --blue-dim: #eaf1fa;
+    --blue-border: #b9d2ec;
+
+    --yellow: #96620a;
+    --yellow-dim: #fbf2e2;
+    --yellow-border: #e8d1a4;
+
+    --purple: #6d40cc;
+    --purple-dim: #f1ecfd;
+    --purple-border: #d3c3f5;
+
+    /* Interaction. Indigo owns every "you can act on this" surface, so it is
+       never confused with a P&L colour. */
+    --indigo: #4338ca;
+    --indigo-dim: #eef0fe;
+    --indigo-border: #c3c6f5;
+    --accent: var(--indigo);
+    --accent-hover: #362eab;
+    --accent-dim: var(--indigo-dim);
+    --accent-border: var(--indigo-border);
+    --accent-on-dim: #3730a3;
+
+    --overlay: rgba(28,27,26,0.34);
+    --topbar-bg: rgba(253,253,252,0.88);
+
     --radius: 12px;
     --radius-sm: 8px;
-    --shadow: 0 4px 24px rgba(0,0,0,0.35);
+    --shadow: 0 1px 2px rgba(28,27,26,0.05), 0 8px 24px rgba(28,27,26,0.07);
+    --shadow-sm: 0 1px 2px rgba(28,27,26,0.06);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
@@ -40,9 +113,10 @@
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
   }
-  ::selection { background: var(--blue); color: #fff; }
-  ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  ::selection { background: var(--accent-dim); color: var(--text-0); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 5px; border: 2px solid var(--bg-0); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--bg-hover); }
   ::-webkit-scrollbar-track { background: transparent; }
 
   a { color: var(--blue); text-decoration: none; }
@@ -62,9 +136,9 @@
   }
   #sidebar .brand .mark {
     width: 26px; height: 26px; border-radius: 7px;
-    background: linear-gradient(135deg, var(--blue), var(--purple));
+    background: var(--indigo);
     display: flex; align-items: center; justify-content: center;
-    font-weight: 700; font-size: 13px; color: #fff; flex-shrink: 0;
+    font-weight: 700; font-size: 13px; color: var(--on-accent); flex-shrink: 0;
   }
   #sidebar .brand .name { font-weight: 650; font-size: 14px; letter-spacing: -0.2px; }
   #sidebar .brand .sub { font-size: 10px; color: var(--text-2); margin-top: 1px; }
@@ -78,7 +152,7 @@
   }
   .navitem svg { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.85; }
   .navitem:hover { background: var(--bg-2); color: var(--text-0); }
-  .navitem.active { background: var(--blue-dim); color: #cddcff; }
+  .navitem.active { background: var(--accent-dim); color: var(--accent-on-dim); font-weight: 650; }
   .navitem.active svg { opacity: 1; }
 
   #sidebar .spacer { flex: 1; }
@@ -95,7 +169,7 @@
   #topbar {
     display: flex; align-items: center; gap: 10px; padding: 14px 26px;
     border-bottom: 1px solid var(--border-soft); flex-wrap: wrap;
-    background: rgba(10,12,17,0.7); backdrop-filter: blur(6px);
+    background: var(--topbar-bg); backdrop-filter: blur(10px);
     position: sticky; top: 0; z-index: 20;
   }
   #topbar h1 { font-size: 15px; font-weight: 650; letter-spacing: -0.2px; margin-right: 4px; }
@@ -106,12 +180,12 @@
     border-radius: 99px; font-size: 11px; font-weight: 600; letter-spacing: 0.2px;
     border: 1px solid transparent; white-space: nowrap;
   }
-  .pill-blue   { background: var(--blue-dim);   color: #a9c3fb; border-color: #2c3f6b; }
-  .pill-green  { background: var(--green-dim);  color: #7fe3bf; border-color: #1f5a44; }
-  .pill-red    { background: var(--red-dim);    color: #ffb3b0; border-color: #6b2a2c; }
-  .pill-yellow { background: var(--yellow-dim); color: #ffd873; border-color: #6b5417; }
-  .pill-purple { background: var(--purple-dim); color: #cdb8ff; border-color: #4a3d80; }
-  .pill-neutral{ background: var(--bg-3); color: var(--text-1); border-color: var(--border); }
+  .pill-blue   { background: var(--blue-dim);   color: var(--blue);   border-color: var(--blue-border); }
+  .pill-green  { background: var(--green-dim);  color: var(--green);  border-color: var(--green-border); }
+  .pill-red    { background: var(--red-dim);    color: var(--red);    border-color: var(--red-border); }
+  .pill-yellow { background: var(--yellow-dim); color: var(--yellow); border-color: var(--yellow-border); }
+  .pill-purple { background: var(--purple-dim); color: var(--purple); border-color: var(--purple-border); }
+  .pill-neutral{ background: var(--bg-2); color: var(--text-1); border-color: var(--border); }
 
   #content { padding: 22px 26px 60px 26px; max-width: 1320px; }
 
@@ -123,18 +197,21 @@
     cursor: pointer; transition: transform 0.06s, background 0.12s, border-color 0.12s;
   }
   .btn svg { width: 14px; height: 14px; }
-  .btn:hover { background: #232a3d; }
+  .btn:hover { background: var(--bg-hover); border-color: var(--border); }
   .btn:active { transform: scale(0.97); }
-  .btn-primary { background: var(--blue); border-color: var(--blue); color: #fff; }
-  .btn-primary:hover { background: #4a7ee0; }
-  .btn-success { background: var(--green); border-color: var(--green); color: #06281d; }
-  .btn-success:hover { background: #2bc48d; }
-  .btn-danger { background: var(--red-dim); border-color: #6b2a2c; color: #ffb3b0; }
-  .btn-danger:hover { background: #4a2226; }
-  .btn-danger.armed { background: var(--red); border-color: var(--red); color: #2a0505; animation: pulse 1.6s infinite; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .btn-success { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .btn-success:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .btn-danger { background: var(--red-dim); border-color: var(--red-border); color: var(--red); }
+  .btn-danger:hover { background: var(--red-border); border-color: var(--red); }
+  .btn-danger.armed { background: var(--red-bright); border-color: var(--red-bright); color: var(--on-accent); animation: pulse 1.6s infinite; }
+  .btn-danger.armed:hover { background: var(--red); border-color: var(--red); }
   .btn-ghost { background: transparent; border-color: var(--border); }
   .btn-sm { padding: 5px 10px; font-size: 11.5px; }
-  .btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+  .btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+  .btn[disabled]:hover { background: var(--bg-3); }
+  .btn-primary[disabled]:hover { background: var(--accent); }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.75; } }
 
   /* ---------- Panels / cards ---------- */
@@ -145,7 +222,7 @@
 
   .panel {
     background: var(--bg-1); border: 1px solid var(--border-soft); border-radius: var(--radius);
-    padding: 18px; margin-bottom: 16px;
+    padding: 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm);
   }
   .panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
   .panel-head svg { width: 15px; height: 15px; color: var(--text-2); }
@@ -175,9 +252,14 @@
     border-radius: var(--radius-sm); font-size: 12px; margin-bottom: 16px; border: 1px solid;
   }
   .banner svg { width: 15px; height: 15px; flex-shrink: 0; }
-  .banner-yellow { background: var(--yellow-dim); border-color: #6b5417; color: #ffd873; }
-  .banner-red { background: var(--red-dim); border-color: #6b2a2c; color: #ffb3b0; }
-  .banner-blue { background: var(--blue-dim); border-color: #2c3f6b; color: #a9c3fb; }
+  .banner-yellow { background: var(--yellow-dim); border-color: var(--yellow-border); color: var(--yellow); }
+  .banner-red    { background: var(--red-dim);    border-color: var(--red-border);    color: var(--red); }
+  .banner-blue   { background: var(--blue-dim);   border-color: var(--blue-border);   color: var(--blue); }
+  .banner-green  { background: var(--green-dim);  border-color: var(--green-border);  color: var(--green); }
+  /* Banner body text sits at normal reading contrast; only the icon and any
+     <b> carry the status colour, so a full-width banner doesn't shout. */
+  .banner .banner-body { color: var(--text-1); }
+  .banner .banner-body .subtle { color: var(--text-2); }
 
   /* ---------- Signal / position cards ---------- */
   .card-row { background: var(--bg-2); border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
@@ -201,22 +283,74 @@
   th.th-sortable { cursor: pointer; user-select: none; white-space: nowrap; }
   th.th-sortable:hover { color: var(--text-0); }
   th.th-sortable .sort-arrow { display: inline-block; margin-left: 4px; opacity: 0.35; font-size: 9px; }
-  th.th-sortable.sort-active .sort-arrow { opacity: 1; color: var(--blue); }
+  th.th-sortable.sort-active .sort-arrow { opacity: 1; color: var(--accent); }
+  /* ---------- Filter row ----------
+     Rebuilt 2026-07-26. Trinath: "too visually heavy" and "dropdowns look
+     unstyled". Both were true and were the same underlying mistake — the row
+     was a full-width band of bordered boxes sitting permanently under every
+     header, so on a table like Signals it drew a second, competing header of
+     empty form controls above the data you came to read. Native <select>
+     dropdowns made it worse: OS-drawn arrows at the OS's own height, which no
+     amount of surrounding styling can bring in line.
+
+     The controls now sit borderless on the row's own tint and only resolve
+     into a bordered field on hover or focus — so an unused filter reads as
+     quiet placeholder text, and the one you are typing into is unmistakable.
+     The native arrow is replaced with an inline SVG chevron in --text-2, and
+     the height is pinned so text inputs and selects agree. */
   tr.col-filter-row td, tr.col-filter-row th {
-    padding: 4px 6px; border-bottom: 1px solid var(--border); background: var(--bg-1);
+    padding: 3px 5px; border-bottom: 1px solid var(--border); background: var(--bg-2);
   }
   tr.col-filter-row input[type=text], tr.col-filter-row select {
-    width: 100%; box-sizing: border-box; background: var(--bg-2); border: 1px solid var(--border);
-    color: var(--text-0); border-radius: 5px; padding: 4px 6px; font-size: 11px; font-family: inherit; outline: none;
+    width: 100%; box-sizing: border-box; height: 26px;
+    background: transparent; border: 1px solid transparent;
+    color: var(--text-0); border-radius: 6px; padding: 2px 7px;
+    font-size: 11px; font-family: inherit; outline: none;
+    transition: background 0.12s, border-color 0.12s, box-shadow 0.12s;
   }
-  tr.col-filter-row input[type=text]:focus, tr.col-filter-row select:focus { border-color: var(--blue); }
-  tr.col-filter-row input::placeholder { color: var(--text-2); }
-  .table-controls-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-  .table-controls-row .clear-filters-link {
-    font-size: 11px; color: var(--blue); cursor: pointer; text-decoration: none;
+  tr.col-filter-row input[type=text]:hover, tr.col-filter-row select:hover {
+    background: var(--bg-1); border-color: var(--border);
   }
-  .table-controls-row .clear-filters-link:hover { text-decoration: underline; }
+  tr.col-filter-row input[type=text]:focus, tr.col-filter-row select:focus {
+    background: var(--bg-1); border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+  /* A filter that is actually doing something stays visible at rest. */
+  tr.col-filter-row input[type=text].has-value, tr.col-filter-row select.has-value {
+    background: var(--bg-1); border-color: var(--accent-border);
+    color: var(--accent-on-dim); font-weight: 600;
+  }
+  tr.col-filter-row input::placeholder { color: var(--text-2); font-weight: 400; }
+  tr.col-filter-row select {
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    padding-right: 20px; cursor: pointer;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%238c877e' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 6px center;
+  }
+
+  .table-controls-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
   .table-controls-row .filter-count { font-size: 11px; color: var(--text-2); }
+  /* Active filters as removable chips — previously the only way to know a
+     filter was on was to spot text in one of a dozen identical boxes. */
+  .filter-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: var(--accent-dim); border: 1px solid var(--accent-border);
+    color: var(--accent-on-dim); border-radius: 99px;
+    padding: 2px 4px 2px 9px; font-size: 11px; font-weight: 600; white-space: nowrap;
+  }
+  .filter-chip .col { opacity: 0.7; font-weight: 500; }
+  .filter-chip button {
+    background: none; border: none; color: inherit; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 50%; padding: 0; opacity: 0.65;
+  }
+  .filter-chip button:hover { background: var(--accent-border); opacity: 1; }
+  .filter-chip button svg { width: 9px; height: 9px; }
+  .clear-filters-link {
+    font-size: 11px; color: var(--text-2); cursor: pointer; text-decoration: none;
+    border-bottom: 1px dotted var(--text-2);
+  }
+  .clear-filters-link:hover { color: var(--accent); border-bottom-color: var(--accent); }
 
   .positive { color: var(--green); }
   .negative { color: var(--red); }
@@ -245,16 +379,18 @@
     border-radius: var(--radius-sm); padding: 8px 11px; font-size: 12.5px; font-family: inherit;
     outline: none; transition: border-color 0.12s;
   }
-  input[type=text]:focus, input[type=number]:focus { border-color: var(--blue); }
+  input[type=text]:focus, input[type=number]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
   input::placeholder { color: var(--text-2); }
+  input[readonly] { background: var(--bg-2); color: var(--text-1); cursor: default; }
+  input[readonly]:focus { border-color: var(--border); box-shadow: none; }
 
   .segmented { display: inline-flex; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 3px; gap: 3px; }
   .segmented button {
     background: none; border: none; color: var(--text-1); padding: 7px 14px; border-radius: 6px;
     font-size: 12px; font-weight: 600; cursor: pointer; transition: background 0.12s, color 0.12s;
   }
-  .segmented button.active { background: var(--blue); color: #fff; }
-  .segmented button:not(.active):hover { background: var(--bg-3); }
+  .segmented button.active { background: var(--bg-1); color: var(--text-0); box-shadow: var(--shadow-sm); }
+  .segmented button:not(.active):hover { background: var(--bg-3); color: var(--text-0); }
 
   .risk-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
   @media (max-width: 900px) { .risk-cards { grid-template-columns: repeat(2, 1fr); } }
@@ -263,30 +399,41 @@
     padding: 13px; cursor: pointer; transition: border-color 0.12s, background 0.12s;
   }
   .risk-card:hover { border-color: var(--text-2); }
-  .risk-card.selected { border-color: var(--blue); background: var(--blue-dim); }
+  .risk-card.selected { border-color: var(--accent); background: var(--accent-dim); }
   .risk-card .name { font-weight: 700; font-size: 12.5px; margin-bottom: 8px; }
   .risk-card .kv { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--text-1); padding: 2px 0; }
   .risk-card .kv b { color: var(--text-0); font-weight: 600; }
 
-  .danger-zone { border: 1px solid #4a2226; background: linear-gradient(180deg, var(--red-dim), var(--bg-1)); }
+  .danger-zone { border: 1px solid var(--red-border); background: linear-gradient(180deg, var(--red-dim), var(--bg-1)); }
 
-  /* ---------- Toast ---------- */
-  #toast-wrap { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 200; }
+  /* ---------- Toast ----------
+     Four kinds, because the call sites already used four names. Before this
+     block, toast() was called with "success" / "error" / "alert" / "info",
+     but only .success and .error existed in CSS — so every warning and every
+     informational message rendered as an unstyled grey box with an alert
+     triangle, visually identical to each other and to nothing in particular.
+     toastKind() (see script) now normalises the aliases onto these four. */
+  #toast-wrap { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 200; max-width: 380px; }
   .toast {
-    background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius-sm);
-    padding: 11px 16px; font-size: 12.5px; box-shadow: var(--shadow); display: flex; align-items: center; gap: 8px;
+    background: var(--bg-1); border: 1px solid var(--border); border-left-width: 3px; border-radius: var(--radius-sm);
+    padding: 11px 16px; font-size: 12.5px; color: var(--text-0);
+    box-shadow: var(--shadow); display: flex; align-items: center; gap: 8px;
     animation: toast-in 0.18s ease-out;
   }
-  .toast.success { border-color: #1f5a44; }
-  .toast.error { border-color: #6b2a2c; }
+  .toast.success { border-left-color: var(--green); }
+  .toast.error   { border-left-color: var(--red); }
+  .toast.warn    { border-left-color: var(--yellow); }
+  .toast.info    { border-left-color: var(--blue); }
   .toast svg { width: 15px; height: 15px; flex-shrink: 0; }
   .toast.success svg { color: var(--green); }
-  .toast.error svg { color: var(--red); }
+  .toast.error   svg { color: var(--red); }
+  .toast.warn    svg { color: var(--yellow); }
+  .toast.info    svg { color: var(--blue); }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
   /* ---------- Modal ---------- */
   #modal-backdrop {
-    position: fixed; inset: 0; background: rgba(4,5,8,0.6); backdrop-filter: blur(2px);
+    position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(2px);
     display: none; align-items: center; justify-content: center; z-index: 300;
   }
   #modal-backdrop.open { display: flex; }
@@ -307,6 +454,66 @@
   /* Hoverable label/value with an explanatory native title tooltip - dotted
      underline is the visual cue that there's more info on hover. */
   .hint { border-bottom: 1px dotted var(--text-2); cursor: help; }
+
+  .card-row { box-shadow: var(--shadow-sm); }
+  .btn.spinning svg { animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  a.navitem { text-decoration: none; }
+  .modal { box-shadow: 0 12px 40px rgba(16,24,40,0.18); }
+  code { background: var(--bg-2); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 5px; color: var(--text-1); }
+  .field-desc code, .subtle code { background: transparent; border: none; padding: 0; }
+
+  /* Prose block for the long explanatory preamble at the top of a panel.
+     The Strategy tab's intro was a single 40-line paragraph at 100% width -
+     a ~250-character measure, which is roughly three times the length the
+     eye can track back from without losing its place. Capping the measure
+     and dropping it to secondary text makes it skimmable and stops it
+     competing with the tables underneath, which are the actual content. */
+  .prose {
+    color: var(--text-1); font-size: 12px; line-height: 1.65; max-width: 78ch;
+    margin-bottom: 14px;
+  }
+  .prose:last-child { margin-bottom: 0; }
+
+  /* Collapsible long-form note — <details>/<summary>, no JS. */
+  details.note { margin-bottom: 14px; }
+  details.note > summary {
+    cursor: pointer; list-style: none; display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; font-weight: 600; color: var(--text-1);
+    padding: 5px 10px; border: 1px solid var(--border); border-radius: 99px; background: var(--bg-2);
+    -webkit-user-select: none; user-select: none;
+  }
+  details.note > summary::-webkit-details-marker { display: none; }
+  details.note > summary:hover { background: var(--bg-3); color: var(--text-0); }
+  details.note[open] > summary { margin-bottom: 10px; }
+  details.note > summary::after { content: "▾"; font-size: 9px; opacity: 0.6; }
+  details.note[open] > summary::after { content: "▴"; }
+
+  /* Key/value strip used by the consolidated market-mood component. */
+  .kv-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .kv-cell {
+    background: var(--bg-2); border: 1px solid var(--border-soft);
+    border-radius: var(--radius-sm); padding: 11px 12px; text-align: center;
+  }
+  .kv-cell .k { font-size: 10px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.5px; }
+  .kv-cell .v { font-size: 19px; font-weight: 650; margin-top: 4px; letter-spacing: -0.3px; }
+  .kv-cell .s { font-size: 11px; color: var(--text-2); margin-top: 1px; }
+
+  /* ---------- Logs ---------- */
+  /* Traceback continuation lines are indented and dimmed so a multi-line
+     record reads as one block instead of as unrelated lines (see server.py's
+     get_logs sorting note for the ordering half of that fix). */
+  .log-line { white-space: pre-wrap; word-break: break-word; }
+  .log-line.cont { color: var(--text-2); padding-left: 18px; }
+
+  @media (max-width: 760px) {
+    #app { flex-direction: column; }
+    #sidebar { width: 100%; height: auto; position: static; padding: 12px; }
+    .navgroup { flex-direction: row; overflow-x: auto; gap: 4px; }
+    #sidebar .spacer, #sidebar .conn { display: none; }
+    #topbar { padding: 10px 14px; }
+    #content { padding: 14px 14px 48px 14px; }
+  }
 </style>
 </head>
 <body>
@@ -317,7 +524,14 @@
       <div class="mark">T</div>
       <div>
         <div class="name">Trading Platform</div>
-        <div class="sub">Decision support - no auto orders</div>
+        <!-- Was "Decision support - no auto orders". That stopped being true
+             when engine/live_trader.py landed: with the Control tab's three
+             gates open this app places real fractional market orders itself.
+             A brand line asserting the opposite, on every screen, is the
+             single most dangerous stale string in the UI - it is exactly
+             the sentence someone would rely on before arming something.
+             This one is rendered live from the real posture instead. -->
+        <div class="sub" id="brand-posture">Checking posture…</div>
       </div>
     </div>
     <div class="navgroup" id="nav"></div>
@@ -335,6 +549,8 @@
       <span id="cycle-status-badge" class="pill pill-neutral" style="display:none;"></span>
       <div class="segmented" id="book-toggle" style="margin-left:6px;" title="Switches Dashboard, Positions, and Portfolio to show either the simulated (Paper) book or your real Robinhood/confirm_fill.py (Real) book - never both mixed together."></div>
       <div class="fill"></div>
+      <button class="btn btn-sm" id="refresh-btn" onclick="refreshCurrentView(event)"
+              title="Re-pull state and re-render this tab in place. Reloading the browser also keeps you on this tab now."></button>
       <button class="btn btn-primary btn-sm" id="copy-btn" onclick="copyPrompt()"></button>
       <!-- §47.5: was macOS `open` on the SERVER, which needed the server and
            the human to be the same machine and a .md handler to be
@@ -421,6 +637,9 @@ function setViewMode(mode) {
   localStorage.setItem(VIEW_MODE_KEY, mode);
   renderBookToggle();
   document.getElementById("page-title").textContent = pageTitle(currentTab);
+  // Keep the book in the URL for the tabs it actually changes, so a reload
+  // (or a shared link) comes back to the same book, not just the same tab.
+  if (typeof syncHash === "function") syncHash();
   loadTab(currentTab);
 }
 
@@ -490,7 +709,10 @@ const TABS = [
   { id: "portfolio",   label: "Portfolio",   icon: "performance",
     desc: "The book selected by the header toggle. Paper: WATCH-mode purse (cash/invested/total value), equity curve, every simulated trade with its P&L, and win/loss stats. Real: your live Robinhood account value/buying power, open real positions, and confirmed real trades - dissect performance at the trade and portfolio level." },
   { id: "control",     label: "Control",     icon: "control",
-    desc: "Watchlist, risk level, trading mode, and the kill switch - the only settings this UI can change. No order is ever placed from here." },
+    // Was "...No order is ever placed from here." - false since
+    // engine/live_trader.py, and this tab is where the switch that makes it
+    // false actually lives. Corrected 2026-07-26 (UI audit).
+    desc: "Watchlist, risk level, trading mode, rotation, and the arming controls - including the Live Execution master switch, Auto-Trade, and the kill switch. This is the only tab that can arm real-money execution." },
   { id: "performance", label: "Performance", icon: "performance",
     desc: "Win rate and average outcome broken down by market regime, plus overall profit factor and Sharpe ratio, from closed pattern_database rows." },
   { id: "learning",    label: "Learning",    icon: "learning",
@@ -518,8 +740,11 @@ const TABS = [
 const TIPS = {
   regime: "Market regime blend from engine/regime_engine.py, recalculated once per scan cycle from SPY trend/breadth/VIX. Format: DOMINANT · bull%/bear%/choppy% - the three numbers are how much of the blend is bull-like/bear-like/choppy-like; the dominant label is whichever is highest, and they're expected to sum to ~100%. Feeds rules/dynamic_thresholds.py - a stressed or transitioning regime raises the buy-score bar.",
   health: "Average position_health_score (0-100) across all open positions, from engine/position_health.py - combines trend/momentum/volume health with MAE/MFE and time decay. Expected: 70+ healthy, 55-70 caution, below 55 weak. Shows — with no open positions.",
-  mode: "Trading mode from config.yaml's trading.mode: SWING (multi-day holds, 7-bucket scoring) or DAY (intraday) or HYBRID.",
-  watch: "WATCH = paper trading: every signal is executed as a simulated fill with full purse/P&L tracking. EXECUTE = real-money mode via Claude Desktop: the scheduler writes trade prompts, and the Auto-Trade toggle controls whether those prompts authorize Claude Desktop to place the orders (OFF = analysis-only). This app itself never places an order.",
+  mode: "Trading mode from config.yaml's trading.mode: SWING (multi-day holds, 6-bucket scoring) or DAY (intraday) or HYBRID (per-ticker: resolves to DAY when the stricter day-trade bar and intraday momentum both clear, otherwise SWING).",
+  // Corrected 2026-07-26 (UI audit). The last sentence used to read "This app
+  // itself never places an order" - true before engine/live_trader.py, false
+  // since, and directly contradicted by the Live Execution panel two tabs away.
+  watch: "WATCH = paper trading: every signal is executed as a simulated fill with full purse/P&L tracking. EXECUTE = real-money mode. Which process actually places the order then depends on the Live Execution master switch (Control tab): OFF = the scheduler writes a trade prompt and Claude Desktop places the orders; ON = this app places real fractional market orders itself via engine/live_trader.py. Auto-Trade must also be ON in either case - with it OFF, EXECUTE mode is analysis-only.",
   fg_score: "CNN Fear & Greed index (0-100). Expected: below 30 = Extreme Fear (often watched as a contrarian buy zone), 30-60 = Neutral, above 60 = Greed (caution).",
   vix: "CBOE Volatility Index - the market's expected 30-day volatility. Expected: below 20 calm, 20-27 elevated, above 27 high stress (raises the buy-score threshold - see the Strategy tab's dynamic threshold formula).",
   strategy_health: "Average position_health_score (0-100) across open positions - same figure as the Health badge in the top bar.",
@@ -527,14 +752,22 @@ const TIPS = {
   signals_today: "Number of BUY/HOLD/SELL signals logged today across your whole watchlist.",
   trades_today: "Number of confirmed real fills logged via confirm_fill.py today.",
   realized_pnl: "Realized profit/loss in dollars from REAL trades closed today (confirm_fill.py) - this figure feeds the risk engine's max-daily-loss guard. The 'paper' line below it is today's realized P&L from paper (simulated) closes. Unrealized P&L on still-open positions isn't included in either.",
-  buy_score: "Final weighted score (0-100%) from the 7-bucket scoring engine - see the Strategy tab for the exact formula. Needs to clear the dynamic threshold (typically 55-85%, higher when the market is stressed) to count as a BUY.",
+  // "7-bucket" here vs "6-BUCKET SCORING" in the Strategy tab's own heading
+  // was a straight contradiction (UI audit 2026-07-26). rules/swing_buy_rules.py
+  // has SIX weighted buckets plus an additive volatility bonus that is not a
+  // weighted bucket - six is the correct count, and saying so explicitly is
+  // what stops the two numbers drifting apart again.
+  buy_score: "Final weighted score (0-100%) from the 6-bucket scoring engine (six weighted buckets, plus an additive volatility-expansion bonus that sits outside the weighting) - see the Strategy tab for the exact formula. Needs to clear the dynamic threshold (typically 55-85%, higher when the market is stressed) to count as a BUY.",
   data_quality: "How many of the ~6 data sources (yfinance, Maverick TA/sentiment, Finviz, scanner, insider) responded this cycle. Expected: complete = all responded, partial = some missing, limited = 3+ missing.",
   pos_entry: "Fill price recorded via confirm_fill.py buy.",
   pos_shares: "Share count from the confirmed fill.",
   pos_stop: "Current stop-loss price from engine/stop_state_machine.py - moves up as the position matures, never down.",
   pos_health: "Position health score (0-100) - see the Health badge tooltip. Expected: 70+ healthy, 55-70 caution, below 55 weak.",
   pos_stop_state: "Current stage in the stop machine's progression (e.g. INITIAL_RISK → BREAKEVEN → TRAILING) - see engine/stop_state_machine.py.",
-  portfolio_heat: "Approximate dollar risk of open positions vs. your max_portfolio_risk_pct budget. Not normalized against real account equity - the balance data is available, but heat feeds position sizing, so re-basing it is a deliberate change rather than a fix. Expected: stay under 100% of max - the bar turns yellow above 60%, red above 90%.",
+  // Kept in sync with the Risk tab's visible caption (_HEAT_CAPTION) - the two
+  // used to name different denominators. Plain text here because TIPS values
+  // are rendered into a title="" attribute, which cannot carry markup.
+  portfolio_heat: "Approximate dollar risk across open positions, measured against your configured max_portfolio_risk_pct budget (not against real account equity - the balance data is available, but heat feeds position sizing, so re-basing it is a deliberate change rather than a fix). Expected: stay under 100% of max - the bar turns yellow above 60%, red above 90%.",
   monitor_market: "Whether scheduler.py's is_market_open() gate is currently open - Mon-Fri, 9:30am-4:00pm ET, narrowed by config.yaml's market_open_buffer_minutes/market_close_buffer_minutes.",
   scan_interval: "How often scheduler.py runs a cycle while the market is open, from config.yaml's trading.scan_interval_minutes. \"Run cycle now\" bypasses this - it can run any time.",
   risk_buy_threshold: "Minimum weighted score (0-100%) a ticker needs to qualify as a BUY at this risk level, before the dynamic adjustments on the Strategy tab (regime/VIX stress, calendar, EV bonus) are applied.",
@@ -592,19 +825,109 @@ function sellRuleExplainer(ruleName) {
   return "";
 }
 
+/* ============================== ROUTING ==============================
+   2026-07-26 (Trinath: "refresh should refresh the page and stay at that
+   page instead of taking to home page").
+
+   The app had no route at all. Every tab lived at "/", the open tab was a
+   plain JS variable, and boot() ended with a hardcoded showTab("dashboard")
+   - so a browser reload, a restored session, a bookmark, and the back
+   button all landed on the Dashboard no matter where you were. Reading the
+   Logs tail and hitting ⌘R meant three clicks to get back.
+
+   The fix is a hash route, "#tab" or "#tab/book" (e.g. "#portfolio/real"),
+   because it needs no server-side rewrite - the server serves one file at
+   "/" and would 404 on a real path. The book segment is in the URL for the
+   three book-aware tabs so a link carries WHICH book you meant, not just
+   which tab; localStorage still holds the preference for a bare "#portfolio".
+
+   parseHash() is deliberately total: an unknown/garbage tab id falls back
+   to the dashboard rather than rendering nothing. */
+const DEFAULT_TAB = "dashboard";
+const _VALID_TABS = new Set(TABS.map(t => t.id));
+
+function parseHash() {
+  const raw = (location.hash || "").replace(/^#\/?/, "");
+  if (!raw) return null;
+  const [tabRaw, bookRaw] = raw.split("/");
+  const tab = decodeURIComponent(tabRaw || "").trim();
+  if (!_VALID_TABS.has(tab)) return null;
+  const book = (bookRaw || "").trim().toLowerCase();
+  return { tab, book: (book === "paper" || book === "real") ? book : null };
+}
+
+// The one place the URL is written. `replace` is used for redirects that the
+// user did not ask for (normalising a bad hash, stamping the book segment on
+// load) so they don't become back-button steps of their own.
+function syncHash(replace = false) {
+  const want = _BOOK_AWARE_TABS.has(currentTab) ? `#${currentTab}/${viewMode}` : `#${currentTab}`;
+  if (location.hash === want) return;
+  // Guard: writing location.hash fires hashchange, which calls back into
+  // showTab. _syncingHash makes that re-entry a no-op instead of a second
+  // render (and, for a book-aware tab, an infinite ping-pong).
+  _syncingHash = true;
+  try {
+    if (replace) history.replaceState(null, "", location.pathname + location.search + want);
+    else location.hash = want;
+  } finally {
+    // hashchange is async; clear on the next task, not synchronously.
+    setTimeout(() => { _syncingHash = false; }, 0);
+  }
+}
+let _syncingHash = false;
+
+function onHashChange() {
+  if (_syncingHash) return;
+  const route = parseHash();
+  if (!route) { syncHash(true); return; }
+  if (route.book && route.book !== viewMode) {
+    viewMode = route.book;
+    localStorage.setItem(VIEW_MODE_KEY, viewMode);
+    renderBookToggle();
+  }
+  if (route.tab !== currentTab) showTab(route.tab, { fromHash: true });
+  else loadTab(currentTab);
+}
+
 /* ============================== NAV / SHELL ============================== */
 function renderNav() {
   document.getElementById("nav").innerHTML = TABS.map(t => `
-    <div class="navitem ${t.id===currentTab?'active':''}" onclick="showTab('${t.id}')" title="${(t.desc||'').replace(/"/g,'&quot;')}">
+    <a class="navitem ${t.id===currentTab?'active':''}" href="#${t.id}"
+       onclick="showTab('${t.id}'); return false;" title="${(t.desc||'').replace(/"/g,'&quot;')}">
       ${svg(t.icon)}<span>${t.label}</span>
-    </div>`).join("");
+    </a>`).join("");
 }
 
-function showTab(name) {
+function showTab(name, opts) {
+  if (!_VALID_TABS.has(name)) name = DEFAULT_TAB;
   currentTab = name;
+  if (!(opts && opts.fromHash)) syncHash();
   renderNav();
   document.getElementById("page-title").textContent = pageTitle(name);
   loadTab(name);
+}
+
+/* Topbar "Refresh" (2026-07-26). Distinct from the browser's reload on
+   purpose: it re-pulls /api/state + /api/status and re-renders the tab you
+   are on, in place - no navigation, no scroll jump, no losing an expanded
+   row on another tab. The browser's own ⌘R now also comes back here, via
+   the hash route above, so both gestures do what "refresh" should. */
+async function refreshCurrentView(evt) {
+  const btn = evt ? evt.currentTarget : document.getElementById("refresh-btn");
+  if (btn) { btn.disabled = true; btn.classList.add("spinning"); }
+  try {
+    const fresh = await (await fetch("/api/state")).json();
+    Object.assign(state, fresh);
+    await loadStatus();
+    await loadTickerNames();
+    await loadTickerHealth();
+    renderHeader();
+    loadTab(currentTab);
+  } catch (e) {
+    toast(`Couldn't reach the server: ${e.message}`, "error");
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove("spinning"); }
+  }
 }
 
 function loadTab(name) {
@@ -665,14 +988,31 @@ function openPrompt() {
   window.open("/api/prompt/raw", "_blank");
 }
 
-/* ============================== TOASTS / MODAL ============================== */
+/* ============================== TOASTS / MODAL ==============================
+   Call sites across this file pass four different kind strings - "success",
+   "error", "alert" and "info" - but the stylesheet only ever defined
+   .toast.success and .toast.error. The other two produced `class="toast
+   alert"` / `class="toast info"`, which matched nothing: a stale-data
+   warning and a "cycle force-killed" notice rendered as the same unstyled
+   grey box, both with the alert triangle, indistinguishable from each
+   other. Rather than chase down every call site, the aliases are normalised
+   here and all four now have styling (see the Toast block in the CSS). */
+const _TOAST_ALIASES = { alert: "warn", warning: "warn", warn: "warn",
+                         info: "info", error: "error", success: "success" };
+const _TOAST_ICONS = { success: "check", error: "alert", warn: "alert", info: "clock" };
+function toastKind(kind) { return _TOAST_ALIASES[String(kind || "").toLowerCase()] || "info"; }
+
 function toast(msg, kind="success") {
   const wrap = document.getElementById("toast-wrap");
+  const k = toastKind(kind);
   const t = document.createElement("div");
-  t.className = `toast ${kind}`;
-  t.innerHTML = `${svg(kind==='success'?'check':'alert', 15)}<span>${msg}</span>`;
+  t.className = `toast ${k}`;
+  t.innerHTML = `${svg(_TOAST_ICONS[k], 15)}<span>${msg}</span>`;
   wrap.appendChild(t);
-  setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity .25s"; setTimeout(()=>t.remove(), 250); }, 2600);
+  // Errors and warnings stay up long enough to actually read; a success
+  // confirmation does not need to linger.
+  const ttl = (k === "error" || k === "warn") ? 6000 : 2600;
+  setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity .25s"; setTimeout(()=>t.remove(), 250); }, ttl);
 }
 
 let _modalResolve = null;
@@ -732,8 +1072,21 @@ async function authFetch(url, opts = {}) {
 }
 
 /* ============================== WEBSOCKET ============================== */
+// One ping timer for the life of the page, not one per connection. This
+// setInterval used to live at the bottom of connect(), which is also the
+// reconnect path (ws.onclose -> setTimeout(connect, 3000)) - so every drop
+// added another 30s timer that was never cleared. An overnight session
+// behind a flaky tunnel accumulated dozens of them, each firing a ping on a
+// closed-over `ws` that might not be the live socket any more.
+let _pingTimer = null;
+
 function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
+  // ws:// on an https page is a mixed-content error the browser blocks
+  // outright, so the UI silently lost live updates the moment it was served
+  // over TLS (a reverse proxy, a tunnel, or the docker-compose profile that
+  // terminates https).
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
   ws.onopen = () => {
     document.getElementById("conn-pill").classList.add("live");
     document.getElementById("conn-text").textContent = "Live";
@@ -762,7 +1115,11 @@ function connect() {
     document.getElementById("conn-text").textContent = "Reconnecting…";
     setTimeout(connect, 3000);
   };
-  setInterval(() => { if (ws.readyState === 1) ws.send("ping"); }, 30000);
+  if (!_pingTimer) {
+    // Reads the module-level `ws`, not a captured one, so it always pings
+    // whichever socket is current.
+    _pingTimer = setInterval(() => { if (ws && ws.readyState === 1) ws.send("ping"); }, 30000);
+  }
 }
 
 /* ============================== LIVE EVENTS ============================== */
@@ -970,9 +1327,48 @@ function renderHeader() {
 
   renderCycleStatusBadge();
   renderBookToggle();
+  renderBrandPosture();
 
   const copyBtn = document.getElementById("copy-btn");
   copyBtn.innerHTML = `${svg("copy", 14)}<span>Copy Prompt</span>`;
+  const refreshBtn = document.getElementById("refresh-btn");
+  if (refreshBtn) refreshBtn.innerHTML = `${svg("refresh", 14)}<span>Refresh</span>`;
+}
+
+/* Replaces the old hardcoded "Decision support - no auto orders" strapline.
+   That string was a claim about execution posture rendered as branding, and
+   it kept asserting "no auto orders" while the Control tab was capable of
+   arming exactly that. This derives the line from the same three gates the
+   Control tab shows, so the sidebar and the switches can never disagree.
+   Falls back to /api/status's execution_posture when config hasn't arrived
+   yet (first paint, before the websocket's full_state). */
+function renderBrandPosture() {
+  const el = document.getElementById("brand-posture");
+  if (!el) return;
+  const cfg = state.config || {};
+  const posture = status.execution_posture || {};
+  const liveExec = cfg.trading ? !!cfg.trading.live_execution_enabled : !!posture.master_switch;
+  const autoTrade = cfg.trading ? !!cfg.trading.auto_trade : !!posture.auto_trade;
+  const execute = (cfg.trading ? cfg.trading.watch_execute : posture.watch_execute) === "EXECUTE";
+  const forcePaper = !!posture.force_paper;
+
+  let text, color, tip;
+  if (forcePaper) {
+    text = "Paper only — env veto"; color = "var(--green)";
+    tip = "TP_FORCE_PAPER is set for this process, which vetoes live execution above config.yaml. No real order can be placed regardless of the Control tab's switches.";
+  } else if (liveExec && autoTrade && execute) {
+    text = "ARMED — places real orders"; color = "var(--red)";
+    tip = "Live Execution, Auto-Trade and Mode=EXECUTE are all on: engine/live_trader.py will place real fractional market orders on buy signals and sell rules.";
+  } else if (liveExec || autoTrade || execute) {
+    text = "Partially armed — inert"; color = "var(--yellow)";
+    tip = "At least one of the three gates (Live Execution / Auto-Trade / Mode=EXECUTE) is on, but not all of them, so nothing real happens yet. See the Control tab.";
+  } else {
+    text = "Paper mode — no live orders"; color = "var(--green)";
+    tip = "All three arming gates are off. This app is analysis + paper trading only right now.";
+  }
+  el.textContent = text;
+  el.style.color = color;
+  el.title = tip;
 }
 
 /* ============================== DASHBOARD ============================== */
@@ -1041,7 +1437,7 @@ function marketBanner() {
 
   if (status.market_open) {
     return `<div class="banner banner-blue">${svg("clock",15)}
-      <div>
+      <div class="banner-body">
         <span>Market open — scheduler.py scans every ${status.scan_interval_minutes || "—"} min.</span>
         <div id="dashboard-next-run">${nextRunLine(status)}</div>
         <div id="dashboard-cycle-progress">${cycleProgressBarHtml(status)}</div>
@@ -1053,15 +1449,93 @@ function marketBanner() {
 
   const next = status.next_open_et ? new Date(status.next_open_et) : null;
   const nextStr = next ? next.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit", timeZone: DISPLAY_TZ }) : "next session";
+  // "The dashboard fills in automatically... or click Run cycle now to
+  // populate it right away" kept saying that AFTER a manual cycle had already
+  // populated it - the banner never acknowledged the run it had just invited
+  // you to do. Now it reports the last cycle when there is one.
+  const lc = status.last_cycle;
+  const lcLine = lc
+    ? `Last cycle: #${lc.cycle_num} at ${fmtCST(lc.timestamp)} CT — ${lc.ticker_count || 0} tickers scanned.`
+    : `The dashboard fills in automatically once a cycle runs during market hours, or click "Run cycle now" to populate it right away.`;
   return `<div class="banner banner-yellow">${svg("clock",15)}
-    <div>
-      <span>Market closed — scheduler is idle. Next session opens ${nextStr} CT. The dashboard fills in automatically once a cycle runs during market hours, or click "Run cycle now" to populate it right away.</span>
+    <div class="banner-body">
+      <span><b>Market closed</b> — scheduler is idle. Next session opens ${nextStr} CT. ${lcLine}</span>
       <div id="dashboard-next-run">${nextRunLine(status)}</div>
       <div id="dashboard-cycle-progress">${cycleProgressBarHtml(status)}</div>
     </div>
     <span style="flex:1"></span>
     ${cancelBtn}${runBtn}
   </div>`;
+}
+
+/* Why a scan produced nothing (2026-07-26, UI audit).
+
+   The manual cycle run during the audit scanned 42 tickers and returned 0 buy
+   signals. The Dashboard reported "SIGNALS 42" and "RECENT BUY SIGNALS 0",
+   which reads as "we looked hard and nothing qualified". What actually
+   happened was that every single ticker was vetoed before scoring even ran,
+   because it was a Sunday and every quote was ~45 hours old against a 30-
+   minute freshness limit - visible only by expanding an individual row on
+   the Signals tab, or by reading the log.
+
+   A dashboard that cannot distinguish "the strategy found no setups" from
+   "the strategy never ran" is actively misleading, so this summarises the
+   veto reasons whenever they dominate the batch. */
+function vetoSummaryBanner(signals) {
+  if (!signals || !signals.length) return "";
+  const vetoed = signals.filter(s => isVetoed(s));
+  if (!vetoed.length) return "";
+  const counts = {};
+  vetoed.forEach(s => {
+    const code = (s.veto_code || s.rejection_code || _vetoCodeFrom(s) || "VETOED");
+    counts[code] = (counts[code] || 0) + 1;
+  });
+  const top = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const pct = Math.round(vetoed.length / signals.length * 100);
+  // Only worth a banner when vetoes are the story, not an occasional row.
+  if (pct < 50) return "";
+  const stale = top.find(([c]) => /STALE|QUOTE/i.test(c));
+  // state.recent_signals is capped at 20 by the server, but the cycle may have
+  // scanned far more (43, in the run this was first seen on). Saying "18 of 20
+  // tickers" against a banner reporting 43 scanned invents a denominator - so
+  // name the sample as a sample whenever it is one.
+  const scanned = (status.last_cycle || {}).ticker_count;
+  const isSample = scanned && scanned > signals.length;
+  const subject = isSample
+    ? `${vetoed.length} of the ${signals.length} most recent signals (${pct}%)`
+    : `${vetoed.length} of ${signals.length} tickers (${pct}%)`;
+  return `<div class="banner banner-yellow">${svg("alert",15)}
+    <div class="banner-body">
+      <span><b>${subject} were vetoed before scoring ran</b> — so "0 buy signals" here means the scan could not evaluate them, not that nothing qualified.${isSample ? ` <span class="subtle">(showing the latest ${signals.length} of ${scanned} scanned — see the Signals tab for the full run.)</span>` : ""}</span>
+      <div class="subtle" style="margin-top:5px;">${top.slice(0,4).map(([c,n]) => `${escHtml(c)}: ${n}`).join(" · ")}</div>
+      ${stale ? `<div class="subtle" style="margin-top:4px;">Stale quotes are expected outside market hours — the freshness limit is measured against real trading time, so a weekend or holiday run will always veto on this. Re-run during the session for a meaningful scan.</div>` : ""}
+    </div>
+  </div>`;
+}
+
+// A signal was vetoed if scoring never ran on it. Kept as ONE predicate,
+// shared by the Dashboard banner, the Signals tab's pill and scoreCellText,
+// so those three cannot disagree about what "vetoed" means - which is
+// exactly how the tab ended up rendering a grey "HOLD" pill next to the
+// words "screened out before scoring ran".
+//
+// bucket_scores is the ground truth: it is only populated when the scoring
+// engine actually executed. ALREADY_OPEN is excluded on purpose - that is a
+// position-management skip, not a rejection of the setup.
+function isVetoed(s) {
+  if (!s) return false;
+  if (s.bucket_scores && s.bucket_scores.length) return false;
+  const f = s.rules_failed && s.rules_failed[0];
+  return !!(f && f.name && f.name !== "ALREADY_OPEN");
+}
+function _vetoCodeFrom(s) {
+  const f = s.rules_failed && s.rules_failed[0];
+  if (f && f.name) return f.name;
+  const txt = String((f && f.detail) || s.sell_reason || "");
+  const m = txt.match(/^([A-Z][A-Z0-9_]{2,})\s*:/);
+  if (m) return m[1];
+  if (/quote\s+\d+\s*min old/i.test(txt)) return "STALE_QUOTE";
+  return null;
 }
 
 // "Kill a hung/long-running cycle" (2026-07-17, Akhil: "add a button or a
@@ -1150,25 +1624,40 @@ function renderDashboard(el) {
   const subPnl = isPaper ? (stats.realized_pnl || 0) : (state.paper_realized_today || 0);
   const subLabel = isPaper ? "real" : "paper";
 
+  // Market Pulse now renders the SAME component the News tab uses (see
+  // marketMoodPanel) instead of its own reduced copy - the Dashboard used to
+  // be the one place that showed Fear & Greed and VIX but not the regime,
+  // while the regime pill sat directly above it in the topbar.
+  const mood = {
+    fear_greed_score: pulse.fg_score, fear_greed_rating: pulse.fg_rating,
+    vix_level: pulse.vix, regime: (state.regime || {}).dominant_regime,
+    blackout_active: pulse.blackout_active, blackout_reason: pulse.blackout_reason,
+    hours_to_next_macro: pulse.hours_to_next_macro,
+    as_of: pulse.as_of || (state.regime || {}).updated_at,
+  };
+
   el.innerHTML = `
     ${marketBanner()}
-    <div class="grid grid-3">
-      <div class="panel">
-        <div class="panel-head">${svg('performance',15)}<span class="panel-title">Market Pulse</span></div>
-        ${pulse.fg_score == null ? emptyBlock('inbox','No cycle data yet','Runs once scheduler.py completes a cycle during market hours.') : `
-          <div class="grid grid-2" style="gap:10px;">
-            <div class="stat"><div class="label">${withTip('Fear &amp; Greed', 'fg_score')}</div><div class="value" style="color:${pulse.fg_score>60?'var(--green)':pulse.fg_score<30?'var(--red)':'var(--text-0)'}">${pulse.fg_score.toFixed(0)}</div></div>
-            <div class="stat"><div class="label">${withTip('VIX', 'vix')}</div><div class="value" style="color:${pulse.vix>22?'var(--red)':'var(--green)'}">${pulse.vix.toFixed(1)}</div></div>
-          </div>
-          <div class="subtle" style="margin-top:10px;">A/D ratio &amp; McClellan come from the sector-ETF breadth proxy - see the Strategy tab's Market Breadth bucket.</div>
-        `}
-      </div>
+    ${vetoSummaryBanner(signals)}
+    <div class="panel">
+      <div class="panel-head">${svg('performance',15)}<span class="panel-title">Market Pulse</span></div>
+      ${pulse.fg_score == null && pulse.vix == null
+        ? emptyBlock('inbox','No cycle data yet','Runs once scheduler.py completes a cycle during market hours.')
+        : marketMoodPanel(mood, { footerExtra: " A/D ratio &amp; McClellan come from the sector-ETF breadth proxy - see the Strategy tab's Market Breadth bucket." })}
+    </div>
+    <div class="grid grid-2">
       <div class="panel">
         <div class="panel-head">${svg('risk',15)}<span class="panel-title">${withTip('Strategy Health', 'strategy_health')}</span></div>
         ${state.health_score != null ? `
-          <div class="stat"><div class="value" style="font-size:28px;">${state.health_score.toFixed(0)}<span style="font-size:14px;color:var(--text-2);">/100</span></div><div class="sub">avg. across open positions</div></div>
+          <div class="stat"><div class="value" style="font-size:28px;">${state.health_score.toFixed(0)}<span style="font-size:14px;color:var(--text-2);">/100</span></div><div class="sub">avg. across open ${isPaper ? 'paper' : 'real'} positions</div></div>
           <div class="health-bar" style="margin-top:10px;"><div class="health-fill" style="width:${state.health_score}%;background:${state.health_score>=70?'var(--green)':state.health_score>=40?'var(--yellow)':'var(--red)'}"></div></div>
-        ` : emptyBlock('inbox','No scored positions','Appears once WATCH-mode paper trading opens a position (or you log a real fill with confirm_fill.py) and Loop B scores it.')}
+        ` : emptyBlock('inbox','No scored positions',
+            // Was book-blind: it described the WATCH-mode paper path even when
+            // the Real book was selected, telling you to wait for something
+            // that has nothing to do with the book you are looking at.
+            isPaper
+              ? 'Appears once WATCH-mode paper trading opens a position and Loop B scores it.'
+              : 'Appears once a real fill is logged (confirm_fill.py buy, or an auto-synced Robinhood holding) and Loop B scores it.')}
       </div>
       <div class="panel">
         <div class="panel-head">${svg('journal',15)}<span class="panel-title">Today</span></div>
@@ -1199,7 +1688,7 @@ function renderDashboard(el) {
 
     <div class="panel">
       <div class="panel-head">${svg('positions',15)}<span class="panel-title">Open Positions (${isPaper ? 'Paper' : 'Real'})</span><span class="fill"></span><span class="pill pill-neutral">${positions.length}</span></div>
-      ${renderPositionsTable(positions)}
+      ${renderPositionsTable(positions, isPaper)}
     </div>
   `;
 }
@@ -1218,14 +1707,30 @@ function escHtml(s) {
     {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-function renderPositionsTable(pos) {
-  if (!pos.length) return emptyBlock('inbox', 'No open positions', 'WATCH mode opens paper positions automatically on BUY signals; real fills are logged with confirm_fill.py buy TICKER PRICE SHARES.');
+// `isPaper` is optional: when the caller has already filtered to one book,
+// pass it so the EMPTY state can describe that book. It used to describe both
+// ("WATCH mode opens paper positions... real fills are logged with
+// confirm_fill.py..."), so the Real view told you about paper behaviour and
+// the Paper view told you to run confirm_fill.py - each answering the
+// question you had not asked.
+function renderPositionsTable(pos, isPaper) {
+  if (!pos.length) {
+    const desc = isPaper === true
+      ? 'WATCH mode opens a paper position automatically when a BUY signal fires, if the purse and max_positions allow it.'
+      : isPaper === false
+        ? 'Real positions come from confirm_fill.py buy TICKER PRICE SHARES, from Robinhood auto-sync (Control tab), or from a fill this app placed itself when Live Execution is armed.'
+        : 'WATCH mode opens paper positions automatically on BUY signals; real fills are logged with confirm_fill.py buy TICKER PRICE SHARES.';
+    return emptyBlock('inbox', 'No open positions', desc);
+  }
+  // The Book column is meaningless when the caller already filtered to one
+  // book - every row would read the same value.
+  const showBook = isPaper === undefined;
   return `<div class="table-wrap"><table><thead><tr>
-    <th>Ticker</th><th>Book</th><th>${withTip('Mode', 'trade_mode')}</th><th>${withTip('Entry', 'pos_entry')}</th><th>${withTip('Shares', 'pos_shares')}</th><th class="num">${withTip('Stop', 'pos_stop')}</th><th class="num">${withTip('Health', 'pos_health')}</th><th>${withTip('Stop State', 'pos_stop_state')}</th>
+    <th>Ticker</th>${showBook ? '<th>Book</th>' : ''}<th>${withTip('Mode', 'trade_mode')}</th><th>${withTip('Entry', 'pos_entry')}</th><th>${withTip('Shares', 'pos_shares')}</th><th class="num">${withTip('Stop', 'pos_stop')}</th><th class="num">${withTip('Health', 'pos_health')}</th><th>${withTip('Stop State', 'pos_stop_state')}</th>
   </tr></thead><tbody>${pos.map(p => `
     <tr>
       <td><b>${tickerLabel(p.ticker)}</b></td>
-      <td><span class="pill ${p.simulated ? 'pill-blue' : 'pill-neutral'}" title="${p.simulated ? 'WATCH-mode paper position - managed automatically by the sell rules' : 'Real fill logged via confirm_fill.py'}">${p.simulated ? 'PAPER' : 'REAL'}</span></td>
+      ${showBook ? `<td><span class="pill ${p.simulated ? 'pill-blue' : 'pill-neutral'}" title="${p.simulated ? 'WATCH-mode paper position - managed automatically by the sell rules' : 'Real fill logged via confirm_fill.py'}">${p.simulated ? 'PAPER' : 'REAL'}</span></td>` : ''}
       <td>${modePill(p.trade_mode)}</td>
       <td>$${p.entry_price?.toFixed(2)}</td>
       <td>${p.shares}</td>
@@ -1413,8 +1918,12 @@ function enhanceTable(table) {
   filterRow.className = 'col-filter-row';
   const filters = new Array(colCount).fill('');
 
+  // Column label per index, for the active-filter chips.
+  const colLabels = ths.map(th => (th.textContent || '').trim().replace(/[▲▼]/g, '').trim());
+
   function applyFilters() {
     let anyActive = false;
+    let shown = 0;
     groups.forEach(g => {
       let visible = true;
       for (let c = 0; c < colCount; c++) {
@@ -1426,7 +1935,16 @@ function enhanceTable(table) {
       }
       g.main.style.display = visible ? '' : 'none';
       if (!visible) g.extra.forEach(e => { e.style.display = 'none'; });
+      // Extra rows (expanded detail) follow their parent's visibility only
+      // when the parent is shown - collapsing state is left alone.
+      if (visible) shown++;
     });
+    // Mark the controls that are actually doing something, so an active
+    // filter is visible at rest rather than only while focused.
+    filterRow.querySelectorAll('input, select').forEach(el => {
+      el.classList.toggle('has-value', !!el.value);
+    });
+    if (table._renderFilterChips) table._renderFilterChips(anyActive, shown, groups.length);
     if (table._clearFiltersLink) table._clearFiltersLink.style.display = anyActive ? '' : 'none';
   }
 
@@ -1459,15 +1977,58 @@ function enhanceTable(table) {
   });
   thead.appendChild(filterRow);
 
-  // ---- "Clear filters" link, injected directly above the table ----
+  // ---- Controls strip above the table: active-filter chips + match count ----
+  //
+  // Previously this was a lone "Clear filters" link, and the only way to see
+  // WHICH filter was on was to scan a dozen identical boxes for stray text -
+  // so a table that looked empty because of a forgotten filter in a column
+  // scrolled off to the right was indistinguishable from one with no data.
+  // Each active filter is now a removable chip naming its column, plus a
+  // row count, so the filtered state is legible without reading the row.
   if (anyFilterable) {
     const controls = document.createElement('div');
     controls.className = 'table-controls-row';
+
+    const chips = document.createElement('div');
+    chips.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;align-items:center;';
+    const count = document.createElement('span');
+    count.className = 'filter-count';
+
     const link = document.createElement('a');
     link.href = '#';
     link.className = 'clear-filters-link';
-    link.textContent = 'Clear filters';
+    link.textContent = 'Clear all';
     link.style.display = 'none';
+
+    function clearOne(c) {
+      filters[c] = '';
+      const cell = filterRow.cells[c];
+      if (cell) {
+        const el = cell.querySelector('input, select');
+        if (el) el.value = '';
+      }
+      applyFilters();
+    }
+
+    table._renderFilterChips = (anyActive, shown, total) => {
+      chips.innerHTML = '';
+      if (!anyActive) { count.textContent = ''; return; }
+      filters.forEach((v, c) => {
+        if (!v) return;
+        const chip = document.createElement('span');
+        chip.className = 'filter-chip';
+        chip.innerHTML = `<span class="col">${escHtml(colLabels[c] || 'Column ' + (c + 1))}:</span> ${escHtml(v)}`;
+        const x = document.createElement('button');
+        x.type = 'button';
+        x.setAttribute('aria-label', `Remove ${colLabels[c] || 'column'} filter`);
+        x.innerHTML = svg('x', 9);
+        x.addEventListener('click', () => clearOne(c));
+        chip.appendChild(x);
+        chips.appendChild(chip);
+      });
+      count.textContent = `${shown} of ${total} rows`;
+    };
+
     link.addEventListener('click', (e) => {
       e.preventDefault();
       filters.fill('');
@@ -1475,6 +2036,9 @@ function enhanceTable(table) {
       filterRow.querySelectorAll('select').forEach(s => { s.value = ''; });
       applyFilters();
     });
+
+    controls.appendChild(chips);
+    controls.appendChild(count);
     controls.appendChild(link);
     table._clearFiltersLink = link;
     table.parentElement.insertBefore(controls, table);
@@ -1518,11 +2082,11 @@ async function renderSignalsTab(el) {
         <td class="subtle"><span id="signal-caret-${i}" style="display:inline-block;transition:transform .15s;">${svg('chevron', 12)}</span></td>
         <td class="subtle">${fmtCST(s.timestamp)}</td>
         <td><b>${s.ticker?tickerLabel(s.ticker):"—"}</b></td>
-        <td><span class="pill ${s.signal==='BUY'?'pill-green':s.signal==='SELL'?'pill-red':'pill-neutral'}">${s.signal}</span></td>
+        <td>${signalPill(s)}</td>
         <td>${modePill(s.trade_mode)}</td>
         <td class="num">${scoreCellText(s)}</td>
         <td class="subtle">${s.data_quality||"—"}</td>
-        <td class="subtle">${s.sell_reason||(s.rules_failed&&s.rules_failed[0]?s.rules_failed[0].detail:"")}</td>
+        <td class="subtle">${escHtml(s.sell_reason||(s.rules_failed&&s.rules_failed[0]?s.rules_failed[0].detail:""))}</td>
       </tr>
       <tr id="signal-detail-${i}" style="display:none;"><td colspan="8">${renderSignalDetail(s)}</td></tr>
       `).join("")}</tbody></table></div>`;
@@ -1549,8 +2113,30 @@ function scoreCellText(s) {
   }
   const failedFirst = s.rules_failed && s.rules_failed[0];
   if (failedFirst && failedFirst.name === "ALREADY_OPEN") return "holding";
-  if (failedFirst) return "not scored";
+  if (failedFirst) return `<span class="subtle">not scored</span>`;
   return `${(s.buy_pct || 0).toFixed(0)}%`;
+}
+
+/* The Signal column used to render s.signal verbatim, so a ticker that was
+   thrown out before scoring even started showed a grey "HOLD" pill - the same
+   pill a ticker gets when the engine scored it and decided to hold. Expanding
+   the row revealed the truth ("screened out before scoring ran — STALE_QUOTE"),
+   but the column that the whole table is scanned by said something else.
+
+   During the audit this affected 42 of 42 rows: every one displayed HOLD, and
+   none of them had been evaluated at all. */
+function signalPill(s) {
+  if (isVetoed(s)) {
+    const code = _vetoCodeFrom(s) || "VETOED";
+    const detail = (s.rules_failed && s.rules_failed[0] && s.rules_failed[0].detail) || "";
+    return `<span class="pill pill-yellow" title="${escHtml(`Vetoed before scoring: ${code}${detail ? ' — ' + detail : ''}`)}">VETOED</span>`;
+  }
+  const f = s.rules_failed && s.rules_failed[0];
+  if (f && f.name === "ALREADY_OPEN") {
+    return `<span class="pill pill-blue" title="Skipped because a position is already open in this ticker - not a rejection of the setup.">HOLDING</span>`;
+  }
+  const cls = s.signal === 'BUY' ? 'pill-green' : s.signal === 'SELL' ? 'pill-red' : 'pill-neutral';
+  return `<span class="pill ${cls}">${escHtml(s.signal || '—')}</span>`;
 }
 
 // Compact bucket-score table: X.X / Y.Y contribution format per bucket,
@@ -1567,10 +2153,16 @@ function renderBucketScores(bucketScores) {
     return a.qualified ? bPct - aPct : aPct - bPct;
   });
   return `<div style="display:grid;gap:6px;">` + sorted.map(b => {
+    // Guarded 2026-07-26 (UI audit): b.weight / b.min_pct were used bare, so
+    // a bucket row missing either field rendered "0.0 / NaN pts" and a
+    // "needs NaN%" label. Real payloads always carry them, but a partial row
+    // from an older server, or a bucket added before its weight is wired up,
+    // should degrade to a dash rather than print NaN at the user.
+    const _w = Number.isFinite(b.weight) ? b.weight : null;
     const pctOfMax = b.max_points ? Math.min(100, (b.points / b.max_points) * 100) : 0;
-    const contribution = b.max_points ? (b.points / b.max_points) * b.weight * (b.qual_mult ?? 1) * 100 : 0;
-    const maxContrib = b.weight * 100;
-    const needPct = (b.min_pct * 100).toFixed(0);
+    const contribution = (b.max_points && _w != null) ? (b.points / b.max_points) * _w * (b.qual_mult ?? 1) * 100 : 0;
+    const maxContrib = _w != null ? _w * 100 : null;
+    const needPct = Number.isFinite(b.min_pct) ? (b.min_pct * 100).toFixed(0) : "—";
 
     // VOLATILITY_EXPANSION is a bonus-only bucket (min_pct=0): ✔/✘ is
     // meaningless noise. When 0 pts: show neutral dash + "no signal" badge.
@@ -1581,8 +2173,8 @@ function renderBucketScores(bucketScores) {
     let mark, markColor, qualBadge;
     if (isVolatilityNeutral) {
       mark = '–';
-      markColor = 'var(--text-muted)';
-      qualBadge = `<span class="pill" style="padding:1px 5px;font-size:10px;background:var(--bg-subtle);color:var(--text-muted);">no signal</span>`;
+      markColor = 'var(--text-2)';
+      qualBadge = `<span class="pill" style="padding:1px 5px;font-size:10px;background:var(--bg-2);color:var(--text-2);">no signal</span>`;
     } else if (isVolatility) {
       mark = '✔';
       markColor = 'var(--green)';
@@ -1595,7 +2187,7 @@ function renderBucketScores(bucketScores) {
         : withTip(`<span class="pill pill-red" style="padding:1px 5px;font-size:10px;">needs ${needPct}%</span>`, 'bucket_qualify');
     }
 
-    const barColor = isVolatilityNeutral ? 'var(--text-muted)' : (b.qualified ? 'var(--green)' : 'var(--red)');
+    const barColor = isVolatilityNeutral ? 'var(--text-2)' : (b.qualified ? 'var(--green)' : 'var(--red)');
     const rulesFired = b.rules_fired && b.rules_fired.length
       ? `<div class="subtle" style="margin-top:2px;font-size:10px;">${b.rules_fired.map(r=>`<code>${r}</code>`).join(' ')}</div>`
       : '';
@@ -1604,7 +2196,7 @@ function renderBucketScores(bucketScores) {
         <span style="color:${markColor};font-size:13px;line-height:1;">${mark}</span>
         <span style="font-size:12px;font-weight:600;flex:1;">${b.name}</span>
         <span style="font-size:12px;font-variant-numeric:tabular-nums;">
-          ${withTip(`<b>${contribution.toFixed(1)}</b> <span class="subtle">/ ${maxContrib.toFixed(0)} pts</span>`, 'bucket_weight')}
+          ${withTip(`<b>${contribution.toFixed(1)}</b> <span class="subtle">/ ${maxContrib != null ? maxContrib.toFixed(0) : "—"} pts</span>`, 'bucket_weight')}
         </span>
         ${qualBadge}
       </div>
@@ -1728,11 +2320,11 @@ function explainSignalPlainEnglish(s) {
       const maxC = b.weight * 100;
       // VOLATILITY_EXPANSION at 0 pts = neutral bonus bucket, not a failure
       const isVolNeutral = b.name === "VOLATILITY_EXPANSION" && b.points === 0;
-      const color = isVolNeutral ? 'var(--text-muted)' : (b.qualified ? 'var(--green)' : 'var(--red)');
+      const color = isVolNeutral ? 'var(--text-2)' : (b.qualified ? 'var(--green)' : 'var(--red)');
       const mark = isVolNeutral ? '–' : (b.qualified ? '✔' : '✘');
       out += `<span style="color:${color}">${mark}</span>`;
-      out += `<span style="color:${isVolNeutral ? 'var(--text-muted)' : (b.qualified ? 'inherit' : 'var(--text-muted)')}">${b.name}</span>`;
-      out += `<span style="color:${isVolNeutral ? 'var(--text-muted)' : (b.qualified ? 'inherit' : 'var(--text-muted)')}">${contrib.toFixed(1)} / ${maxC.toFixed(0)}</span>`;
+      out += `<span style="color:${isVolNeutral ? 'var(--text-2)' : (b.qualified ? 'inherit' : 'var(--text-2)')}">${b.name}</span>`;
+      out += `<span style="color:${isVolNeutral ? 'var(--text-2)' : (b.qualified ? 'inherit' : 'var(--text-2)')}">${contrib.toFixed(1)} / ${maxC.toFixed(0)}</span>`;
     }
     out += `</div>`;
     if (failedBuckets.length) {
@@ -1869,10 +2461,18 @@ function renderPositionsTab(el) {
     hasSynced
       ? `<button class="btn btn-sm" onclick="clearSyncedPositions()" title="Removes positions auto-imported from your real Robinhood account by engine/account_sync.py (config.yaml account.auto_sync) - these don't count toward trading.max_positions or get picked for rotation, but you can also remove them from view entirely. Doesn't touch Robinhood or place any order.">${svg('refresh',13)}<span>Clear synced positions</span></button>`
       : ''
-  }</div>${renderPositionsTable(positions)}</div>
+  }</div>${renderPositionsTable(positions, isPaper)}</div>
+  ${/* The "Manage a fill" panel is about confirm_fill.py, which only ever
+        touches the REAL book - it was rendered on the Paper view too, where
+        it is not just irrelevant but wrong: paper positions open by
+        themselves on a BUY signal and confirm_fill.py has nothing to do with
+        them. Its claim that "this UI can't place or confirm trades itself"
+        was also false twice over: the Live Execution switch exists, and this
+        very tab has Sell buttons. */''}
+  ${isPaper ? '' : `
   <div class="panel"><div class="panel-head">${svg('control',15)}<span class="panel-title">Manage a fill</span></div>
-    <p class="field-desc">Positions only appear here after you run <code>confirm_fill.py buy/sell</code> in Terminal following a real trade in Claude Desktop — this UI can't place or confirm trades itself.</p>
-  </div>`;
+    <p class="field-desc">Real positions appear here once a fill is recorded — either by running <code>confirm_fill.py buy/sell</code> in Terminal after a trade, or automatically by <code>engine/account_sync.py</code> when Auto-sync is on (Control tab). When the Live Execution master switch is armed, fills this app places itself are recorded without any manual step.</p>
+  </div>`}`;
 }
 
 /* ============================== PORTFOLIO TAB ============================== */
@@ -1892,7 +2492,7 @@ const fmtRatio = v => (v == null || !isFinite(v)) ? "n/a" : Number(v).toFixed(2)
 // Which trading mode (SWING/DAY/HYBRID) was active when the buy was made -
 // stamped on every position and ledger row (positions.trade_mode /
 // paper_trades.trade_mode). SEED = cloned from the real book at purse start.
-const _MODE_COLORS = { SWING: "var(--green)", DAY: "var(--yellow)", HYBRID: "var(--blue, #4a9eff)", SEED: "var(--text-2)" };
+const _MODE_COLORS = { SWING: "var(--green)", DAY: "var(--yellow)", HYBRID: "var(--blue)", SEED: "var(--text-2)" };
 function modePill(mode) {
   if (!mode) return '<span class="subtle">—</span>';
   const m = mode.toUpperCase();
@@ -2330,13 +2930,34 @@ async function renderRealPortfolioTab(el) {
       <div class="panel">
         <div class="panel-head">${svg('performance',15)}<span class="panel-title">Real Account Value</span><span class="fill"></span><span class="subtle" style="font-size:10px;">${summary.connected ? 'Robinhood · live read' : 'not connected'}</span></div>
         ${summary.connected ? `
-          <div class="stat"><div class="value" style="font-size:28px;">${fmtUSD(summary.account_value)}</div><div class="sub">total portfolio value</div></div>
+          ${/* The headline used to be summary.account_value labelled "total
+                portfolio value", while the server was actually sending
+                portfolio CASH (see _robinhood_account_probe). The breakdown
+                below is not decoration: cash + holdings must visibly add up
+                to the headline, so the same class of mislabelling cannot hide
+                again. */''}
+          <div class="stat"><div class="value" style="font-size:28px;">${fmtUSD(summary.account_value)}</div><div class="sub">total account value (cash + holdings)</div></div>
           <div class="grid grid-2" style="gap:10px;margin-top:10px;">
-            <div class="stat"><div class="label">Buying power</div><div class="value">${fmtUSD(summary.buying_power)}</div></div>
-            <div class="stat"><div class="label">Invested (cost)</div><div class="value">${fmtUSD(summary.invested_cost)}</div></div>
+            <div class="stat"><div class="label">Cash</div><div class="value">${fmtUSD(summary.cash)}</div></div>
+            <div class="stat"><div class="label">Holdings (broker)</div><div class="value">${fmtUSD(summary.holdings_value)}</div></div>
+            <div class="stat"><div class="label">Buying power</div><div class="value">${fmtUSD(summary.buying_power)}</div><div class="sub">spendable now</div></div>
+            <div class="stat"><div class="label">Invested (cost basis)</div><div class="value">${fmtUSD(summary.invested_cost)}</div><div class="sub">local book</div></div>
           </div>
+          ${(() => {
+            // Holdings value comes from the broker for the CONFIGURED account;
+            // market_value is summed from the local book, which may contain
+            // positions from another account (see the reconciliation panel).
+            // When they disagree, say so rather than showing two numbers that
+            // quietly contradict each other.
+            const b = summary.holdings_value, l = summary.market_value;
+            if (b == null || l == null) return "";
+            if (Math.abs(b - l) <= Math.max(1, Math.abs(b) * 0.02)) return "";
+            return `<div class="subtle" style="margin-top:8px;color:var(--yellow);">
+              ${svg('alert',11)} Local book values open positions at ${fmtUSD(l)}, but this account holds ${fmtUSD(b)}.
+              See “Broker reconciliation” below.</div>`;
+          })()}
           <div class="subtle" style="margin-top:10px;">${summary.account_source === 'agentic_configured'
-            ? `Account: <b>${summary.account_number}</b> (from Control tab)`
+            ? `Account: <b>${escHtml(summary.account_number)}</b> <span class="subtle">(masked — set via RH_ACCOUNT_NUMBER, see Control tab)</span>`
             : `<span style="color:var(--yellow);">No account.robinhood_account_number configured on the Control tab - reading your PRIMARY Robinhood account, not the Agentic account.</span>`}</div>
         ` : emptyBlock('alert',
             summary.credentials_configured === false
@@ -2362,10 +2983,28 @@ async function renderRealPortfolioTab(el) {
         </div>
       </div>
       <div class="panel">
-        <div class="panel-head">${svg('risk',15)}<span class="panel-title">All-Time Realized</span></div>
-        <div class="stat"><div class="value ${pnlClass(summary.realized_pnl_all_time)}" style="font-size:28px;">${fmtUSD(summary.realized_pnl_all_time)}</div><div class="sub">sum of daily_stats.realized_pnl since tracking began</div></div>
+        <div class="panel-head">${svg('risk',15)}<span class="panel-title">All-Time Realized</span>
+          <span class="fill"></span><span class="pill pill-neutral" style="padding:1px 6px;font-size:10px;">real book only</span></div>
+        <div class="stat"><div class="value ${pnlClass(summary.realized_pnl_all_time)}" style="font-size:28px;">${fmtUSD(summary.realized_pnl_all_time)}</div><div class="sub">running total of closed REAL trades</div></div>
         <div class="subtle" style="margin-top:8px;">Trades today: ${summary.trades_placed_today || 0} · Winners today: ${summary.winning_trades_today || 0}</div>
+        <div id="realized-audit" class="subtle" style="margin-top:8px;"></div>
       </div>
+    </div>
+
+    <div class="panel" id="reconcile-panel">
+      <div class="panel-head">${svg('risk',15)}<span class="panel-title">Broker Reconciliation</span>
+        <span class="fill"></span>
+        <button class="btn btn-ghost btn-sm" onclick="loadReconcilePanel()">${svg('refresh',12)}<span>Re-check</span></button>
+      </div>
+      <div class="prose" style="margin-bottom:10px;">
+        The <code>positions</code> table has no account column, and
+        <code>account_sync.py</code> imports through a robin_stocks call that only
+        ever sees your PRIMARY account — so a position bought in one account can
+        end up counted against another. This compares the local real book against
+        what the configured account actually holds. It only reports; nothing here
+        changes your data or touches Robinhood.
+      </div>
+      <div id="reconcile-body">Loading…</div>
     </div>
 
     <div class="panel">
@@ -2410,9 +3049,196 @@ async function renderRealPortfolioTab(el) {
       emptyBlock('inbox', 'No real trades yet', 'Use confirm_fill.py buy/sell after executing a trade in Claude Desktop.')}
     </div>
   `;
+
+  loadReconcilePanel();
+  auditRealizedPnl(summary, trades);
+}
+
+/* Cross-check the All-Time Realized figure against the trade ledger.
+
+   Added 2026-07-26 (Trinath: "All-Time Realized -$369.91 seems unrealistic ...
+   validate that number"). It is a fair challenge, and the card gave no way to
+   answer it: the figure is SUM(daily_stats.realized_pnl) over every row ever
+   written, a running accumulator with no drill-down, while the ledger
+   underneath it held six real trades and exactly one completed round trip.
+
+   A headline P&L number with no auditable path back to the trades that
+   produced it is one you cannot act on. This recomputes the total from the
+   closed round trips the ledger actually contains and reports agreement or
+   disagreement, so the card either earns trust or visibly fails to. */
+function auditRealizedPnl(summary, trades) {
+  const el = document.getElementById("realized-audit");
+  if (!el) return;
+  const rows = (trades || []).filter(t => !t.simulated);
+  const sells = rows.filter(t => String(t.action || t.side || "").toLowerCase() === "sell");
+  const withPnl = sells.filter(t => t.pnl != null && isFinite(Number(t.pnl)));
+  const ledgerTotal = withPnl.reduce((a, t) => a + Number(t.pnl), 0);
+  const headline = Number(summary.realized_pnl_all_time || 0);
+
+  if (!sells.length) {
+    el.innerHTML = `<span style="color:var(--yellow);">${svg('alert',11)}
+      The ledger holds <b>no closed real round trips</b>, so this total cannot be
+      reproduced from your trades. It is an accumulator over
+      <code>daily_stats.realized_pnl</code> across all history — including rows
+      written by earlier versions. Treat it as unverified until the ledger and
+      the accumulator agree.</span>`;
+    return;
+  }
+  if (!withPnl.length) {
+    el.innerHTML = `<span style="color:var(--yellow);">${svg('alert',11)}
+      ${sells.length} real sell(s) recorded, but none carry a per-trade P&amp;L,
+      so this total cannot be audited against them.</span>`;
+    return;
+  }
+  const drift = Math.abs(ledgerTotal - headline);
+  if (drift <= Math.max(0.01, Math.abs(headline) * 0.005)) {
+    el.innerHTML = `<span style="color:var(--green);">${svg('check',11)}
+      Reconciles with ${withPnl.length} closed round trip(s) in the ledger.</span>`;
+  } else {
+    el.innerHTML = `<span style="color:var(--yellow);">${svg('alert',11)}
+      Ledger sums to <b>${fmtUSD(ledgerTotal)}</b> over ${withPnl.length} closed round
+      trip(s) — a ${fmtUSD(drift)} gap against the figure above. The headline is an
+      all-history accumulator; the ledger is the auditable record.</span>`;
+  }
+}
+
+async function loadReconcilePanel() {
+  const body = document.getElementById("reconcile-body");
+  if (!body) return;
+  let r;
+  try { r = await fetchJSON("/api/real/reconcile", 25000); }
+  catch (e) { body.innerHTML = tabErrorHTML(e); return; }
+
+  if (!r.broker_read_ok) {
+    body.innerHTML = `<div class="subtle">Couldn't read this account's holdings from Robinhood: <code>${escHtml(r.read_error || 'no detail')}</code></div>`;
+    return;
+  }
+  const problems = [...(r.local_only || []), ...(r.broker_only || [])];
+  if (!problems.length) {
+    body.innerHTML = `<div class="subtle" style="color:var(--green);">${svg('check',12)}
+      Local book matches account ${escHtml(r.account_number || '')} exactly — ${(r.matched || []).length} position(s), share counts agree.</div>`;
+    return;
+  }
+  const REMEDY = {
+    not_held_in_this_account:
+      "Not held in the configured account. If it lives in a different Robinhood account, this book is summing across accounts — close it here with <code>confirm_fill.py sell</code> at the price you actually got, or move the position.",
+    share_count_differs:
+      "Share count disagrees with the broker. A partial fill or a sell made outside this app — reconcile with <code>confirm_fill.py</code>.",
+    held_at_broker_but_not_tracked:
+      "Held at the broker but absent from this book, so the exit engines are not managing it. Log it with <code>confirm_fill.py buy TICKER PRICE SHARES</code>.",
+  };
+  body.innerHTML = `
+    <div class="subtle" style="margin-bottom:8px;color:var(--yellow);">
+      ${svg('alert',12)} ${problems.length} position(s) do not agree with account ${escHtml(r.account_number || '')}
+      — every aggregate on this tab (market value, unrealized P&amp;L, invested cost, portfolio heat) is affected.
+    </div>
+    <div class="table-wrap"><table><thead><tr>
+      <th>Ticker</th><th class="num">This book</th><th class="num">At broker</th><th>What it means</th>
+    </tr></thead><tbody>
+      ${problems.map(p => `<tr>
+        <td><b>${escHtml(p.ticker)}</b></td>
+        <td class="num">${p.local_shares || 0}</td>
+        <td class="num">${p.broker_shares || 0}</td>
+        <td class="subtle">${REMEDY[p.issue] || escHtml(p.issue || '')}</td>
+      </tr>`).join('')}
+    </tbody></table></div>
+    ${(r.matched || []).length ? `<div class="subtle" style="margin-top:8px;">${r.matched.length} other position(s) match.</div>` : ''}`;
 }
 
 /* ============================== CONTROL TAB ============================== */
+/* Consolidated arming summary, added 2026-07-26 (UI audit).
+
+   Two problems it solves. First, answering "can this thing spend my money
+   right now?" required reading three separate danger-zone panels plus the
+   Watch/Execute segment and mentally AND-ing them - the state that matters
+   was never stated anywhere as a single fact. Second, and worse: the server
+   already computes exactly that fact and several of its inputs, and the UI
+   rendered NONE of them. A repo-wide grep for each field of
+   /api/robinhood/status and /api/status found zero references in this file
+   to:
+
+     live_trading_armed   the single boolean for "armed"
+     execution_path       "claude_desktop" vs this app placing orders itself
+     orders_breaker_open  the ORDER circuit breaker - when open, real orders
+                          are being silently skipped. Safety-relevant, and
+                          it was invisible in the UI entirely.
+     read_ok              whether the Robinhood read actually succeeded
+     validation           the backtest-receipt gate's verdict
+     kill_reason / pid    why the last cycle was auto-killed, and what to
+                          kill by hand if one hangs (see Monitor tab)
+
+   Each row below therefore shows a value the app already knew and never
+   said out loud. */
+// Cached between renders so the panel paints immediately from the last known
+// values and then refreshes, rather than flashing an empty shell. Refilled by
+// loadExecutionPosture() below on every Control-tab render.
+let _rhStatus = {};
+
+async function loadExecutionPosture() {
+  try { _rhStatus = await (await fetch("/api/robinhood/status")).json(); }
+  catch (e) { /* keep previous - a stale posture is better than a blank one */ }
+  const slot = document.getElementById("execution-posture-slot");
+  if (slot) slot.innerHTML = executionPosturePanel();
+  renderBrandPosture();
+}
+
+function executionPosturePanel() {
+  const p = status.execution_posture || {};
+  const rh = _rhStatus || {};
+  const armed = rh.live_trading_armed != null
+    ? !!rh.live_trading_armed
+    : !!(p.master_switch && p.auto_trade && p.watch_execute === "EXECUTE" && !p.force_paper);
+
+  const row = (label, value, cls, tip) => `
+    <tr>
+      <td style="width:200px;color:var(--text-1);">${tip ? withTip(label, tip) : label}</td>
+      <td><span class="pill ${cls}">${value}</span></td>
+    </tr>`;
+
+  const pathLabel = rh.execution_path === "live_trader"
+    ? "This app (engine/live_trader.py)"
+    : rh.execution_path === "claude_desktop" ? "Claude Desktop (trade prompt)"
+    : (p.master_switch ? "This app (engine/live_trader.py)" : "Claude Desktop (trade prompt)");
+
+  const breakerOpen = !!rh.orders_breaker_open;
+  const validation = p.validation || "unknown";
+  const validationOk = /valid|current|pass/i.test(validation) && !/no validation/i.test(validation);
+
+  return `
+    <div class="panel ${armed ? 'danger-zone' : ''}">
+      <div class="panel-head">${svg(armed ? 'alert' : 'power',15)}
+        <span class="panel-title">Execution Posture</span>
+        <span class="fill"></span>
+        <span class="pill ${armed ? 'pill-red' : 'pill-green'}">${armed ? 'ARMED — REAL ORDERS' : 'NO REAL ORDERS POSSIBLE'}</span>
+      </div>
+      <div class="prose" style="margin-bottom:10px;">
+        Every gate below must be open for this app to place a real order. The
+        summary pill is the AND of all of them — read it, not the individual
+        switches, when you want the one-line answer.
+      </div>
+      <div class="table-wrap"><table><tbody>
+        ${row('Env veto (TP_FORCE_PAPER)', p.force_paper ? 'SET — vetoes everything' : 'not set',
+              p.force_paper ? 'pill-green' : 'pill-neutral',
+              "Checked ABOVE config.yaml on purpose: an old version's committed config.yaml has all three trading gates open, so running it to reproduce a backtest would otherwise arm live trading against the real account.")}
+        ${row('Live Execution master switch', p.master_switch ? 'ON' : 'OFF', p.master_switch ? 'pill-red' : 'pill-green')}
+        ${row('Watch / Execute', p.watch_execute || '—', p.watch_execute === 'EXECUTE' ? 'pill-red' : 'pill-green')}
+        ${row('Auto-Trade', p.auto_trade ? 'ON' : 'OFF', p.auto_trade ? 'pill-red' : 'pill-green')}
+        ${row('Kill switch', p.kill_switch ? 'ENGAGED — blocks new buys' : 'off', p.kill_switch ? 'pill-yellow' : 'pill-neutral')}
+        ${row('Backtest validation receipt', validation, validationOk ? 'pill-green' : 'pill-yellow',
+              'live_trader.is_live_mode() requires a receipt written by a PASSING run_backtest.py run, no more than 30 days old. Without it, no order is placed no matter what the switches say.')}
+        ${row('Order circuit breaker', breakerOpen ? 'OPEN — orders are being SKIPPED' : 'closed',
+              breakerOpen ? 'pill-red' : 'pill-neutral',
+              'When this breaker is open, engine/live_trader.py returns without submitting. Until now this was computed by the server and never displayed anywhere, so an armed platform could be quietly placing nothing at all.')}
+        ${row('Robinhood read', rh.read_ok === true ? 'OK' : rh.read_ok === false ? 'FAILING' : 'not attempted / not configured',
+              rh.read_ok === true ? 'pill-green' : rh.read_ok === false ? 'pill-red' : 'pill-neutral')}
+        ${row('Who places the order', pathLabel, 'pill-neutral',
+              'With the master switch OFF the scheduler only writes trade_prompt.md and a human/Claude Desktop executes it. With it ON, this process submits via robin_stocks directly.')}
+        ${row('Risk level', p.risk_level || '—', 'pill-neutral')}
+      </tbody></table></div>
+      ${rh.read_error ? `<div class="subtle" style="margin-top:10px;">Read error: <code>${escHtml(rh.read_error)}</code></div>` : ''}
+    </div>`;
+}
+
 function renderControlTab(el) {
   const cfg = state.config || {};
   const watchlist = cfg.watchlist || [];
@@ -2432,8 +3258,16 @@ function renderControlTab(el) {
   const rotOn = !!rot.enabled;
   const acctNum = cfg.account?.robinhood_account_number || "";
   const autoSyncOn = !!cfg.account?.auto_sync;
+  // Present when config.yaml holds a ${VAR} reference rather than a literal -
+  // see server.py's _redact_config_for_ui(). Before that existed, this input
+  // rendered the raw string "${RH_ACCOUNT_NUMBER}" as if it were the account
+  // number, which reads as a broken template and was one stray edit away from
+  // being saved back over the reference.
+  const acctSrc = cfg.account?._account_number_source || null;
 
   el.innerHTML = `
+    <div id="execution-posture-slot">${executionPosturePanel()}</div>
+
     <div class="panel">
       <div class="panel-head">${svg('positions',15)}<span class="panel-title">Watchlist</span></div>
       <div class="chips" id="watchlist-chips"></div>
@@ -2460,7 +3294,10 @@ function renderControlTab(el) {
         <div class="field" style="margin-bottom:0;">
           <div class="field-label">Watch / Execute</div>
           <div class="segmented" id="exec-seg"></div>
-          <div class="field-desc">WATCH = paper trading (simulated fills, full tracking). EXECUTE = real-money mode via Claude Desktop: the scheduler writes trade prompts; orders are placed there (never from this app) and recorded back with <code>confirm_fill.py</code>.</div>
+          ${/* "orders are placed there (never from this app)" contradicted the
+                Live Execution panel sitting immediately to the right of it,
+                on the same screen. Corrected 2026-07-26 (UI audit). */''}
+          <div class="field-desc">WATCH = paper trading (simulated fills, full tracking). EXECUTE = real-money mode. Which process actually submits then depends on the Live Execution master switch beside this: OFF → the scheduler writes <code>trade_prompt.md</code> and Claude Desktop places the orders, recorded back with <code>confirm_fill.py</code>; ON → this app submits them itself.</div>
         </div>
       </div>
 
@@ -2565,8 +3402,19 @@ function renderControlTab(el) {
       <div class="panel-head">${svg('positions',15)}<span class="panel-title">Robinhood Account Link</span></div>
       <div class="field">
         <div class="field-label">Account number</div>
-        <input type="text" id="rh-account-number" placeholder="empty = primary account" value="${acctNum}"
-               style="width:220px;" onchange="setRhAccountNumber(this.value)">
+        ${acctSrc ? `
+          <input type="text" id="rh-account-number" readonly style="width:260px;"
+                 value="${acctSrc.is_set ? `${acctSrc.masked}  (from ${acctSrc.env_var})` : `not set — ${acctSrc.env_var} is empty`}"
+                 title="This value lives in .env, not config.yaml, so it is not editable here.">
+          <div class="field-desc">
+            ${acctSrc.is_set
+              ? `Managed by <code>${acctSrc.env_var}</code> in <code>.env</code> — shown masked because the full number never leaves the server.`
+              : `<b style="color:var(--yellow);">Not set.</b> <code>config.yaml</code> points at <code>\${${acctSrc.env_var}}</code> but that variable is empty in this process, so account-scoped reads fall back to your PRIMARY account.`}
+            To change it: <code>./scripts/tp secrets set ${acctSrc.env_var}</code> (or edit <code>.env</code>), then restart the server.
+          </div>`
+        : `
+          <input type="text" id="rh-account-number" placeholder="empty = primary account" value="${escHtml(acctNum)}"
+                 style="width:220px;" onchange="setRhAccountNumber(this.value)">`}
         <div class="field-desc">Which Robinhood account this platform reads and (in live mode) trades. <b>Set this to your AGENTIC account number</b> - Robinhood's agentic-trading policy allows agents to trade only in that dedicated account, and the platform's default (empty) is your primary individual account. Find it in the Robinhood app under the account's settings, or via <code>python3 robinhood_sync.py status</code>.</div>
       </div>
       <div class="field" style="margin-bottom:0;">
@@ -2601,6 +3449,8 @@ function renderControlTab(el) {
     `<button class="${val===rotOn?'active':''}" onclick="setRotationEnabled(${val})">${label}</button>`).join("");
   document.getElementById("autosync-seg").innerHTML = [["OFF",false],["ON",true]].map(([label,val]) =>
     `<button class="${val===autoSyncOn?'active':''}" onclick="setAutoSyncEnabled(${val})">${label}</button>`).join("");
+
+  loadExecutionPosture();  // fills in the read_ok / breaker / execution_path rows
 }
 
 // Live Execution master switch (2026-07-17): enabling requires the auth
@@ -2857,19 +3707,22 @@ async function renderLearningTab(el) {
       <div id="backtest-body">Loading…</div>
     </div>
   `;
-  try {
-    const summary = await fetchJSON("/api/analytics/performance");
-    document.getElementById("learning-body").innerHTML = `
-      <p class="field-desc" style="margin-bottom:14px;">Pattern database, EV engine, Bayesian weight updater, walk-forward, and champion/challenger all run against closed <code>pattern_database</code> rows — see README for what's real vs. simulated.</p>
-      <div class="metrics-row">
-        <div class="metric"><div class="metric-label">Closed patterns</div><div class="metric-value">${summary.n_closed_patterns}</div></div>
-        <div class="metric"><div class="metric-label">Profit factor</div><div class="metric-value">${summary.profit_factor.toFixed(2)}</div></div>
-        <div class="metric"><div class="metric-label">Sharpe</div><div class="metric-value">${summary.sharpe_ratio.toFixed(2)}</div></div>
-      </div>
-    `;
-  } catch (e) {
-    document.getElementById("learning-body").innerHTML = tabErrorHTML(e);
-  }
+  /* The three-metric strip that used to live here (Closed patterns / Profit
+     factor / Sharpe) was a byte-for-byte duplicate of the one at the top of
+     the Performance tab, reading the same /api/analytics/performance call -
+     two tabs, same numbers, no added context on either. Worse, this copy
+     called summary.profit_factor.toFixed(2) directly while the Performance
+     tab's copy went through fmtRatio(), which exists precisely because
+     profit_factor is legitimately null until the book has a losing trade to
+     divide by. So the moment there were closed trades but no losses, this
+     panel threw a TypeError and rendered "Couldn't load this panel" - the
+     duplicate was not just redundant, it was the broken one.
+
+     Replaced with a one-line pointer. The metrics have exactly one home. */
+  document.getElementById("learning-body").innerHTML = `
+    <p class="field-desc" style="margin-bottom:0;">Pattern database, EV engine, Bayesian weight updater, walk-forward, and champion/challenger all run against closed <code>pattern_database</code> rows — see README for what's real vs. simulated.
+    Headline numbers for this book (closed patterns, profit factor, Sharpe) live on the <a href="#performance" onclick="showTab('performance');return false;">Performance tab</a>, broken down by market regime.</p>
+  `;
 
   loadBacktestPanel(); // fire-and-forget - independent of the learning_runs early-return below
 
@@ -3059,7 +3912,28 @@ function _renderBacktestHistory(runs) {
 }
 
 /* ============================== STRATEGY TAB ============================== */
-const STATUS_PILL = { REAL: 'pill-green', PROXY: 'pill-yellow', PLACEHOLDER: 'pill-red' };
+// REAL_APPROXIMATE was missing (added 2026-07-26, UI audit). The lookup falls
+// back to a bare 'pill' class, which sets no background, border or colour - so
+// that rule rendered as unstyled bold text in a column where every other row
+// is a coloured pill, reading as a rendering glitch rather than as a status.
+// The legend above the table did not mention it either. One rule currently
+// carries it (above_avwap_earnings), which is why it survived: a single row in
+// a 49-rule table.
+//
+// It sits between REAL and PROXY in meaning - genuine live data, but with an
+// inferred input (an approximated earnings report time) - so it takes REAL's
+// hue in the lighter dim variant rather than a fourth colour.
+const STATUS_PILL = {
+  REAL: 'pill-green', REAL_APPROXIMATE: 'pill-blue',
+  PROXY: 'pill-yellow', PLACEHOLDER: 'pill-red',
+};
+// Shown next to the status column so a reader can decode it without guessing.
+const STATUS_LEGEND = {
+  REAL: 'live data today',
+  REAL_APPROXIMATE: 'live data, but one input is inferred rather than reported',
+  PROXY: 'a real approximation of the true signal',
+  PLACEHOLDER: 'no data source wired yet, essentially never fires',
+};
 
 async function renderStrategyTab(el) {
   el.innerHTML = `<div id="strategy-body"><p class="field-desc">Loading…</p></div>`;
@@ -3095,10 +3969,26 @@ function renderStrategyBody(s) {
   return `
     <div class="panel">
       <div class="panel-head">${svg('strategy',15)}<span class="panel-title">Buy Rules — 6-Bucket Scoring</span></div>
-      <p class="field-desc" style="margin-bottom:12px;">${s.buy_rules.engine}. Every bucket contributes continuously via its qualification multiplier - min-qualify is a display threshold only, never a hard score cutoff.
-        <span class="pill pill-green" style="padding:1px 6px;">REAL</span> = live data today,
-        <span class="pill pill-yellow" style="padding:1px 6px;">PROXY</span> = a real approximation of the true signal,
-        <span class="pill pill-red" style="padding:1px 6px;">PLACEHOLDER</span> = no data source wired yet, essentially never fires.</p>
+      ${/* s.buy_rules.engine is a ~2,700-character single paragraph of
+            engineering changelog (subgroup caps, effective vs raw max_points,
+            weight recalibration dates). Rendered full-width it was a ~250-
+            character measure and roughly 40 lines tall - the first thing on
+            the tab, above the tables that are the actual content, and the
+            thing a reader has to scroll past every single visit.
+
+            The one sentence in it that governs how to READ the tables below
+            is promoted; the rest is moved behind a disclosure. Nothing is
+            deleted - the detail is one click away and still verbatim. */''}
+      <p class="prose">
+        Every bucket contributes continuously via its qualification multiplier — <b>min-qualify is a display threshold only</b>, never a hard score cutoff, so a bucket below its bar still adds to the score.
+        <br><br>
+        ${Object.entries(STATUS_LEGEND).map(([k, v]) =>
+          `<span class="pill ${STATUS_PILL[k]}" style="padding:1px 6px;">${k}</span> = ${v}`).join(' · ')}
+      </p>
+      <details class="note">
+        <summary>Full scoring-engine notes (caps, weights, changelog)</summary>
+        <div class="prose">${s.buy_rules.engine}</div>
+      </details>
       ${s.buy_rules.buckets.map(b => `
         <div style="margin-bottom:16px;">
           <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
@@ -3588,10 +4478,27 @@ function renderRiskTab(el) {
       <div class="panel-head">${svg('risk',15)}<span class="panel-title">${withTip('Portfolio Heat', 'portfolio_heat')}</span></div>
       <div class="stat"><div class="value">${heat.current_heat_pct}%<span style="font-size:13px;color:var(--text-2);"> / ${heat.max_heat_pct}% max</span></div></div>
       <div class="heat-track" style="margin-top:10px;"><div class="heat-fill" style="width:${pct}%;background:${pct>90?'var(--red)':pct>60?'var(--yellow)':'var(--green)'}"></div></div>
-      <p class="field-desc" style="margin-top:12px;">Approximate — dollar risk of open positions vs. dollars deployed. Not normalized against real account equity - the balance data is available, but heat feeds position sizing, so re-basing it is a deliberate change rather than a fix.</p>
+      ${/* The caption and the hover tooltip described DIFFERENT denominators:
+            the tooltip said "vs. your max_portfolio_risk_pct budget", the
+            caption said "vs. dollars deployed". Both were on screen at once,
+            and only one can be right. The figure is
+            current_heat_pct / max_heat_pct, i.e. against the configured risk
+            budget - the tooltip was correct and the caption was not.
+            Reconciled 2026-07-26 (UI audit); both now come from one string. */''}
+      <p class="field-desc" style="margin-top:12px;">${_HEAT_CAPTION}</p>
+      <div class="grid grid-2" style="gap:10px;margin-top:14px;">
+        <div class="metric"><div class="metric-label">Risk budget used</div><div class="metric-value">${pct.toFixed(0)}%</div></div>
+        <div class="metric"><div class="metric-label">Headroom left</div><div class="metric-value">${Math.max(0, (heat.max_heat_pct || 0) - (heat.current_heat_pct || 0)).toFixed(2)}%</div></div>
+        <div class="metric"><div class="metric-label">Open positions</div><div class="metric-value">${(state.positions || []).length}</div></div>
+        <div class="metric"><div class="metric-label">Position cap</div><div class="metric-value">${state.config?.trading?.max_positions ?? '—'}</div></div>
+      </div>
     </div>
   `;
 }
+
+// Single source for the portfolio-heat explanation, referenced by both the
+// Risk tab caption and TIPS.portfolio_heat so they cannot drift apart again.
+const _HEAT_CAPTION = "Approximate dollar risk across open positions, measured against your configured <code>max_portfolio_risk_pct</code> budget (not against real account equity — the balance data is available, but heat feeds position sizing, so re-basing it is a deliberate change rather than a fix). Stay under 100% of max: the bar turns yellow above 60% and red above 90%.";
 
 /* ============================== JOURNAL TAB ============================== */
 async function renderJournalTab(el) {
@@ -3863,7 +4770,14 @@ async function renderMonitorTab(el) {
         ${lc ? `
           <div class="stat"><div class="label">Cycle #</div><div class="value">${lc.cycle_num} <span class="pill pill-neutral" style="padding:1px 6px;font-size:10px;">${lc.triggered_by || 'scheduler'}</span></div></div>
           <div class="subtle" style="margin-top:8px;">${fmtCST(lc.timestamp, {second: "2-digit"})}</div>
-          <div class="subtle">${lc.ticker_count} tickers scanned, ${lc.blocked ? 'blocked: '+lc.reason : 'completed in '+(lc.duration||0).toFixed(0)+'s'}</div>
+          <div class="subtle">${lc.ticker_count} tickers scanned, ${lc.blocked ? 'blocked: '+escHtml(lc.reason||'') : 'completed in '+(lc.duration||0).toFixed(0)+'s'}</div>
+          ${/* kill_reason and pid are written by engine/cycle_supervisor.py on
+                every auto-kill and were rendered nowhere - so a cycle that got
+                SIGKILLed at the 15-minute watchdog looked identical to one
+                that finished, and the pid you would need to clean up by hand
+                was only in the logs. */''}
+          ${status.kill_reason ? `<div class="subtle" style="margin-top:6px;color:var(--red);">${svg('alert',11)} Last run was killed: <b>${escHtml(status.kill_reason)}</b></div>` : ''}
+          ${status.is_running && status.pid ? `<div class="subtle" style="margin-top:6px;">Running as PID <code>${status.pid}</code> — "Cancel run" kills this process group.</div>` : ''}
         ` : emptyBlock('inbox','No cycles run yet','Start scheduler.py, use ./run.sh --ui, or click "Run cycle now" above.')}
       </div>
     </div>
@@ -3908,7 +4822,15 @@ async function renderSourcesPanel() {
           ${s.optional ? '' : '<span class="pill pill-neutral" style="padding:1px 6px;font-size:10px;">core</span>'}
         </div>
         <div class="field-desc" style="margin-top:3px;">${s.role}</div>
-        <div class="subtle" style="margin-top:3px;font-size:11px;">${s.note || ''}</div>
+        ${/* Timestamps are formatted HERE, through fmtCST, so this panel obeys
+             the same "everything is CT and labelled" rule as the rest of the
+             UI. The server used to hand over a pre-baked note containing a raw
+             naive-UTC ISO string. */''}
+        <div class="subtle" style="margin-top:3px;font-size:11px;">
+          ${s.note ? escHtml(s.note) : ''}
+          ${s.status === 'OK' && s.last_success_at ? `Last success ${fmtCST(s.last_success_at, {second:'2-digit'})} CT` : ''}
+          ${s.status !== 'OK' && s.last_success_at ? `<span style="opacity:.75;">· last worked ${fmtCST(s.last_success_at)} CT</span>` : ''}
+        </div>
       </div>
       <span class="pill" style="flex-shrink:0;padding:2px 8px;font-size:11px;color:${COLORS[s.status]};border:1px solid ${COLORS[s.status]};">${(s.status || '').replace(/_/g,' ')}</span>
     </div>`).join("") + `</div>`;
@@ -3967,6 +4889,14 @@ function _logLineColor(raw) {
   return "var(--text-1)";
 }
 
+// A line that does NOT start with a timestamp is a continuation of the record
+// above it - almost always a traceback frame. Server-side these now sort with
+// their parent record (see server.py's get_logs); here they're indented and
+// dimmed so a multi-line exception reads as one block rather than as a run of
+// unrelated log lines.
+const _LOG_TS_PREFIX = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/;
+function _isLogContinuation(raw) { return !_LOG_TS_PREFIX.test(raw); }
+
 async function renderLogsTab(el) {
   el.innerHTML = `
     <div class="panel">
@@ -4003,9 +4933,14 @@ async function loadLogsBody() {
     return;
   }
   const wasAtBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 20;
-  body.innerHTML = lines.map(l =>
-    `<div style="color:${_logLineColor(l.raw)};">${l.raw.replace(/</g,'&lt;')}</div>`
-  ).join("");
+  // Continuation lines inherit the colour of the record they belong to, so a
+  // traceback under an ERROR stays red instead of resetting to body text.
+  let inheritedColor = "var(--text-1)";
+  body.innerHTML = lines.map(l => {
+    const cont = _isLogContinuation(l.raw);
+    if (!cont) inheritedColor = _logLineColor(l.raw);
+    return `<div class="log-line${cont ? ' cont' : ''}" style="color:${cont ? inheritedColor : _logLineColor(l.raw)};${cont ? 'opacity:.8;' : ''}">${escHtml(l.raw)}</div>`;
+  }).join("");
   if (wasAtBottom) body.scrollTop = body.scrollHeight;  // stick to newest lines unless you've scrolled up to read history
 }
 
@@ -4024,7 +4959,25 @@ function sentimentPill(label) {
   return `<span class="pill ${cls}" style="padding:1px 6px;">${label || "neutral"}</span>`;
 }
 
-function newsMoodPanel(mood) {
+/* ONE market-mood component, shared by the News tab and the Dashboard's
+   Market Pulse panel (2026-07-26, UI audit).
+
+   These were two separate renderers showing overlapping data, and they had
+   already drifted: News showed Fear & Greed, VIX, Regime and Macro Blackout;
+   the Dashboard's Market Pulse showed only Fear & Greed and VIX. So the
+   Dashboard - the tab whose entire job is the at-a-glance summary - was the
+   one MISSING the regime, while the topbar pill showed a regime the panel
+   underneath it didn't mention. Whichever you were looking at, some of the
+   market context was on a different tab.
+
+   `hours_to_next_macro` also came through as the sentinel 999.0 when no
+   macro event is scheduled, and rendered literally as "999.0h to next macro
+   event" - a made-up 41-day countdown presented as fact. Sentinels are
+   filtered here rather than at each call site. */
+const _MACRO_SENTINEL_HOURS = 240;  // anything beyond ~10 days is the "none scheduled" sentinel, not a real countdown
+
+function marketMoodPanel(mood, opts) {
+  opts = opts || {};
   if (!mood || (mood.fear_greed_score == null && mood.vix_level == null)) {
     return `<div class="subtle">No market-mood snapshot yet - populated after scheduler.py's first scan cycle.</div>`;
   }
@@ -4033,33 +4986,53 @@ function newsMoodPanel(mood) {
   const vix = mood.vix_level;
   const vixColor = vix == null ? "var(--text-2)" : vix > 27 ? "var(--red)" : vix > 22 ? "var(--yellow)" : "var(--green)";
   const blackout = mood.blackout_active
-    ? `<span class="pill pill-red" style="padding:1px 6px;">active${mood.blackout_reason ? " — " + mood.blackout_reason : ""}</span>`
+    ? `<span class="pill pill-red" style="padding:1px 6px;">active${mood.blackout_reason ? " — " + escHtml(mood.blackout_reason) : ""}</span>`
     : `<span class="pill pill-neutral" style="padding:1px 6px;">clear</span>`;
-  const hoursToMacro = mood.hours_to_next_macro != null ? `${mood.hours_to_next_macro.toFixed(1)}h to next macro event` : "";
+  const h = mood.hours_to_next_macro;
+  const macroSub = (h == null || h >= _MACRO_SENTINEL_HOURS)
+    ? "none scheduled"
+    : h < 1 ? "under 1h to next macro event" : `${h.toFixed(1)}h to next macro event`;
+
+  // Regime comes from the same DB row the topbar badge reads, so the two can
+  // never disagree; mood.regime is the fallback for the News payload.
+  const reg = state.regime || {};
+  const regimeLabel = reg.dominant_regime || mood.regime || "—";
+  const regimeSub = reg.bull_pct != null
+    ? `${reg.bull_pct.toFixed(0)}% bull · ${reg.bear_pct?.toFixed(0)}% bear · ${reg.choppy_pct?.toFixed(0)}% choppy`
+    : "";
+  const regimeColor = regimeLabel === "BULL" ? "var(--green)"
+    : (regimeLabel === "BEAR" || regimeLabel === "CRISIS") ? "var(--red)"
+    : regimeLabel === "—" ? "var(--text-2)" : "var(--yellow)";
+
   return `
-    <div class="metrics-row" style="grid-template-columns:repeat(auto-fit, minmax(120px, 1fr));">
-      <div class="metric">
-        <div class="metric-label">${withTip('Fear &amp; Greed', 'fg_score')}</div>
-        <div class="metric-value" style="color:${fgColor};">${fg ?? "—"}</div>
-        <div class="subtle">${mood.fear_greed_rating || ""}</div>
+    <div class="kv-strip">
+      <div class="kv-cell">
+        <div class="k">${withTip('Fear &amp; Greed', 'fg_score')}</div>
+        <div class="v" style="color:${fgColor};">${fg ?? "—"}</div>
+        <div class="s">${mood.fear_greed_rating || ""}</div>
       </div>
-      <div class="metric">
-        <div class="metric-label">${withTip('VIX', 'vix')}</div>
-        <div class="metric-value" style="color:${vixColor};">${vix != null ? vix.toFixed(1) : "—"}</div>
+      <div class="kv-cell">
+        <div class="k">${withTip('VIX', 'vix')}</div>
+        <div class="v" style="color:${vixColor};">${vix != null ? vix.toFixed(1) : "—"}</div>
+        <div class="s">${vix == null ? "" : vix > 27 ? "high stress" : vix > 22 ? "elevated" : "calm"}</div>
       </div>
-      <div class="metric">
-        <div class="metric-label">Regime</div>
-        <div class="metric-value" style="font-size:13px;">${mood.regime || "—"}</div>
+      <div class="kv-cell">
+        <div class="k">${withTip('Regime', 'regime')}</div>
+        <div class="v" style="font-size:15px;color:${regimeColor};">${regimeLabel}</div>
+        <div class="s">${regimeSub}</div>
       </div>
-      <div class="metric">
-        <div class="metric-label">Macro Blackout</div>
-        <div style="margin-top:4px;">${blackout}</div>
-        <div class="subtle" style="margin-top:2px;">${hoursToMacro}</div>
+      <div class="kv-cell">
+        <div class="k">Macro blackout</div>
+        <div style="margin-top:7px;">${blackout}</div>
+        <div class="s" style="margin-top:4px;">${macroSub}</div>
       </div>
     </div>
-    <div class="subtle" style="margin-top:10px;">As of ${fmtCST(mood.as_of)} CT - recalculated every scan cycle.</div>
+    <div class="subtle" style="margin-top:10px;">As of ${fmtCST(mood.as_of)} CT - recalculated every scan cycle.${opts.footerExtra || ""}</div>
   `;
 }
+
+// Back-compat alias: the News tab called this by its old name.
+const newsMoodPanel = marketMoodPanel;
 
 async function renderNewsTab(el) {
   el.innerHTML = `
@@ -4120,7 +5093,25 @@ async function boot() {
   await loadTickerNames();
   await loadTickerHealth();
   connect();
-  showTab("dashboard");
+
+  // Restore the tab (and book) from the URL instead of hardcoding the
+  // dashboard - this is what makes a browser reload land where you were.
+  // A bare "/" with no hash still opens the dashboard, and gets its hash
+  // stamped in with replaceState so the very first reload already works.
+  const route = parseHash();
+  if (route) {
+    if (route.book && route.book !== viewMode) {
+      viewMode = route.book;
+      localStorage.setItem(VIEW_MODE_KEY, viewMode);
+      renderBookToggle();
+    }
+    showTab(route.tab, { fromHash: true });
+  } else {
+    showTab(DEFAULT_TAB, { fromHash: true });
+  }
+  syncHash(true);
+  window.addEventListener("hashchange", onHashChange);
+
   setInterval(loadStatus, 10000);  // frequent enough that the cycle-running topbar badge/elapsed timer feels live
   setInterval(loadTickerNames, 300000);
   setInterval(loadTickerHealth, 300000);

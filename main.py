@@ -309,17 +309,35 @@ def run_ui():
     # survived the v2.3.1 fix untouched.
     #
     # Guarding the bind itself is the only placement that covers every launcher.
+    # TP_UI_PORT, not a hardcoded 8080 (fixed 2026-07-26, UI audit).
+    #
+    # scripts/tp gives every installed version its own port and sets
+    # TP_UI_PORT accordingly (see cmd_run) - that per-version port is half of
+    # what makes two versions co-installable at all. scripts/services.py
+    # honours it. main.py did not: it bound 8080 unconditionally AND passed
+    # port=8080 to _free_ui_port, whose job is to KILL whatever is holding
+    # that port.
+    #
+    # So `tp run v2.9.0 --ui`, intending to start a second UI on its own port,
+    # would instead kill the PRIMARY version's UI and take 8080 for itself -
+    # the exact cross-version collision the version manager exists to prevent,
+    # arriving through the one launcher that ignored the mechanism. The
+    # failure is also quiet from the browser's side: localhost:8080 keeps
+    # serving a UI, just a different version's.
+    port = int(os.getenv("TP_UI_PORT", "8080"))
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
         from services import _free_ui_port
-        _free_ui_port(port=8080)
+        _free_ui_port(port=port)
     except Exception as e:
         # Never block startup on the cleanup. If it cannot run, the bind either
         # succeeds anyway or fails with its own message.
-        console.print(f"[yellow]note: could not check port 8080 for a stale "
+        console.print(f"[yellow]note: could not check port {port} for a stale "
                        f"holder ({e})[/yellow]")
 
-    uvicorn.run(app, host=host, port=8080, log_level="warning")
+    console.print(f"[dim]UI on http://{host}:{port}"
+                  f"{'' if port == 8080 else '  (TP_UI_PORT)'}[/dim]")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":

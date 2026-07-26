@@ -181,6 +181,24 @@ class _PGCursorWrapper:
         return iter(self._cur)
 
     @property
+    def description(self):
+        """Column metadata, same shape as sqlite3's (name is element 0).
+
+        Added 2026-07-26 (UI audit). This wrapper implemented fetchone/
+        fetchall/rowcount/lastrowid but NOT description, and psycopg2's own
+        cursor does have it - so `cur.description` raised AttributeError on
+        Postgres and worked on SQLite. There is exactly one caller in the
+        tree (get_source_health), and it wrapped itself in a bare
+        `except Exception: return []` with the comment "table not created
+        yet", so the AttributeError was indistinguishable from an empty
+        table: the Monitor tab's Data Sources panel reported "NO DATA YET"
+        for all 14 sources permanently after the Postgres migration, with
+        no error anywhere. Implementing the property is the actual fix;
+        get_source_health no longer relies on it either.
+        """
+        return self._cur.description
+
+    @property
     def rowcount(self):
         return self._cur.rowcount
 
@@ -974,6 +992,21 @@ class Database:
         # to the strategy category it was bought under. NULL on rows that
         # predate this column; 'SEED' on positions cloned from the real book.
         self._add_column_if_missing(conn, "positions", "trade_mode", "TEXT")
+        # Close audit trail (2026-07-26). Until these existed, closing a
+        # position recorded status='closed' and nothing else: the exit price
+        # the P&L was computed from, the time, and the resulting figure were
+        # all discarded, leaving daily_stats.realized_pnl as an accumulator
+        # with no traceable inputs. That is how a -$369.91 all-time figure came
+        # to sit above a ledger whose only completed real round trip made
+        # +$0.09, with no way to investigate from the data. See
+        # close_position()'s docstring.
+        #
+        # NULL on every row that predates this, which is itself the useful
+        # signal: those are exactly the closes that cannot be audited.
+        self._add_column_if_missing(conn, "positions", "exit_price", "REAL")
+        self._add_column_if_missing(conn, "positions", "exit_time", "TEXT")
+        self._add_column_if_missing(conn, "positions", "realized_pnl", "REAL")
+        self._add_column_if_missing(conn, "positions", "closed_by", "TEXT")
         conn.execute("""CREATE TABLE IF NOT EXISTS paper_account (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             starting_cash REAL NOT NULL,
@@ -1689,13 +1722,38 @@ class Database:
                     (name, now, (error or "")[:300], consecutive_failures, breaker_open_until, now))
 
     def get_source_health(self) -> list:
+        """Rows for the Monitor tab's Data Sources panel.
+
+        Rewritten 2026-07-26 (UI audit). This used to read cur.description to
+        build column names, which the Postgres cursor wrapper did not expose,
+        and then swallow the resulting AttributeError under a bare
+        `except Exception: return []` labelled "table not created yet". The
+        two failures were indistinguishable, so after the Postgres migration
+        every source silently read as NO_DATA_YET forever - a monitoring
+        panel that cannot report a problem is worse than no panel, because
+        it is read as "nothing is wrong".
+
+        Now it uses the row_factory idiom the other ~47 read methods in this
+        file use (no .description dependency at all), narrows the except to
+        the one condition it was actually claiming to handle, and logs
+        anything else instead of hiding it.
+        """
         with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
             try:
                 cur = conn.execute("SELECT * FROM source_health ORDER BY name")
-                cols = [d[0] for d in cur.description]
-                return [dict(zip(cols, row)) for row in cur.fetchall()]
-            except Exception:
-                return []  # table not created yet (no source has reported)
+                return [dict(r) for r in cur.fetchall()]
+            except Exception as e:
+                # A genuinely absent table (nothing has reported yet on a
+                # fresh install) is the expected empty case; anything else is
+                # a bug that used to disappear here.
+                msg = str(e).lower()
+                if "no such table" in msg or "does not exist" in msg or "undefinedtable" in msg:
+                    return []
+                logging.getLogger(__name__).warning(
+                    "get_source_health failed (%s: %s) - Monitor tab's Data "
+                    "Sources panel will show no data", type(e).__name__, e)
+                return []
 
     # ---------- analyst estimate revision tracking (2026-07-16) ----------
     # engine/rules_catalog.py's analyst_estimate_raised rule used to be a
@@ -2813,8 +2871,45 @@ class Database:
         confirm_fill.py's behavior is unchanged - a real sell must never close
         the simulated clone of the same ticker (and vice versa). Simulated
         closes stay OUT of daily_stats: that table feeds the risk engine's
-        max_daily_loss guard and reports REAL money only."""
+        max_daily_loss guard and reports REAL money only.
+
+        AUDIT TRAIL (added 2026-07-26). This method used to compute
+        ``pnl = (exit_price - entry_price) * shares``, add it to
+        ``daily_stats.realized_pnl``, and then discard every input: the
+        position row recorded only ``status='closed'``, with no exit price, no
+        exit time, and no stored P&L. For the paper book that was survivable,
+        because ``paper_trades`` logs each simulated sell. The real book had no
+        equivalent, so a real close left a flag on one table and a number in a
+        daily accumulator with nothing connecting them.
+
+        The cost of that showed up during the UI audit: the Real Portfolio tab
+        reported -$369.91 all-time realized against a ledger whose only
+        completed real round trip made +$0.09, and the discrepancy could not be
+        investigated from the database at all - not because the evidence was
+        hidden, but because it had never been written. A P&L figure that cannot
+        be traced back to the trades that produced it cannot be trusted or
+        corrected; it can only be believed or zeroed, and both are guesses.
+
+        ``exit_price``/``exit_time``/``realized_pnl``/``closed_by`` are now
+        persisted on the row, so every dollar in daily_stats has a position it
+        came from.
+        """
         sim_flag = 1 if simulated else 0
+        # A falsy exit price turns the entire cost basis into a loss:
+        # (0 - entry) * shares == -cost. That is the single most plausible way
+        # a small book books a large negative number, and it is always a bug -
+        # a real fill has a real price. Refuse rather than silently corrupt the
+        # ledger, which is what the old code did.
+        try:
+            exit_price = float(exit_price)
+        except (TypeError, ValueError):
+            exit_price = 0.0
+        if exit_price <= 0:
+            logger.error(
+                f"close_position({ticker}, simulated={simulated}): refusing to "
+                f"close at exit_price={exit_price!r}. This would book the whole "
+                f"cost basis as a realized loss. Pass the actual fill price.")
+            return {}
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
@@ -2825,13 +2920,22 @@ class Database:
             if not row:
                 return {}
             row = dict(row)
-            conn.execute(
-                "UPDATE positions SET status = 'closed' WHERE ticker = ? AND status = 'open' "
-                "AND COALESCE(simulated, 0) = ?", (ticker, sim_flag)
-            )
             entry_price, shares = row["entry_price"], row["shares"]
             pnl = (exit_price - entry_price) * shares if entry_price and shares else 0.0
             pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price else 0.0
+            # Persist WHAT the close was, not just THAT it happened - see this
+            # method's docstring. Scoped by id, not by ticker: the old UPDATE
+            # matched on ticker+status and would have closed every open row for
+            # that ticker in the book, while the SELECT above deliberately took
+            # only the newest one (ORDER BY id DESC LIMIT 1). Those two
+            # disagreed, so a duplicate open row would be silently closed with
+            # no P&L recorded for it at all.
+            conn.execute(
+                "UPDATE positions SET status = 'closed', exit_price = ?, "
+                "exit_time = ?, realized_pnl = ?, closed_by = ? WHERE id = ?",
+                (exit_price, datetime.utcnow().isoformat(), round(pnl, 4),
+                 "paper_trader" if simulated else "real_close", row["id"]),
+            )
             # §8 (Phase 2): BOTH books now record. This used to be
             # `if not simulated`, on the reasoning that daily_stats feeds the
             # risk engine's max_daily_loss guard and must report real money

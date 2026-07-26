@@ -348,13 +348,63 @@ def _market_pulse_from_logs(db) -> dict:
             "breadth_gate_ok": True, "macro_blackout": None}
 
 
+# ``${VAR}`` / ``${VAR:-default}``, same grammar as config_loader._ENV_REF.
+_CFG_ENV_REF = re.compile(r"^\$\{([A-Z0-9_]+)(?::-([^}]*))?\}$")
+
+
+def _mask_account(acct) -> str:
+    """``569643794`` -> ``••••3794``. One helper so every surface that shows an
+    account number masks it the same way."""
+    s = str(acct or "").strip()
+    if not s:
+        return ""
+    return f"••••{s[-4:]}" if len(s) >= 4 else "••••"
+
+
+def _redact_config_for_ui(cfg: dict) -> dict:
+    """Make ``${VAR}`` placeholders in config.yaml presentable to the browser.
+
+    Why (2026-07-26, UI audit): this endpoint deliberately ships the RAW yaml
+    (see _load_config()'s note - the server also WRITES this file, and an
+    expanded tree round-tripped through yaml.dump would bake a secret into a
+    versioned file). The consequence was visible: the Control tab's
+    "Robinhood account number" input rendered the literal string
+    ``${RH_ACCOUNT_NUMBER}``, which looks like a broken template and is one
+    stray keystroke away from being SAVED back as the account number.
+
+    Resolving it in the browser is not an option either - the account number
+    is a secret, and this payload also travels over a plain ``ws://`` socket.
+
+    So the value is replaced with a structured descriptor the UI can render
+    honestly: whether the variable is set, and a masked tail so you can tell
+    WHICH account is linked without the number leaving the server. The UI
+    shows a read-only field in this state (see renderControlTab), because the
+    real value lives in .env and typing over it here would not change it.
+    """
+    acct = (cfg.get("account") or {}).get("robinhood_account_number")
+    if isinstance(acct, str):
+        m = _CFG_ENV_REF.match(acct.strip())
+        if m:
+            name, fallback = m.group(1), m.group(2)
+            resolved = secrets.get(name, required=False) or fallback or ""
+            cfg = dict(cfg)
+            cfg["account"] = dict(cfg.get("account") or {})
+            cfg["account"]["robinhood_account_number"] = ""
+            cfg["account"]["_account_number_source"] = {
+                "env_var": name,
+                "is_set": bool(resolved),
+                "masked": _mask_account(resolved),
+            }
+    return cfg
+
+
 def _build_state_payload(db: Database, msg_type: str = "full_state") -> dict:
     """Shared by the /ws initial send and /api/state (used by the UI to
     refresh after a cycle_complete push event, without needing a fresh /ws
     reconnect). regime comes from the DB, not engine.regime_engine's
     current_state() singleton - see storage/database.py's latest_regime
     schema comment for why (this process never calls calculate() itself)."""
-    cfg = _load_config()
+    cfg = _redact_config_for_ui(_load_config())
     return {
         "type": msg_type,
         "config": cfg,
@@ -644,9 +694,59 @@ def _robinhood_account_probe(cfg: dict) -> dict:
         for k in ("buying_power", "cash_available_for_withdrawal", "cash"):
             if profile.get(k) not in (None, ""):
                 out["buying_power"] = float(profile[k]); break
-        for k in ("equity", "portfolio_cash", "total_equity", "market_value"):
+
+        # TOTAL ACCOUNT VALUE = cash + market value of holdings.
+        #
+        # Fixed 2026-07-26 (Trinath: "the $1859.94 is not the total portfolio
+        # value, it's the buying power"). He was right, and the cause was the
+        # fallback chain below, which used to read:
+        #
+        #     for k in ("equity", "portfolio_cash", "total_equity", "market_value")
+        #
+        # take-the-first-non-empty. But `load_account_profile()` does not
+        # return an `equity` key at all - equity lives on
+        # `load_portfolio_profile()`, a DIFFERENT endpoint. So the chain always
+        # fell through to the second entry, `portfolio_cash`, and the Real
+        # Portfolio tab displayed CASH under the heading "total portfolio
+        # value". Verified against the broker: cash 1859.94, holdings 144.21,
+        # true total 2004.15 - and 1859.94 is exactly what the UI showed.
+        #
+        # It reads plausibly (a little above buying power, moves day to day),
+        # which is why it survived: the number is wrong by exactly the value of
+        # the holdings, so it looks right whenever the book is nearly flat.
+        #
+        # Now: ask the portfolio endpoint for equity, and fall back to
+        # cash + market_value computed from it. Cash and holdings are returned
+        # separately too, so the UI can show the breakdown that makes the total
+        # checkable by eye rather than asking anyone to trust one figure.
+        cash = None
+        for k in ("portfolio_cash", "cash", "cash_available_for_withdrawal"):
             if profile.get(k) not in (None, ""):
-                out["portfolio_value"] = float(profile[k]); break
+                cash = float(profile[k]); break
+        out["cash"] = cash
+
+        pf = {}
+        try:
+            pf = rh.profiles.load_portfolio_profile(account_number=acct) or {}
+        except Exception as e:
+            # Non-fatal: the account profile already gave us cash, and
+            # holdings market value can be summed locally. Record why the
+            # authoritative figure is missing instead of silently degrading.
+            out["portfolio_read_note"] = f"portfolio profile unavailable ({type(e).__name__}: {e})"[:200]
+
+        holdings = None
+        for k in ("market_value", "extended_hours_market_value", "last_core_market_value"):
+            if pf.get(k) not in (None, ""):
+                holdings = float(pf[k]); break
+        out["holdings_value"] = holdings
+
+        total = None
+        for k in ("equity", "extended_hours_equity", "last_core_equity"):
+            if pf.get(k) not in (None, ""):
+                total = float(pf[k]); break
+        if total is None and cash is not None and holdings is not None:
+            total = cash + holdings
+        out["portfolio_value"] = total
     except Exception as e:
         # 2026-07-26: this was a bare `except Exception: read_ok = False`, and
         # that silence cost real debugging time. The account-number placeholder
@@ -697,6 +797,105 @@ async def robinhood_status():
         out["read_error"] = probe.get("read_error")
     else:
         out["read_error"] = "ROBINHOOD_USERNAME/ROBINHOOD_PASSWORD are not set in .env."
+    return out
+
+
+@app.get("/api/real/reconcile")
+async def reconcile_real_book():
+    """Compare the LOCAL real book against what the CONFIGURED account
+    actually holds at Robinhood.
+
+    Added 2026-07-26 after the audit turned up a concrete case. The Real
+    Portfolio tab showed four open positions worth $245.77 of market value,
+    sitting directly beneath an account-value figure for account ...3794. The
+    broker held three positions worth $144.21. The fourth, CLF, was bought in
+    the PRIMARY account - a different account entirely.
+
+    Nothing was corrupt; the schema simply cannot express the distinction. The
+    `positions` table has no account column (see its CREATE TABLE), and
+    engine/account_sync.py's own docstring records why that matters:
+    robin_stocks' build_holdings() takes no account_number and only ever sees
+    the primary individual account, so anything it imported was attributed to
+    whichever account happened to be configured at the time. Once
+    account.robinhood_account_number was pointed at the Agentic account, the
+    earlier import stayed behind and the two books silently merged.
+
+    The consequence is not cosmetic: every aggregate on that tab - market
+    value, unrealized P&L, invested cost, portfolio heat - sums across
+    accounts while the header reports one account's value, so the numbers
+    cannot be reconciled against any statement.
+
+    This endpoint does NOT mutate anything. Deciding what a mismatched row
+    means (moved account, sold elsewhere, never filled) needs a human, and
+    silently deleting position rows to make a total agree is how the original
+    problem is compounded rather than fixed. It classifies and reports; the UI
+    shows the remedy per row.
+    """
+    from datetime import datetime as _dt
+    cfg = _load_config()
+    db = Database()
+    local = db.get_all_positions(simulated=False)
+    out = {
+        "checked_at": _dt.utcnow().isoformat(),
+        "account_number": None, "broker_read_ok": False, "read_error": None,
+        "matched": [], "local_only": [], "broker_only": [],
+    }
+    try:
+        from engine import live_trader
+        from engine.account_sync import _fetch_remote_positions
+        acct = live_trader._account_number(cfg)
+        out["account_number"] = _mask_account(acct)
+        if not live_trader._login():
+            out["read_error"] = (live_trader._login_state.get("error")
+                                 or "Robinhood login failed")
+            return out
+        remote_raw = _fetch_remote_positions(live_trader._rh(), acct)
+        if remote_raw is None:
+            out["read_error"] = "Robinhood returned no position list for this account."
+            return out
+        out["broker_read_ok"] = True
+    except Exception as e:
+        out["read_error"] = f"{type(e).__name__}: {e}"[:300]
+        logging.getLogger(__name__).warning("real-book reconcile failed: %s", e)
+        return out
+
+    def _sym(r):
+        return (r.get("symbol") or r.get("ticker") or "").upper()
+
+    remote = {}
+    for r in remote_raw or []:
+        s = _sym(r)
+        if not s:
+            continue
+        try:
+            qty = float(r.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty > 0:
+            remote[s] = qty
+
+    seen = set()
+    for p in local:
+        s = (p.get("ticker") or "").upper()
+        seen.add(s)
+        lqty = float(p.get("shares") or 0)
+        if s in remote:
+            rqty = remote[s]
+            # Fractional shares make exact equality the wrong test.
+            same = abs(rqty - lqty) <= max(1e-4, abs(rqty) * 0.001)
+            (out["matched"] if same else out["local_only"]).append({
+                "ticker": s, "local_shares": lqty, "broker_shares": rqty,
+                "issue": None if same else "share_count_differs",
+            })
+        else:
+            out["local_only"].append({
+                "ticker": s, "local_shares": lqty, "broker_shares": 0.0,
+                "issue": "not_held_in_this_account",
+            })
+    for s, rqty in remote.items():
+        if s not in seen:
+            out["broker_only"].append({"ticker": s, "local_shares": 0.0, "broker_shares": rqty,
+                                        "issue": "held_at_broker_but_not_tracked"})
     return out
 
 
@@ -768,7 +967,15 @@ async def get_real_summary(live: bool = False):
         "read_error": None if connected else probe.get("read_error"),
         "buying_power": probe.get("buying_power"),
         "account_value": probe.get("portfolio_value"),
-        "account_number": probe.get("account_number"),
+        # Masked, for the same reason the Control tab's field is (2026-07-26,
+        # UI audit). This endpoint shipped the full number and the Real
+        # Portfolio panel printed it verbatim - which, once the Control tab
+        # started saying "the full number never leaves the server", made that
+        # statement false on the very next tab. Either both mask or neither
+        # claims to; masking is the side that survives a screenshot or a
+        # screen share. The last four are enough to answer the question the
+        # panel exists to answer: "which account am I looking at?"
+        "account_number": _mask_account(probe.get("account_number")),
         "account_source": probe.get("account_source"),
         "n_open": len(open_real),
         "open_positions": positions_out,
@@ -791,7 +998,9 @@ async def get_paper_equity_history(limit: int = 500):
 
 @app.get("/api/config")
 async def get_config():
-    return _load_config()
+    # Same redaction as the /ws + /api/state payload - this endpoint is
+    # reachable from the browser too, so it must not ship a raw ${VAR}.
+    return _redact_config_for_ui(_load_config())
 
 
 @app.post("/api/config")
@@ -835,8 +1044,20 @@ async def update_config(update: dict, _: bool = Depends(require_token)):
         cfg.setdefault("account", {})
         if "robinhood_account_number" in update["account"]:
             v = str(update["account"]["robinhood_account_number"] or "").strip()
-            if len(v) <= 30 and (v == "" or v.replace("-", "").isalnum()):
+            current = str(cfg["account"].get("robinhood_account_number") or "")
+            # Never let a blank overwrite a ${VAR} reference. The UI renders
+            # that state as a read-only "managed by .env" field, but a stale
+            # tab, a scripted PUT, or a future call site could still send the
+            # empty string _redact_config_for_ui() substitutes - and silently
+            # unlinking the account by round-tripping a redaction is exactly
+            # the failure this guard exists to make impossible.
+            if v == "" and _CFG_ENV_REF.match(current.strip()):
+                pass
+            elif len(v) <= 30 and (v == "" or v.replace("-", "").isalnum()):
                 cfg["account"]["robinhood_account_number"] = v
+        # Defence in depth: the redacted payload's descriptor key is display
+        # -only and must never reach config.yaml.
+        cfg["account"].pop("_account_number_source", None)
         if "auto_sync" in update["account"]:
             cfg["account"]["auto_sync"] = bool(update["account"]["auto_sync"])
     if "rotation" in update and isinstance(update["rotation"], dict):
@@ -944,6 +1165,12 @@ async def get_news(hours: int = 72, limit: int = 100, notable_only: bool = False
     }
 
 
+# Leading "YYYY-MM-DD HH:MM:SS,mmm" of a real log record. Continuation lines
+# of a multi-line record (traceback frames) do not match, which is the whole
+# point - see get_logs()'s sorting note.
+_LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[.,]\d{0,6})")
+
+
 @app.get("/api/logs")
 async def get_logs(lines: int = 300, level: str = None, source: str = None):
     """Tails output/logs/scheduler.log and output/logs/server.log (see
@@ -956,20 +1183,52 @@ async def get_logs(lines: int = 300, level: str = None, source: str = None):
     the final merged count) - e.g. lines=300 reads up to 300 from each of
     scheduler.log/server.log, then merges+sorts, so you may get up to 600
     entries back. `level`/`source` are optional client-side-style filters
-    applied after reading, so the UI can narrow down without re-fetching."""
+    applied after reading, so the UI can narrow down without re-fetching.
+
+    Sorting (fixed 2026-07-26, UI audit): this used to be
+    ``merged.sort(key=lambda e: e["raw"])`` - sort the WHOLE line
+    lexically, on the theory that asctime sorts correctly as a string. That
+    holds only for lines that BEGIN with a timestamp. A Python traceback's
+    continuation lines ("  File ...", "    ~~~~^^^", "RuntimeError: ...")
+    carry no timestamp at all, so they all sorted by their own text: every
+    traceback in the file was shredded, its frames scattered across the
+    feed and identical frames from different tracebacks stacked on top of
+    each other. The Logs tab showed six consecutive "~~~~~~~^^^" lines and
+    three bare "Traceback (most recent call last):" with no frames under
+    them - which is exactly what a reader needs when something crashed.
+
+    The fix carries the last seen timestamp forward within each source, so a
+    continuation line inherits the timestamp of the log record it belongs
+    to, and sorts on (timestamp, source, original position). Python's sort
+    is stable, so frames of one traceback stay in file order.
+    """
     sources = ["scheduler", "server"] if not source else [source]
     merged = []
     for proc in sources:
-        for raw in tail_log_lines(proc, max_lines=lines):
+        # Blank sorts before any real timestamp, so pre-first-record noise
+        # (a bare startup banner) stays at the top instead of at the end.
+        last_ts = ""
+        for seq, raw in enumerate(tail_log_lines(proc, max_lines=lines)):
             if not raw.strip():
                 continue
-            merged.append({"raw": raw, "source": proc})
-    merged.sort(key=lambda e: e["raw"])  # asctime's default format is lexically sortable
+            m = _LOG_TS_RE.match(raw)
+            if m:
+                last_ts = m.group(1)
+            merged.append({"raw": raw, "source": proc, "_ts": last_ts, "_seq": seq})
+    merged.sort(key=lambda e: (e["_ts"], e["source"], e["_seq"]))
 
     if level:
         level = level.upper()
-        merged = [e for e in merged if f" {level} " in e["raw"]]
+        # A traceback's continuation lines carry no level token of their own.
+        # Filtering them out orphans the "ERROR ...Traceback" header they
+        # belong to, so keep any line that inherited a kept record's
+        # timestamp-and-source group.
+        keep_groups = {(e["_ts"], e["source"]) for e in merged if f" {level} " in e["raw"]}
+        merged = [e for e in merged if (e["_ts"], e["source"]) in keep_groups]
 
+    for e in merged:
+        e.pop("_ts", None)
+        e.pop("_seq", None)
     return {"lines": merged, "log_dir_note": "output/logs/{scheduler,server}.log, rotated at 5MB x3"}
 
 
@@ -1760,7 +2019,16 @@ async def get_data_sources():
                 note = f"{fails} recent consecutive failure(s): {h.get('last_error') or ''}"
             else:
                 status = "OK"
-                note = f"Last success {h.get('last_success_at', '?')}"
+                # No timestamp baked into the prose. It used to read
+                # f"Last success {h['last_success_at']}", which put a raw
+                # naive-UTC ISO string on screen ("2026-07-26T12:58:29.638442")
+                # in a UI whose stated convention is that every timestamp goes
+                # through fmtCST() and is labelled CT - so this panel was the
+                # one place showing unconverted UTC with no zone label, the
+                # exact bug fmtCST() was written to fix. last_success_at is
+                # already returned as a structured field below; the client
+                # formats it.
+                note = ""
         out.append({
             "name": name, "kind": kind, "role": role, "optional": optional,
             "status": status, "note": note,

@@ -22,6 +22,294 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [3.1] — v3.1.0 — 2026-07-26
+
+### Decision function: UNCHANGED — presentation, monitoring and one data-layer fix
+
+`scripts/classify_change.py` reports MINOR and this ships as **minor**. Worth
+recording why, since the scope invites a major bump: the diff touches
+`main.py`, `server.py` and `storage/database.py` (all BEHAVIOUR_PATHS), adds
+four columns and two endpoints, and re-themes the entire UI — but no file in
+`DECISION_PATHS`, no `migrations/`, and no decision-relevant `config.yaml` key.
+Scoring, sizing, exits and vetoes are byte-identical.
+
+That distinction is the whole point of this project's versioning rule. A major
+bump asserts that trade history either side of it was produced by different
+strategies and must not be pooled. Claiming that here — on a release whose
+largest change is a colour palette — would corrupt every future comparison
+against v3.0.0 data for no reason. Size of diff is not the criterion; movement
+of the decision function is.
+
+Nothing in this entry alters how market data maps to a buy, a size, or an exit.
+`rules/`, `engine/` scoring and the exit path are untouched, so trade history
+from v3.0.0 pools with this. What changed is what the UI *says* about that
+mapping, plus one storage-layer bug that had silently disabled a monitoring
+panel.
+
+Prompted by a full click-through audit of every tab in both books
+(2026-07-26). Grouped by severity rather than by file, because the severity is
+the point.
+
+#### Fixed — the UI stated things that were not true
+
+- **`storage/database.py`: `get_source_health()` always returned `[]` on
+  Postgres.** `_PGCursorWrapper` implemented `fetchone`/`fetchall`/`rowcount`/
+  `lastrowid` but not `description`, and this was the tree's only
+  `cur.description` caller. The resulting `AttributeError` was swallowed by a
+  bare `except Exception: return []` annotated "table not created yet", so
+  after the v3.0 Postgres migration the Monitor tab reported **NO DATA YET for
+  all 14 data sources, permanently**, with nothing in the logs. A monitoring
+  panel that cannot report a problem is read as "no problem". The property is
+  implemented, the reader no longer depends on it, and the `except` is narrowed
+  to the condition it claimed to handle.
+- **`server.py`: `/api/logs` destroyed every traceback.** Lines were sorted by
+  their whole text (`merged.sort(key=lambda e: e["raw"])`) on the assumption
+  that asctime sorts lexically — true only for lines that *begin* with a
+  timestamp. Traceback frames carry none, so they sorted by their own text:
+  identical frames from unrelated failures stacked together and
+  `Traceback (most recent call last):` appeared with no frames beneath it. Now
+  carries the last-seen timestamp forward per source and sorts on
+  `(ts, source, position)`; level filtering keeps a kept record's continuation
+  lines instead of orphaning them.
+- **`${RH_ACCOUNT_NUMBER}` was rendered into the Control tab as if it were an
+  account number.** `/api/state` ships raw YAML by design (the server also
+  writes that file, and an expanded tree would bake a secret into a versioned
+  one). New `_redact_config_for_ui()` converts a `${VAR}` reference into a
+  descriptor — variable name, whether it resolves, and a masked tail — and the
+  UI renders a read-only "managed by .env" field. `POST /api/config` now
+  refuses to overwrite a `${VAR}` reference with an empty string, so a stale
+  tab cannot silently unlink the account.
+- **Signals showed `HOLD` for tickers that were never scored.** During the
+  audit all 42 rows of a scan read `HOLD`; every one had been vetoed before
+  scoring ran (weekend-stale quotes). Expanding a row said so; the column the
+  table is scanned by did not. New `VETOED` and `HOLDING` pills, driven by a
+  single `isVetoed()` predicate shared with the Dashboard.
+- **A sentinel leaked as fact:** `hours_to_next_macro: 999.0` rendered as
+  "999.0h to next macro event" — a fabricated 41-day countdown. Now "none
+  scheduled".
+- **Copy that contradicted the code.** The sidebar strapline
+  ("Decision support - no auto orders"), the Control tab description ("No order
+  is ever placed from here"), the Watch/Execute help ("orders are placed there
+  (never from this app)") and the Positions panel ("this UI can't place or
+  confirm trades itself") all predate `engine/live_trader.py` and were false.
+  The strapline is now derived live from the real gates. Also reconciled: the
+  Risk tab's heat caption and its tooltip named different denominators, and
+  "6-bucket" vs "7-bucket" scoring disagreed across three strings.
+- Two `var()` references to CSS tokens that were never defined
+  (`--text-muted`, `--bg-subtle`), and unguarded `b.weight` / `b.min_pct`
+  arithmetic that could print `NaN pts`.
+- **`main.py --ui` ignored `TP_UI_PORT`.** It bound 8080 unconditionally *and*
+  passed `port=8080` to `_free_ui_port()`, whose job is to kill whatever holds
+  that port — while `scripts/tp` assigns every installed version its own port
+  and `scripts/services.py` honours it. `tp run <tag> --ui` would therefore
+  kill the PRIMARY version's UI and take 8080 for itself: the exact
+  cross-version collision the version manager exists to prevent, arriving
+  through the one launcher that ignored the mechanism. Quiet from the
+  browser's side too — `localhost:8080` keeps serving *a* UI, just a different
+  version's.
+- The Data Sources panel printed raw naive-UTC ISO strings
+  (`2026-07-26T12:58:29.638442`) because the note was pre-formatted
+  server-side. It was the only surface bypassing `fmtCST()`, which exists
+  precisely to stop unconverted, unlabelled UTC reaching the screen.
+- The Real Portfolio panel printed the **full** Robinhood account number, which
+  made the Control tab's new "the full number never leaves the server"
+  statement false on the very next tab. Both now go through one
+  `_mask_account()` helper.
+- `REAL_APPROXIMATE` had no entry in `STATUS_PILL`, so it fell through to a
+  bare `pill` class with no background or colour and rendered as unstyled text
+  in a column of coloured pills — and the legend above the table did not
+  mention it. One rule in 49 carries it, which is why it went unnoticed. The
+  legend is now generated from the same map, so a new status cannot appear
+  without one.
+- The veto banner said "18 of 20 tickers" directly beneath a banner reporting
+  43 tickers scanned: `recent_signals` is capped at 20 server-side. It now
+  names the sample as a sample.
+
+#### Fixed — the Real Portfolio tab reported the wrong money
+
+Three separate problems, all found by Trinath reading the numbers and noticing
+they did not add up. Each was individually plausible on screen, which is why
+none had been caught.
+
+- **"Total portfolio value" was actually portfolio CASH.**
+  `_robinhood_account_probe()` resolved it through a first-non-empty chain,
+  `("equity", "portfolio_cash", "total_equity", "market_value")` — but
+  `load_account_profile()` has no `equity` key at all; equity lives on
+  `load_portfolio_profile()`, a different endpoint. The chain therefore always
+  fell through to `portfolio_cash`. Verified against the broker: cash
+  $1,859.94, holdings $144.21, true total $2,004.15 — and $1,859.94 is exactly
+  what the tab displayed. The error equals the value of the holdings, so it
+  looks correct whenever the book is nearly flat. Now reads equity from the
+  portfolio endpoint, falls back to cash + market value, and returns `cash`
+  and `holdings_value` separately so the headline is checkable by eye.
+
+- **The real book merges positions across Robinhood accounts.** The tab showed
+  four positions worth $245.77 under an account-value figure for account
+  ...3794; that account holds three, worth $144.21. The fourth (CLF) was
+  bought in the PRIMARY account. Nothing is corrupt — the schema cannot
+  express the distinction: `positions` has no account column, and
+  `engine/account_sync.py`'s own docstring records that robin_stocks'
+  `build_holdings()` takes no `account_number` and only ever sees the primary
+  account. So every aggregate on the tab — market value, unrealized P&L,
+  invested cost, portfolio heat — sums across accounts while the header
+  reports one account's value.
+
+  New `GET /api/real/reconcile` and a Broker Reconciliation panel compare the
+  local book against the configured account and classify each disagreement
+  (`not_held_in_this_account`, `share_count_differs`,
+  `held_at_broker_but_not_tracked`) with the remedy for each. **It reports
+  only — it mutates nothing.** Deciding what a mismatched row means needs a
+  human, and deleting position rows to make a total agree would compound the
+  original fault rather than fix it. The value panel also warns when the
+  broker's holdings figure and the locally-summed market value diverge.
+
+- **All-Time Realized could not be audited.** `-$369.91` on a book whose
+  ledger holds six real trades and exactly one completed round trip (a
+  four-minute VZ buy/sell) is not a number anyone should act on. It is
+  `SUM(daily_stats.realized_pnl)` over every row ever written — an accumulator
+  spanning earlier versions, with no drill-down. The card now recomputes the
+  total from the closed round trips in the ledger and states plainly whether
+  the two agree, so it either earns trust or visibly fails to. It is also
+  explicitly labelled *real book only* (paper P&L lives in the separate
+  `paper_realized_pnl` column and always did — that separation was correct;
+  the auditability was not).
+
+#### Fixed — `close_position()` destroyed its own evidence
+
+Chasing the −$369.91 found the root cause, and it is a data-integrity bug
+rather than a display one.
+
+`close_position()` computed `pnl = (exit_price - entry_price) * shares`, added
+it to `daily_stats`, and then **discarded every input**. The position row
+recorded `status='closed'` and nothing else — no exit price, no exit time, no
+stored P&L. The paper book survived this because `paper_trades` logs each
+simulated sell; the real book had no equivalent, so a real close left a flag on
+one table and a number in a daily accumulator with nothing connecting them.
+
+That is why the figure could not be investigated: not because the evidence was
+hidden, but because it was never written. An audit query written against
+`positions.exit_price` failed with "column does not exist", which was the
+finding.
+
+- `positions` gains `exit_price`, `exit_time`, `realized_pnl` and `closed_by`.
+  NULL on pre-existing rows, which is itself the signal — those are exactly the
+  closes that cannot be audited.
+- **`close_position()` now refuses a non-positive `exit_price`.** It used to
+  accept `0`/`None` and compute `(0 - entry) * shares == -cost`, booking an
+  entire cost basis as a realized loss. That is the single most plausible way a
+  small book records a large negative number, and it is always a bug — a real
+  fill has a real price.
+- The closing `UPDATE` was scoped by `ticker + status`, while the `SELECT`
+  above it deliberately took only the newest row (`ORDER BY id DESC LIMIT 1`).
+  The two disagreed, so a duplicate open row in the same ticker would be
+  silently closed with no P&L recorded for it. Now scoped by `id`.
+
+`scripts/audit_realized_pnl.sql` traces any realized-P&L figure back to the
+positions that produced it. `scripts/cleanup_test_pnl.sql` clears the
+2026-07-24 test-session accumulator — backing the original values up to
+`daily_stats_pnl_backup` first, zeroing only the two accumulator columns for
+that one date, and deleting no trade, position or history row.
+
+#### Fixed — behaviour
+
+- **Reload keeps your place.** There was no route: every tab lived at `/` and
+  `boot()` ended in a hardcoded `showTab("dashboard")`, so reload, restore-session
+  and the back button all landed on the Dashboard. Now a hash route
+  (`#tab`, or `#tab/book` for the three book-aware tabs), with a topbar
+  **Refresh** that re-pulls state and re-renders in place.
+- WebSocket used a hardcoded `ws://` — blocked as mixed content on any https
+  deployment, silently killing live updates. Now scheme-aware.
+- The 30-second ping `setInterval` was registered inside `connect()`, which is
+  also the reconnect path, so every drop leaked another timer.
+- Learning tab called `summary.profit_factor.toFixed(2)` where the Performance
+  tab uses `fmtRatio()` — `profit_factor` is legitimately null until the book
+  has a loss, so that panel threw as soon as there were wins and no losses.
+- `toast()` was called with four kinds (`success`/`error`/`alert`/`info`) and
+  only two were styled; warnings and errors were visually identical grey boxes.
+  All four now styled, aliases normalised, errors persist longer.
+
+#### Added — values the server computed and the UI never showed
+
+A field-by-field diff of every API payload against the UI found several
+computed values with zero references in `index.html`. New **Execution Posture**
+panel on Control surfaces them as one AND-ed verdict:
+`live_trading_armed`, `execution_path` (who actually submits the order),
+**`orders_breaker_open`** (when open, real orders are silently skipped —
+previously invisible), `read_ok`, and the backtest `validation` receipt.
+Monitor now shows `kill_reason` and the running `pid`.
+
+Also new: a Dashboard banner explaining *why* a scan produced no buy signals
+when vetoes dominate the batch — "42 of 42 vetoed before scoring ran" is a
+different fact from "nothing qualified", and the UI could not previously tell
+them apart.
+
+#### Removed — redundancy
+
+- **Chart.js** was fetched from a CDN on every page load and never used: the
+  file contained exactly one occurrence of the string "Chart", the script tag
+  itself. The one chart is hand-rolled SVG. (~200 KB and a third-party round
+  trip on every load of a local-first dashboard.)
+- The Learning tab's three-metric strip was a byte-for-byte duplicate of the
+  Performance tab's, reading the same endpoint — and was the copy with the
+  null-handling bug. Replaced with a pointer.
+- Dashboard "Market Pulse" and News "Market Mood" were two renderers of
+  overlapping data that had already drifted: the Dashboard, whose job is the
+  at-a-glance summary, was the one missing the regime — while the regime pill
+  sat directly above it. Now one shared `marketMoodPanel()`.
+- Positions' "Manage a fill" panel (about `confirm_fill.py`, real book only)
+  rendered in the Paper view too; empty states described both books at once.
+
+#### Changed — theme: "indigo on warm paper"
+
+The first pass ported Robinhood's palette fairly literally. Trinath's read was
+that the reference was right but the result was too close to a replica, and
+that the *text* tone specifically should differentiate it. Second pass:
+
+- **Indigo owns interaction; green and red own money.** Robinhood uses one
+  green for both "selected" and "made money", which works in an app showing one
+  number at a time and actively hurts in a dense table where a green nav item,
+  a green primary button and a green P&L cell compete for the same meaning.
+  Active nav, primary buttons, focus rings and links are now `#4338CA`; gain and
+  loss keep green/red and nothing else does.
+- **Warm surfaces** (`#FDFDFC` page, `#F5F4F1` fills) instead of white and
+  blue-grey — a paper cast that is the most immediately distinguishing choice
+  on the page and easier over long sessions.
+- **Warm near-black text** (`#1C1B1A`) on a warm slate ramp, rather than the
+  cool blue-black most fintech UIs use. This was the specific request: text
+  tone carries most of a UI's character because it is everywhere.
+- Gain/loss remain semantic and contrast-corrected for the 10px table figures
+  this UI is full of. Being novel about those colours costs comprehension.
+
+Every colour is a token; the ~24 hardcoded hexes scattered through the rules
+are gone. Strategy's 2,700-character intro paragraph moved behind a disclosure;
+long prose capped to a readable measure; mobile breakpoint added.
+
+#### Changed — filter row
+
+Two complaints with one cause: the row was a permanent full-width band of
+bordered boxes under every header, so on a table like Signals it drew a second,
+competing header of empty form controls above the data. Native `<select>`
+elements made it worse — OS-drawn arrows at the OS's own height, which no amount
+of surrounding styling can bring into line.
+
+- Controls are borderless on the row's own tint and resolve into a bordered
+  field only on hover or focus, so an unused filter reads as quiet placeholder
+  text and the active one is unmistakable.
+- Native select arrow replaced with an inline SVG chevron; heights pinned so
+  text inputs and selects agree.
+- A filter that is actually filtering keeps a tinted, accent-bordered state at
+  rest — previously the only way to spot one was to scan a dozen identical
+  boxes for stray text, so a table that looked empty because of a forgotten
+  filter in an off-screen column was indistinguishable from one with no data.
+- Active filters now render as removable chips naming their column, with a
+  "N of M rows" count and "Clear all".
+
+#### Added — tests
+
+`tests/ui/` boots the real `ui/index.html` in jsdom against captured payloads.
+`run.js` renders all 13 tabs × 2 books; `assert.js` carries 31 named
+assertions. The file had no test of any kind before this.
+
 ## [3.0] — v3.0.0 — 2026-07-26
 
 ### Decision function: CHANGED — re-validation required before arming live
