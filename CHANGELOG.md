@@ -22,6 +22,61 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [3.1.1] — v3.1.1 — 2026-07-26
+
+### Decision function: UNCHANGED — service management only
+
+`scripts/classify_change.py` reports PATCH and this ships as **patch**.
+`scripts/services.py` is in neither `DECISION_PATHS` nor `BEHAVIOUR_PATHS`: it
+installs and supervises processes and has no part in scoring, sizing or exits.
+Nothing about the strategy moved, and no runtime code changed — only the
+scripts that start it.
+
+#### Fixed — `service.sh restart` could take the UI down and leave it down
+
+Found while deploying v3.1.0, which is the only way it could have been found.
+
+- **`_free_ui_port()` ran before knowing a replacement could start.** It fires
+  on `install`/`start`/`restart`, but only `install` writes a plist. On a
+  machine where the `ui` service had never been installed, `restart` killed the
+  process holding port 8080 and *then* discovered it had no plist to bootstrap:
+
+  ```
+  restart ui
+    port 8080 still held by a previous UI process (PID 64255) - terminating it
+    ERROR: no plist at .../com.tradingplatform.ui.plist
+  ```
+
+  A working UI destroyed to make room for one that could never start — the net
+  effect of `restart` was to take the UI down. The port is now freed only when
+  the service is actually installed.
+
+- **`LaunchdManager.start()` bootstrapped a plist it never checked existed**,
+  and `check=True` rendered every launchd failure as a `CalledProcessError`
+  traceback through `subprocess.run` — the least informative possible form of
+  "your service is already registered". It now diagnoses: missing plist,
+  explicitly disabled label (via `launchctl print-disabled`), or a plist naming
+  an interpreter that no longer exists — which is exactly what a version switch
+  produces, since `_commands()` bakes `sys.executable` into the plist at install
+  time, so an install under a venv and a restart under anaconda disagree.
+
+  launchd's exit 5 is `EIO` and covers several unrelated conditions, so an
+  unconditional `bootout` plus a single retry now clears the common one: bootout
+  is asynchronous, so `launchctl print` can report "not loaded" while the job is
+  still tearing down. That is the case that produced the original report —
+  `not running:` immediately followed by `Bootstrap failed: 5`.
+
+  It also suppresses launchd's own "try re-running the command as root" advice,
+  which is wrong here: this is the `gui/$UID` domain, and root is a different
+  one entirely.
+
+- `SystemdManager.start()` had the identical `check=True` failure mode and now
+  matches, so both platforms fail the same way. New
+  `ServiceManager.is_installed()` keeps `main()` from reaching for
+  `plist_path()`, which exists only on the launchd manager and would have
+  raised `AttributeError` on Linux and Windows — trading a macOS bug for a
+  portability one.
+
 ## [3.1] — v3.1.0 — 2026-07-26
 
 ### Decision function: UNCHANGED — presentation, monitoring and one data-layer fix
@@ -307,7 +362,7 @@ of surrounding styling can bring into line.
 #### Added — tests
 
 `tests/ui/` boots the real `ui/index.html` in jsdom against captured payloads.
-`run.js` renders all 13 tabs × 2 books; `assert.js` carries 31 named
+`run.js` renders all 13 tabs × 2 books; `assert.js` carries 42 named
 assertions. The file had no test of any kind before this.
 
 ## [3.0] — v3.0.0 — 2026-07-26

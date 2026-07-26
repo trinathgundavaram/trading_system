@@ -254,6 +254,22 @@ class ServiceManager:
     def install(self, name: str, cmd: list, env: dict, workdir: Path, log_path: Path) -> None:
         raise NotImplementedError
 
+    def is_installed(self, name: str) -> bool:
+        """Has `install` been run for this service on this machine?
+
+        Added 2026-07-26 so main() can ask the question without reaching for a
+        manager-specific attribute. The first cut of that check called
+        `mgr.plist_path(name)` directly, which exists only on LaunchdManager
+        and would have raised AttributeError on Linux and Windows - trading a
+        macOS bug for a portability one.
+
+        Defaults to True: a manager that cannot answer cheaply should not
+        block an operation that used to proceed. The check exists to prevent a
+        destructive step (killing the port holder) when we already KNOW the
+        replacement cannot start, not to add a new precondition.
+        """
+        return True
+
     def uninstall(self, name: str) -> None:
         raise NotImplementedError
 
@@ -284,6 +300,9 @@ class LaunchdManager(ServiceManager):
 
     def plist_path(self, name: str) -> Path:
         return self.agents_dir / f"{self.label(name)}.plist"
+
+    def is_installed(self, name: str) -> bool:
+        return self.plist_path(name).exists()
 
     def _domain(self, name: str) -> str:
         return f"gui/{os.getuid()}/{self.label(name)}"
@@ -371,17 +390,120 @@ class LaunchdManager(ServiceManager):
         return False
 
     def start(self, name):
+        """Bootstrap the agent, and DIAGNOSE the failure rather than raising.
+
+        2026-07-26. `./service.sh restart` produced this, verbatim:
+
+            restart scheduler
+              not running: com.tradingplatform.scheduler
+            Bootstrap failed: 5: Input/output error
+            Try re-running the command as root for richer errors.
+            Traceback (most recent call last):
+              ...
+            subprocess.CalledProcessError: Command '['launchctl',
+            'bootstrap', 'gui/501', '.../com.tradingplatform.scheduler.plist']'
+            returned non-zero exit status 5
+
+        Three separate faults conspired there, and all three are fixed here.
+
+        1. `start()` bootstraps a plist it never checks exists. Only
+           `install()` writes one. So `start`/`restart` on a machine that has
+           never run `install` - or whose plist was removed, or was written by
+           a DIFFERENT python than the one now running (`_commands()` uses
+           `sys.executable`, so an install under a venv and a restart under
+           anaconda disagree) - fails in launchd rather than here, where the
+           reason is known.
+
+        2. launchd's exit 5 is `EIO`, which it uses for several unrelated
+           conditions. The two that actually happen: the label is still
+           registered (bootout is asynchronous - see BOOTOUT_TIMEOUT_S above -
+           and `launchctl print` can report "not loaded" while the job is mid
+           -teardown), or the label has been explicitly disabled, in which
+           case bootstrap refuses forever and no amount of retrying helps.
+           Telling them apart takes one extra command; guessing does not work.
+
+        3. `check=True` converted all of that into a Python traceback ending in
+           CalledProcessError. A stack trace through subprocess.run is the
+           least informative possible rendering of "your service is already
+           registered" - and launchd's own advice, "try re-running as root",
+           is actively wrong here: this is a gui/$UID domain, and running it as
+           root targets a different domain entirely.
+        """
+        plist = self.plist_path(name)
+        if not plist.exists():
+            print(f"  ERROR: no plist at {plist}")
+            print(f"         `start` bootstraps an existing plist; only `install` writes one.")
+            print(f"         Fix: ./service.sh install {name}")
+            return
+
         if self._is_loaded(name):
             subprocess.run(["launchctl", "bootout", self._domain(name)],
                            capture_output=True)
-            if not self._wait_until_gone(name):
-                print(f"  WARNING: {self.label(name)} was still loaded "
-                      f"{self.BOOTOUT_TIMEOUT_S:.0f}s after bootout; bootstrapping "
-                      f"anyway, and 'Bootstrap failed: 5' below means it had not "
-                      f"finished exiting. Re-run `./service.sh start` in a moment.")
-        subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}",
-                        str(self.plist_path(name))], check=True)
-        print(f"  started {self.label(name)}")
+            self._wait_until_gone(name)
+
+        r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f"  started {self.label(name)}")
+            return
+
+        # Exit 5 with the job not visibly loaded is nearly always a teardown
+        # that had not finished. Retry once, after boot-ing out unconditionally
+        # this time - which is safe whether or not anything is there.
+        if r.returncode == 5:
+            subprocess.run(["launchctl", "bootout", self._domain(name)],
+                           capture_output=True)
+            self._wait_until_gone(name)
+            r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                print(f"  started {self.label(name)} (after clearing a stale registration)")
+                return
+
+        self._explain_bootstrap_failure(name, plist, r)
+
+    def _explain_bootstrap_failure(self, name, plist, r):
+        """Turn a launchctl exit code into something actionable."""
+        label = self.label(name)
+        err = (r.stderr or r.stdout or "").strip()
+        print(f"  ERROR: could not start {label} (launchctl exit {r.returncode})")
+        if err:
+            print(f"         launchctl said: {err}")
+
+        # Explicitly disabled labels survive reboots and ignore bootstrap.
+        disabled = subprocess.run(["launchctl", "print-disabled", f"gui/{os.getuid()}"],
+                                  capture_output=True, text=True).stdout
+        if f'"{label}" => disabled' in disabled or f'"{label}" => true' in disabled:
+            print(f"         {label} is DISABLED in this domain, which is why bootstrap")
+            print(f"         refuses. Re-enable it:")
+            print(f"           launchctl enable gui/{os.getuid()}/{label}")
+            print(f"           ./service.sh start {name}")
+            return
+
+        # A plist naming an interpreter that no longer exists is the other
+        # common cause, and the one a version switch creates: _commands() bakes
+        # sys.executable into the plist at install time.
+        try:
+            import plistlib
+            with open(plist, "rb") as fh:
+                prog = (plistlib.load(fh).get("ProgramArguments") or [None])[0]
+            if prog and not Path(prog).exists():
+                print(f"         The plist runs {prog}, which does not exist.")
+                print(f"         It was written by a different interpreter than the one")
+                print(f"         running now ({sys.executable}). Rewrite it:")
+                print(f"           ./service.sh install {name}")
+                return
+        except Exception as e:
+            print(f"         (could not parse {plist}: {type(e).__name__}: {e})")
+            print(f"         A malformed plist also produces exit 5. Rewrite it:")
+            print(f"           ./service.sh install {name}")
+            return
+
+        print(f"         Most likely a stale registration. In order:")
+        print(f"           launchctl bootout gui/{os.getuid()}/{label}")
+        print(f"           ./service.sh install {name}")
+        print(f"         Note: launchd's own 'try as root' advice does not apply -")
+        print(f"         this is the gui/{os.getuid()} domain, and root is a different one.")
 
     def stop(self, name):
         r = subprocess.run(["launchctl", "bootout", self._domain(name)],
@@ -427,6 +549,9 @@ class SystemdManager(ServiceManager):
 
     def unit(self, name: str) -> str:
         return f"tp-{name}{self.suffix}.service"
+
+    def is_installed(self, name: str) -> bool:
+        return (self.unit_dir / self.unit(name)).exists()
 
     def _systemctl(self, *args, check=False):
         return subprocess.run(["systemctl", "--user", *args],
@@ -489,7 +614,23 @@ WantedBy=default.target
                   f"          sudo loginctl enable-linger {user}")
 
     def start(self, name):
-        self._systemctl("enable", "--now", self.unit(name), check=True)
+        # Same guard the launchd path grew on 2026-07-26: `start` enables a
+        # unit it does not write (only `install` writes one), so on a machine
+        # that has never installed, check=True turned "no unit file" into a
+        # CalledProcessError traceback. Kept in step with LaunchdManager.start
+        # so the two platforms fail the same way.
+        if not self.is_installed(name):
+            print(f"  ERROR: no unit file at {self.unit_dir / self.unit(name)}")
+            print(f"         `start` enables an existing unit; only `install` writes one.")
+            print(f"         Fix: ./service.sh install {name}")
+            return
+        r = self._systemctl("enable", "--now", self.unit(name))
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            print(f"  ERROR: could not start {self.unit(name)} (systemctl exit {r.returncode})")
+            if err:
+                print(f"         systemctl said: {err}")
+            return
         print(f"  started {self.unit(name)}")
 
     def stop(self, name):
@@ -644,11 +785,32 @@ def main(argv=None) -> int:
         # Runs on install/start/restart because all three end with mgr.start(),
         # and the stale holder is just as fatal in each case. It is a no-op when
         # the port is free, which is the normal path.
+        #
+        # BUT ONLY IF A REPLACEMENT CAN ACTUALLY START (2026-07-26). This block
+        # used to run unconditionally, and killing the port holder is
+        # destructive while `start` may not be able to follow through. Observed
+        # exactly once, which was enough:
+        #
+        #     restart ui
+        #       not running: com.tradingplatform.ui
+        #       port 8080 still held by a previous UI process (PID 64255) - terminating it
+        #       ERROR: no plist at .../com.tradingplatform.ui.plist
+        #
+        # A working UI was killed to make room for one that could never be
+        # bootstrapped, and the net effect of `restart` was to take the UI down.
+        # `install` writes the plist itself so it is always safe; `start` and
+        # `restart` are only safe once one exists. Check first, and say so.
         if name == "ui" and args.action in ("install", "start", "restart"):
-            if args.action == "restart":
-                mgr.stop(name)          # stop first, so the port is usually
+            can_start = args.action == "install" or mgr.is_installed(name)
+            if not can_start:
+                print(f"  refusing to free port {UI_PORT}: {name} is not installed,")
+                print(f"  so nothing could take the port afterwards. Leaving the current")
+                print(f"  process alone. Fix: ./service.sh install {name}")
+            else:
+                if args.action == "restart":
+                    mgr.stop(name)      # stop first, so the port is usually
                                         # already free by the time we look
-            _free_ui_port()
+                _free_ui_port()
 
         if args.action == "install":
             mgr.install(name, cmds[name], env, REPO_DIR, _log_path(name))
