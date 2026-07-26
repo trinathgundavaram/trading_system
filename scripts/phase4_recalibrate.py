@@ -243,6 +243,34 @@ def cmd_assess(args) -> int:
                 f"from that. This is what migrations/012's FK exists to keep "
                 f"honest - see scripts/rehearse_cutover.py.")
 
+    # exit_kind coverage (§50). This tool already SELECTs exit_kind into every
+    # sample it loads, which makes it the first real consumer and therefore the
+    # first place a partial sample could be mistaken for a complete one. §20's
+    # outcome distribution is the specific risk: grouping by exit_kind over a
+    # sample where half the rows are NULL produces a breakdown that looks like
+    # the strategy and is actually a description of which exits happened to be
+    # classifiable.
+    try:
+        cov = Database().get_exit_kind_coverage()
+        print(f"  {cov['label']}")
+        if cov["total"] and cov["missing"]:
+            top = ", ".join(f"{r['exit_reason'][:38]} x{r['n']}"
+                            for r in cov["unclassified_reasons"][:3])
+            print(f"  unclassified exit_reasons   {top}")
+        # Not a blocking problem below 100%: §19's weights come from features
+        # and outcomes, neither of which needs exit_kind. It becomes blocking
+        # only for a breakdown that GROUPs by it, so the number is printed
+        # unconditionally and the caveat travels with it.
+        if cov["pct"] is not None and cov["pct"] < 50:
+            problems.append(
+                f"exit_kind covers only {cov['pct']:.0f}% of closed patterns "
+                f"({cov['structured']}/{cov['total']}). §20's outcome "
+                f"distribution may group by it; a minority sample is not a "
+                f"random subset of exits, so any such breakdown would be "
+                f"biased toward whichever exits were classifiable.")
+    except Exception as e:
+        print(f"  exit_kind coverage          unreadable ({e})")
+
     feats = {}
     for p in pats:
         for k, v in p["features"].items():
@@ -367,8 +395,59 @@ def cmd_propose(args) -> int:
     except Exception as e:
         tiers = {"refused": f"excursion table unreadable: {e}"}
 
+    # ── Model identity (2026-07-26, review follow-up) ───────────────────────
+    #
+    # A proposal file used to carry a timestamp and nothing else identifying.
+    # Two of them from either side of a §19 weight change are structurally
+    # identical documents describing DIFFERENT MODELS, and the only way to tell
+    # was the filename - which defaults to the same path every run and is
+    # therefore overwritten.
+    #
+    # That is the "later notebooks mix pre- and post-Phase-3 EV curves" failure
+    # exactly. It does not announce itself: pooling two EV curves produces a
+    # curve, and a plausible one. The fields below make the two provably
+    # different objects rather than two runs of the same one.
+    #
+    #   config_fingerprint - the same hash pattern_database stamps on every
+    #     row (§17). Two proposals with different fingerprints were fitted on
+    #     samples produced by different strategies and must not be compared.
+    #   app_version - which build produced the proposal. (storage/version.py
+    #     exposes only this one; add_pattern writes it into BOTH the
+    #     app_version and engine_version columns, so there is no separate
+    #     engine version to record here.)
+    #   feature_schema - which encoding the SAMPLE rows carry. A sample of
+    #     schema-1 rows has constant adx/cmf/sector-RS, so any weight derived
+    #     for those features is a statement about the recording gap, not the
+    #     market. See learning/pattern_database.py's FEATURE_SCHEMA_VERSION.
+    #   exit_kind_coverage - so a §20 distribution can never be read without
+    #     the denominator it was computed over.
+    try:
+        from learning.pattern_database import (FEATURE_SCHEMA_VERSION,
+                                               config_fingerprint)
+        from storage.version import app_version
+        _schemas = sorted({int((p.get("features") or {}).get("feature_schema") or 1)
+                           for p in pats})
+        model_id = {
+            "config_fingerprint": config_fingerprint(s["config"]),
+            "app_version": app_version(),
+            "writer_feature_schema": FEATURE_SCHEMA_VERSION,
+            "sample_feature_schemas": _schemas,
+            "mixed_feature_schema": len(_schemas) > 1,
+        }
+    except Exception as e:      # never block a proposal on its own provenance
+        model_id = {"unavailable": str(e)}
+
+    try:
+        model_id["exit_kind_coverage"] = Database().get_exit_kind_coverage()
+    except Exception as e:
+        model_id["exit_kind_coverage"] = {"unavailable": str(e)}
+
     proposal = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # Compare this block before comparing anything below it. Two proposals
+        # whose model_id differs are different models, not two measurements of
+        # one.
+        "model_id": model_id,
         "sample": {
             "n_patterns": len(pats),
             "span_days": span_days(pats),
@@ -395,6 +474,17 @@ def cmd_propose(args) -> int:
     print(BANNER)
     print(f"  PROPOSAL from {len(pats)} patterns over {span_days(pats)} days")
     print(BANNER)
+    print(f"  model_id.config_fingerprint  {model_id.get('config_fingerprint', '?')}")
+    cov = model_id.get("exit_kind_coverage") or {}
+    if cov.get("label"):
+        print(f"  {cov['label']}")
+    if model_id.get("mixed_feature_schema"):
+        print("  WARNING: this sample mixes feature schemas "
+              f"{model_id.get('sample_feature_schemas')}. Rows on the older "
+              "schema carry constant adx/cmf/sector-RS, so a weight derived "
+              "for those features describes the recording gap rather than the "
+              "market - see learning/pattern_database.py's "
+              "FEATURE_SCHEMA_VERSION.")
     if not weights:
         print("  §19: NO feature earned a weight. Every candidate was constant,")
         print("       degenerate, or too thin. This is a finding about the")

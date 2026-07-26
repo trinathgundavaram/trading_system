@@ -3979,6 +3979,77 @@ class Database:
                 f"analysis rather than wrong in it.")
             return False
 
+    def get_exit_kind_coverage(self, mode: str = None, since: str = None) -> dict:
+        """How many closed patterns carry a countable `exit_kind`, and how many
+        exist at all. Every consumer of exit_kind must show this beside its
+        results (§50).
+
+        WHY THIS IS MANDATORY RATHER THAN NICE. `exit_kind` is NULL wherever
+        the exit could not be classified - see rules/common.py's classify_exit,
+        which returns None rather than guessing, on the correct principle that
+        a wrong kind is worse than a missing one. That means every GROUP BY
+        exit_kind silently analyses a SUBSET, and the result looks exactly like
+        a complete one. "trailing_stop: 60%" reads as a fact about the strategy
+        when it may be a fact about 12 of 68 trades.
+
+        A NOTE ON WHAT THE GAP ACTUALLY IS, because it is easy to get backwards.
+        The gap is HISTORICAL, not a pending producer. Every live producer now
+        emits a structured kind natively: rules/sell_rules.py carries
+        `exit_kind` on its SellResult and every triggered hard check supplies
+        one (§D); Loop B goes through exit_kind_for_loop_b_label; the price
+        watch, rotation, time stops and manual confirms all pass fixed literals.
+        So coverage should approach 100% for anything closed after §D, and the
+        shortfall is rows closed before it. That distinction decides what to do
+        about a low number: wait for it to age out, not go looking for an
+        unwired producer.
+
+        `unclassified_reasons` is included because it turns the number into an
+        action. If the missing rows are dominated by one `exit_reason` prefix,
+        that prefix is either a producer worth teaching or a token worth adding
+        to classify_exit - and if they are scattered prose, they are history and
+        nothing can be done but let them age out.
+        """
+        from rules.common import format_exit_kind_coverage
+
+        where = ["is_closed = 1"]
+        params = []
+        if mode:
+            where.append("mode = ?")
+            params.append(mode)
+        if since:
+            where.append("recorded_at >= ?")
+            params.append(since)
+        clause = " AND ".join(where)
+
+        with self._conn() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM pattern_database WHERE {clause}",
+                tuple(params)).fetchone()[0]
+            structured = conn.execute(
+                f"SELECT COUNT(*) FROM pattern_database "
+                f"WHERE {clause} AND exit_kind IS NOT NULL",
+                tuple(params)).fetchone()[0]
+            reasons = conn.execute(
+                f"SELECT COALESCE(exit_reason, '(none)'), COUNT(*) "
+                f"FROM pattern_database WHERE {clause} AND exit_kind IS NULL "
+                f"GROUP BY 1 ORDER BY 2 DESC LIMIT 5",
+                tuple(params)).fetchall()
+
+        return {
+            "structured": int(structured),
+            "total": int(total),
+            "missing": int(total) - int(structured),
+            # None, not 0.0, when there is nothing to divide. A 0% coverage bar
+            # against an empty book is a false alarm, and the difference
+            # between "no structured exits" and "no exits" matters to anyone
+            # reading this to decide whether a number is trustworthy yet.
+            "pct": (round(structured / total * 100, 1) if total else None),
+            "unclassified_reasons": [
+                {"exit_reason": r[0], "n": int(r[1])} for r in reasons
+            ],
+            "label": format_exit_kind_coverage(structured, total),
+        }
+
     def get_pattern_excursions(self, mode: str = None, since: str = None) -> list:
         """§51: the ONE sanctioned join from closed patterns to their MAE/MFE
         rows. Everything wanting true intraday excursions goes through here.

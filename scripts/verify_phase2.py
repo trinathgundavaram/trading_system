@@ -222,6 +222,100 @@ def main() -> int:
                 check("rejected_signals.would_have_size exists (008)",
                       "would_have_size" in rc)
 
+                # ── 009-012: the Phase 2.5 cutover preconditions ─────────────
+                #
+                # ADDED 2026-07-26 (review follow-up). This section stopped at
+                # 008, so the four migrations that establish the MEASUREMENT
+                # BASE - the ones Phase 3's §19-§21 re-derive scoring,
+                # thresholds and sizing tiers from - were enforced nowhere
+                # except in the cutover runbook and the operator's memory.
+                #
+                # These are hard FAILs, and that is the whole point of moving
+                # them here. verify_phase2.py is called by release.sh, so an
+                # unapplied migration now blocks a tag rather than producing a
+                # release whose learning outputs were fitted on a base nobody
+                # verified. "Enforced by discipline" is the state this closes:
+                # discipline is not auditable after the fact, and the failure
+                # is silent - a Phase 3 recalibration on an unmigrated database
+                # does not error, it just quietly fits on excursion rows that
+                # may belong to the wrong ticker.
+                #
+                # Each check reads the SHAPE the migration leaves behind, not a
+                # version table, because that is the fact that matters: a
+                # database restored from a pre-cutover backup loses the shape
+                # while any bookkeeping row would survive.
+                idx_mae = {r[0] for r in conn.execute(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE tablename = 'mae_mfe_data'").fetchall()}
+                check("idx_mae_mfe_trade_id exists (010)",
+                      "idx_mae_mfe_trade_id" in idx_mae,
+                      "without the unique index one excursion row can attach "
+                      "itself to several patterns - the exact defect §51 "
+                      "documents (trade_id '1' claimed by five tickers). "
+                      "Apply: ./scripts/apply_migration.sh "
+                      "migrations/010_mae_mfe_unique_trade.sql")
+
+                mm = {r[0]: r[1] for r in conn.execute(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_name = 'mae_mfe_data'").fetchall()}
+                check("mae_mfe_data.trade_id is INTEGER (012)",
+                      mm.get("trade_id") == "integer",
+                      f"is {mm.get('trade_id')!r}; while it is TEXT nothing "
+                      f"stops a trade_id naming a position that does not "
+                      f"exist. Apply: ./scripts/apply_migration.sh "
+                      f"migrations/012_mae_mfe_fk.sql")
+
+                # The FK and, specifically, its delete rule. 'n' is SET NULL.
+                # CASCADE here would be worse than no FK at all: reset_paper_
+                # account() deletes every simulated position by design, and a
+                # cascade would make it silently destroy the excursion history
+                # that migration's own docstring promises to keep.
+                fk = conn.execute("""
+                    SELECT c.conname, c.confdeltype
+                      FROM pg_constraint c
+                      JOIN unnest(c.conkey) k(attnum) ON TRUE
+                      JOIN pg_attribute a
+                        ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+                     WHERE c.conrelid = 'mae_mfe_data'::regclass
+                       AND c.contype = 'f' AND a.attname = 'trade_id'
+                     LIMIT 1""").fetchone()
+                check("mae_mfe_data.trade_id has a FK to positions (012)",
+                      fk is not None,
+                      "no foreign key - an orphaned excursion row is still "
+                      "writable. Apply migrations/012_mae_mfe_fk.sql")
+                if fk is not None:
+                    check("that FK is ON DELETE SET NULL, not CASCADE (012)",
+                          fk[1] == "n",
+                          f"delete rule is {fk[1]!r}. CASCADE ('c') would make "
+                          f"reset_paper_account() destroy excursion history it "
+                          f"promises to keep; re-apply "
+                          f"migrations/012_mae_mfe_fk.sql, which replaces a "
+                          f"wrong rule rather than assuming it is right.")
+
+                # §49's purge is the data half, and like 007's sweep it lives
+                # only in the runbook. An orphan surviving here means either the
+                # purge never ran or a restore predates it.
+                #
+                # The comparison is written to suit whichever shape is actually
+                # present. `p.id = m.trade_id` against a TEXT column raises
+                # (integer = text has no operator), and an exception here would
+                # abort the rest of this section - reporting a database that is
+                # merely unmigrated as one that could not be read at all, which
+                # is the more alarming and less accurate of the two.
+                if mm.get("trade_id") == "integer":
+                    orphan_join = "p.id = m.trade_id"
+                else:
+                    orphan_join = "CAST(p.id AS TEXT) = CAST(m.trade_id AS TEXT)"
+                orphans = conn.execute(
+                    f"SELECT COUNT(*) FROM mae_mfe_data m "
+                    f" WHERE m.trade_id IS NOT NULL "
+                    f"   AND NOT EXISTS (SELECT 1 FROM positions p "
+                    f"                    WHERE {orphan_join})").fetchone()[0]
+                check("no orphaned excursion rows (§49 purge)", orphans == 0,
+                      f"{orphans} row(s) name a position that does not exist. "
+                      f"Run scripts/assess_test_damage.py, then "
+                      f"scripts/repair_test_damage.py --apply.")
+
                 dupes = conn.execute(
                     "SELECT COUNT(*) FROM (SELECT ticker FROM positions "
                     "WHERE status='open' GROUP BY ticker, COALESCE(simulated,0) "

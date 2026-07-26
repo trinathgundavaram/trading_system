@@ -296,7 +296,33 @@ portfolio_risk:
   correlation_lookback_days: 60
   high_correlation_threshold: 0.75
   max_high_correlation_cluster: 3
+  # PROVISIONAL, and unlike the drawdown caps above this one has never been
+  # measured at all - 5.0 is a round number chosen because it sounded like
+  # "high volatility", not a percentile of anything. Recorded here 2026-07-26
+  # so it stops reading as a derived figure.
+  #
+  # WHY IT CANNOT BE MEASURED YET. The open-position side of this check has
+  # been falling back to a PROXY where a stored ATR was unavailable, and
+  # engine/portfolio_risk.py counts those in `high_vol_proxy_count` precisely
+  # so the substitution is visible rather than assumed away (see its comment at
+  # the field, and §B6). While that count is non-zero, the population this
+  # threshold would be fitted against is part real ATR and part proxy, and a
+  # percentile over a mixed population describes neither.
+  #
+  # WHEN TO RECALIBRATE. Once `high_vol_proxy_count` has been zero or
+  # near-zero across ~20 sessions, take the distribution of real ATR-as-%-of-
+  # price across open positions and set this to the percentile you actually
+  # want to call "high volatility" - then replace this comment with the
+  # measured value, the percentile it represents, and the sample size, exactly
+  # as max_intraday_drawdown_pct records its own provenance above. Expect the
+  # measured figure to differ: 5% of price is a large daily range for a liquid
+  # large-cap and an ordinary one for the momentum names the screener favours,
+  # so a single number chosen a priori is likely wrong in one direction or the
+  # other for most of the book.
   high_vol_atr_pct_threshold: 5.0
+  # Also provisional, and for the same reason - a cap of 4 on a book that
+  # rarely holds more than a handful of positions has probably never bound.
+  # rejected_signals will show whether it ever did before you tune it.
   max_simultaneous_high_vol_positions: 4
 
   # §18 (Phase 2). Was false, which meant a breach only scaled position size -

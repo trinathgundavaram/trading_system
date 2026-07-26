@@ -1364,6 +1364,13 @@ async def get_performance():
         "profit_factor": profit_factor(outcomes) if outcomes else 0.0,
         "sharpe_ratio": sharpe_ratio(outcomes) if outcomes else 0.0,
         "win_rate_by_regime": win_rate_by(patterns, "regime"),
+        # exit_kind_coverage (§50): carried on this payload even though nothing
+        # here groups by exit_kind TODAY. That is the point - this is the
+        # endpoint a breakdown-by-exit-kind will be added to, and shipping the
+        # denominator first means the panel that eventually renders it cannot
+        # be written without one. A consumer that has to go and find its own
+        # coverage number is a consumer that will ship without it.
+        "exit_kind_coverage": db.get_exit_kind_coverage(),
     }
 
 

@@ -30,6 +30,33 @@ EXIT_KINDS = frozenset({
 })
 
 
+def format_exit_kind_coverage(structured: int, total: int) -> str:
+    """The one-line coverage label every exit_kind consumer must print beside
+    its results: "structured exits: 41/68 (60%)".
+
+    Lives here rather than in each consumer so the wording cannot drift. A
+    dashboard saying "60% classified" and a report saying "41 of 68" describe
+    the same fact and will be read as two different ones.
+
+    The parenthetical caveats are the point of the function. A breakdown over
+    12 of 68 trades is not a small sample of the strategy, it is a possibly
+    biased one - the unclassified rows are not a random subset, they are the
+    ones whose exit_reason was prose, which correlates with the older
+    sell_rules path. Saying "41/68" alone invites the reader to mentally round
+    to "most of them"; naming the risk does not.
+    """
+    if not total:
+        return "structured exits: 0/0 - no closed trades yet"
+    pct = structured / total * 100
+    base = f"structured exits: {structured}/{total} ({pct:.0f}%)"
+    if structured == total:
+        return base + " - complete"
+    if pct < 50:
+        return (base + " - MINORITY SAMPLE; the unclassified rows are not a "
+                       "random subset, so any breakdown below may be biased")
+    return base + " - partial; unclassified exits are excluded from any breakdown"
+
+
 def classify_exit(exit_reason: str) -> str | None:
     """Map an exit_reason to an EXIT_KINDS member, or None when the string does
     not carry enough structure to say.

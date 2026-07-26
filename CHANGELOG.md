@@ -127,7 +127,86 @@ pattern database: `vix_percentile_1y`, `vix_percentile_3m` (need VIX history;
 `market_context.py` fetches spot only), and `gap_pct`, `premarket_gap`,
 `premarket_rvol` (need a premarket session the scheduler does not run in).
 
-Tests: 413 passing, up from 403.
+### Phase 2.5 / Phase 3 review follow-ups
+
+Folded into this release because v2.4.0 was prepared but never tagged — the
+CHANGELOG header used the wrong version shorthand (`[2.4.0]` where
+`version.py --shorthand` says `[2.4]`), so `release.sh` exited at step 5 and
+never reached `git tag`.
+
+- **`exit_kind` coverage is now carried with every consumer, not left to be
+  remembered.** `db.get_exit_kind_coverage()` returns
+  `{structured, total, missing, pct, unclassified_reasons, label}`, and
+  `rules/common.format_exit_kind_coverage()` owns the wording so it cannot
+  drift between a dashboard and a report. Wired into
+  `/api/analytics/performance` and `scripts/phase4_recalibrate.py assess`.
+  **The premise needed correcting**: nothing in `analytics/` or the UI reads
+  `exit_kind` yet, so no consumer was misreporting — the denominator ships
+  first precisely so the panel that eventually renders a breakdown cannot be
+  written without one. **And the gap is historical, not a pending producer**:
+  `rules/sell_rules.py` has carried `exit_kind` on its `SellResult` since §D and
+  every triggered hard check supplies one, Loop B goes through
+  `exit_kind_for_loop_b_label`, and the price watch, rotation, time stops and
+  manual confirms all pass fixed literals. Coverage below 100% is rows closed
+  before §D ageing out, not an unwired producer to go and find.
+
+- **Migrations 009–012 are now a hard release gate.** `verify_phase2.py`'s
+  database section stopped at 008, so the four migrations establishing the
+  measurement base that §19–§21 re-derive scoring, thresholds and sizing tiers
+  from were enforced nowhere but the runbook. Now checked, as hard FAILs that
+  block `release.sh`: `idx_mae_mfe_trade_id` exists (010), `trade_id` is
+  INTEGER (012), a FK to `positions` exists whose delete rule is SET NULL and
+  not CASCADE (012), and no orphaned excursion rows survive (§49). Each reads
+  the *shape* the migration leaves rather than a bookkeeping row, because a
+  restore from a pre-cutover backup loses the shape and keeps the bookkeeping.
+
+- **The FK delete policy is now exercised, not just read.** The existing tests
+  assert the migration *file* contains "ON DELETE SET NULL". That catches a
+  hand-edit and nothing else — it passes identically on a database where 012
+  was never applied, or where the FK exists under a generated name with a
+  different rule. `tests/test_mae_mfe_fk_lifecycle.py` performs the destructive
+  operations the policy exists to survive: a bare `DELETE FROM positions`, and
+  `reset_paper_account()`, asserting the excursion row survives with
+  `trade_id IS NULL` and its measurement intact, that a real position's link is
+  untouched by a paper reset, that an orphan is excluded from
+  `get_pattern_excursions()` rather than counted as zero, and that the FK
+  refuses an orphan being written in the first place.
+
+- **`high_vol_atr_pct_threshold: 5.0` is documented as provisional.** Unlike the
+  drawdown caps, it was never measured — a round number that sounded like "high
+  volatility". It also cannot be fitted while `high_vol_proxy_count` is
+  non-zero, because the open-position side is then part real ATR and part
+  stop-distance proxy (§C3) and a percentile over a mixed population describes
+  neither. Recorded in `config.yaml` with the recalibration trigger and what to
+  write when measured, and in `engine/rules_catalog.py` so the Strategy tab
+  stops presenting 5.0% as a derived figure. `max_simultaneous_high_vol_positions`
+  flagged the same way.
+
+- **Phase 4 proposals now carry a model identity.** `phase4_proposal.json` had a
+  timestamp and nothing else identifying, and the default output path is the
+  same file every run — so two proposals from either side of a §19 weight
+  change were structurally identical documents describing different models.
+  Now stamped with `config_fingerprint`, `app_version`, the writer and sample
+  `feature_schema` values, a `mixed_feature_schema` flag, and the exit_kind
+  coverage the §20 distribution was computed over. This is the "later notebooks
+  mix pre- and post-Phase-3 EV curves" risk: pooling two EV curves produces a
+  curve, and a plausible one.
+
+**Verified as accurate, no change needed:** `engine/ev_engine.py` retains its
+HONESTY NOTE on horizon proxies for intraday drawdown, in four places, and it
+correctly says not to lift the warning until MAE/MFE is clean and linked.
+`get_pattern_excursions()` has all three documented safeguards — the indexed
+one-hop join on `pattern_database.trade_id`, mandatory ticker agreement, and a
+deduping fallback that warns when the unique index is missing. The drawdown caps
+already record their own provenance and their "~20 sessions" revisit trigger.
+
+**Cannot be done from code, and is still outstanding:** the Phase 2.5
+operational tail (B1–B7) against your Postgres, and the two threshold
+recalibrations, which need measured distributions that do not exist yet.
+
+Tests: 429 passing, up from 403. The 8 new FK-lifecycle tests require Postgres
+and skip without it — they are statically verified (signatures, `?`→`%s`
+translation, `@contextmanager` auto-commit) but have not been executed.
 
 ## [2.3.2] — v2.3.2 — 2026-07-26
 
