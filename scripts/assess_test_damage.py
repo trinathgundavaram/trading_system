@@ -91,7 +91,7 @@ def main() -> int:
         # the dedicated section further down for what was still in there.
         ("mae_mfe_data", "recorded_at"),
         ("rotation_log", "executed_at"),
-        ("monitoring_alerts", "created_at"),
+        ("monitoring_alerts", "triggered_at"),   # NOT created_at - the column has never existed, so this row read ERR and the alerts section below silently reported nothing (2026-07-25)
         ("signals", "timestamp"),
     ]
     print(f"{'table':<20} {'rows':>8} {'in window':>10}   earliest -> latest")
@@ -227,11 +227,11 @@ def main() -> int:
 
     section("ALERTS created in the window (account_sync writes sync_missing_*)")
     try:
-        alerts = _rows(db, "SELECT alert_type, message, created_at FROM monitoring_alerts "
-                           "WHERE created_at >= ? ORDER BY created_at", (cutoff,))
+        alerts = _rows(db, "SELECT alert_type, message, triggered_at FROM monitoring_alerts "
+                           "WHERE triggered_at >= ? ORDER BY triggered_at", (cutoff,))
         print(f"  {len(alerts)} alert(s)")
         for a in alerts[:15]:
-            print(f"    {str(a['created_at'])[:19]}  {a['alert_type']}")
+            print(f"    {str(a['triggered_at'])[:19]}  {a['alert_type']}")
         if len(alerts) > 15:
             print(f"    ... and {len(alerts) - 15} more")
     except Exception as e:

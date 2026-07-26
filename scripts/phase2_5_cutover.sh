@@ -133,7 +133,24 @@ if want B2; then
   step "B2  BACKUP" "verified pg_dump. The restore point for B3 and B6."
   note "tp backup dumps, then reads the dump back before reporting success."
   note "An unverified backup is a belief, not a backup."
-  run ./scripts/tp backup phase2_5_cutover || die "backup failed - refusing to continue"
+
+  # Ask the APPLICATION which database it resolves to, rather than repeating
+  # its resolution rules here (2026-07-25). Two bugs lived in the old line,
+  # `tp backup phase2_5_cutover`:
+  #
+  #   1. It read as a label and `tp backup` takes a VERSION, so it died with
+  #      `unknown version: phase2_5_cutover`. Loud, harmless, fixed by --label.
+  #   2. The quiet one: with a PRIMARY set, a bare `tp backup` dumps the
+  #      PRIMARY VERSION's database - which need not be the database B3-B7 are
+  #      about to modify. A restore point for the wrong database is worse than
+  #      none, because it is believed. Naming it explicitly removes the
+  #      question, and asking storage/database.py means the answer cannot drift
+  #      from what every other step in this script touches.
+  TARGET_DB=$("$PY" -c 'from storage.database import PG_DB; print(PG_DB)') \
+    || die "could not resolve the target database"
+  note "target database: $TARGET_DB"
+  run ./scripts/tp backup --db "$TARGET_DB" --label phase2_5_cutover \
+    || die "backup failed - refusing to continue"
   if [ -n "$APPLY" ]; then
     note ""
     note "Sync ~/tp/archive off-machine, but NEVER to the git remote - a dump"

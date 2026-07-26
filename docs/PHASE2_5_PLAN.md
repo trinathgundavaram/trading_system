@@ -1,7 +1,10 @@
 # Phase 2.5 — measurement integrity before recalibration (§48–§55)
 
 Status: 2026-07-25. Sits between Phase 2 (`v1.3.1`, shipped) and Phase 3
-(§19–§21, scoring recalibration, ships `v2.0.0`).
+(§19–§21, scoring recalibration). NOTE 2026-07-25: this document calls that
+work "Phase 3" and predicts it ships as v2.0.0. Neither held. The CHANGELOG and
+release notes are authoritative: Phase 2.5 shipped as v2.0.0, §41–§47 shipped as
+Phase 3 in v2.1.0, and the recalibration is Phase 4, unstarted.
 
 | Item | | Status |
 |---|---|---|

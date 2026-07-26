@@ -107,13 +107,41 @@ PURGE = [
 #                     priced moved in one direction or the other; both sides
 #                     exactly zero means update_live() never ran for it, which
 #                     is a fixture inserting a row directly.
-#   ticker_collision  trade_id resolves to a positions row for a DIFFERENT
-#                     ticker (or to no row at all). Unrepairable by
-#                     construction: nothing records which trade an excursion
-#                     with the wrong id belonged to. This is the predicate that
-#                     matters for §51 - a collision does not merely add a junk
-#                     row, it makes any join attach that row to another trade's
-#                     pattern.
+#   ticker_mismatch   trade_id resolves to a positions row for a DIFFERENT
+#                     ticker. Unrepairable by construction: nothing records
+#                     which trade an excursion with the wrong id belonged to.
+#                     This is the predicate that matters for §51 - a collision
+#                     does not merely add a junk row, it makes any join attach
+#                     that row to another trade's pattern.
+#
+#   orphan_trade_id   trade_id resolves to NO row at all. SET NULL, NOT DELETE
+#                     (2026-07-25) - and the distinction is the difference
+#                     between losing real measurements and keeping them.
+#
+#                     These two used to be one predicate, `ticker_collision`,
+#                     which deleted both. But positions are deleted ROUTINELY,
+#                     by design: reset_paper_account() removes every simulated
+#                     position and the 2026-07-25 cleanup removed more. Every
+#                     excursion belonging to those trades then resolves to
+#                     nothing - through no fault of its own. On the release
+#                     machine that predicate matched all 30 rows, of which 23
+#                     are flat fixtures and 7 carry real excursion values
+#                     against plausible distinct trade_ids (BAH, ORIC, DLR,
+#                     SGRY, SHEL, LW, USB). Those 7 are exactly the rows §21's
+#                     sizing tiers are derived from, and deleting them is not
+#                     recoverable.
+#
+#                     migrations/012 already settled what an orphan MEANS, and
+#                     it is not "junk": "The maximum adverse excursion of a
+#                     trade that happened is a fact about that trade, and it
+#                     stays true after the position row is gone. What is no
+#                     longer true is that we can say WHICH position it was - so
+#                     trade_id becomes NULL." That is why 012 chose ON DELETE
+#                     SET NULL over CASCADE. This purge now agrees with the
+#                     migration instead of contradicting it: NULLed rows are
+#                     excluded from get_pattern_excursions() (which requires a
+#                     link) and still counted by get_recent_mae_mfe() (which
+#                     does not).
 #
 # Deliberately NOT included: "ticker in TEST_TICKERS" on its own. That would
 # delete real ORCL/NVDA/BMY excursions, and a false positive here is permanent.
@@ -126,12 +154,27 @@ PURGE_MAE_PREDICATES = [
     ("flat_excursion",
      "COALESCE(mae_pct,0) = 0 AND COALESCE(mfe_pct,0) = 0",
      "mae = mfe = 0.0 exactly - update_live() never ran"),
-    ("ticker_collision",
-     """trade_id IS NOT NULL AND NOT EXISTS (
+    ("ticker_mismatch",
+     """trade_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM positions p
+             WHERE CAST(p.id AS TEXT) = CAST(mae_mfe_data.trade_id AS TEXT))
+        AND NOT EXISTS (
             SELECT 1 FROM positions p
              WHERE CAST(p.id AS TEXT) = CAST(mae_mfe_data.trade_id AS TEXT)
                AND UPPER(p.ticker) = UPPER(mae_mfe_data.ticker))""",
-     "trade_id resolves to a different ticker, or to nothing"),
+     "trade_id resolves to a position of a DIFFERENT ticker - unrepairable"),
+]
+
+# Rows that are NOT deleted - their link is cleared instead. See the
+# orphan_trade_id note above: an excursion whose position was legitimately
+# deleted is still a true measurement, and migrations/012 chose ON DELETE SET
+# NULL precisely so this case keeps its data.
+NULL_MAE_PREDICATES = [
+    ("orphan_trade_id",
+     """trade_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM positions p
+             WHERE CAST(p.id AS TEXT) = CAST(mae_mfe_data.trade_id AS TEXT))""",
+     "trade_id names no position at all - the excursion survives, the link does not"),
 ]
 
 # The two closes the suite performed against the real book, both winners.
@@ -195,7 +238,46 @@ def main() -> int:
             continue
         mae_total += n
         print(f"    {name:<20} {n:>4} rows   {note}")
-    print(f"    {'(overlaps counted once at delete time)':<20} {mae_total:>4} raw\n")
+    print(f"    {'(sum, overlapping)':<20} {mae_total:>4} raw")
+
+    # The number that actually matters, computed rather than left to the
+    # reader (2026-07-25). The line above is a SUM of overlapping predicates -
+    # on the release machine it read "30 raw" against a 30-row table, which
+    # invites exactly one conclusion (everything goes) and it was wrong: 7 of
+    # those rows match no delete predicate at all and are kept. A purge report
+    # whose headline number can be misread as "all of it" is a bad report.
+    union_sql = " OR ".join(f"({p})" for _, p, _ in PURGE_MAE_PREDICATES)
+    try:
+        n_delete = _count(db, f"SELECT COUNT(*) FROM mae_mfe_data WHERE {union_sql}")
+        n_all = _count(db, "SELECT COUNT(*) FROM mae_mfe_data")
+        print(f"    {'ACTUALLY DELETED':<20} {n_delete:>4} of {n_all} rows "
+              f"({n_all - n_delete} kept)")
+    except Exception as e:
+        print(f"    could not compute the union: {e}")
+    print()
+
+    # The rows that are KEPT. Reported with as much prominence as the deletions
+    # because "what survives" is the part a reader has to trust, and because
+    # these were being deleted until 2026-07-25.
+    print("  mae_mfe_data, link cleared but row KEPT (migrations/012's SET NULL):")
+    for name, predicate, note in NULL_MAE_PREDICATES:
+        try:
+            n = _count(db, f"SELECT COUNT(*) FROM mae_mfe_data WHERE {predicate}")
+            survivors = _rows(
+                db, f"SELECT ticker, trade_id, mae_pct, mfe_pct FROM mae_mfe_data "
+                    f"WHERE {predicate} AND NOT (COALESCE(mae_pct,0) = 0 "
+                    f"AND COALESCE(mfe_pct,0) = 0) LIMIT 12")
+        except Exception as e:
+            print(f"    {name:<20} SKIPPED ({e})")
+            continue
+        print(f"    {name:<20} {n:>4} rows   {note}")
+        if survivors:
+            print(f"      of those, {len(survivors)} carry a REAL excursion and are")
+            print("      the rows §21's sizing tiers are derived from:")
+            for s in survivors:
+                print(f"        {str(s['ticker']):<6} trade_id={str(s['trade_id']):<6} "
+                      f"mae={s['mae_pct']}  mfe={s['mfe_pct']}")
+    print()
 
     # Safety: refuse if the cut would take rows that predate the incident.
     stray = _rows(db, "SELECT ticker, entry_time FROM positions "
@@ -228,11 +310,28 @@ def main() -> int:
         if args.trades_placed is None:
             print(f"  trades_placed   {s.get('trades_placed')}  ->  UNCHANGED "
                   f"(pass --trades-placed N to correct)")
-            print("    The suite's own failure printed trades_placed=8 at the first")
-            print("    live-buy assertion, implying 7 pre-existing + 1. Current value")
-            print("    is 10, so 3 test increments. 7 is the likely correct value -")
-            print("    but verify against the surviving `trades` rows below before")
-            print("    committing to it.")
+            # Computed from the ledger, not asserted from memory (2026-07-25).
+            # This used to be three hardcoded sentences - "Current value is 10,
+            # so 3 test increments. 7 is the likely correct value" - written
+            # when that was true. By the time anyone read them the value was 6
+            # and the surviving ledger held 6 rows, so the advice argued for
+            # changing a figure that was already correct. Stale prose in a
+            # repair tool is worse than no prose: it is authoritative-sounding
+            # and wrong, and it is pointing at a --flag that overwrites data.
+            n_ledger = _count(
+                db, "SELECT COUNT(*) FROM trades WHERE timestamp >= ? AND timestamp < ?",
+                (AFFECTED_STATS_DATE, AFFECTED_STATS_DATE + "T23:59:59"))
+            current = s.get("trades_placed")
+            if current == n_ledger:
+                print(f"    The surviving `trades` ledger holds {n_ledger} row(s) for this")
+                print(f"    date and trades_placed is {current}. They AGREE - nothing to")
+                print("    correct, and passing --trades-placed would only introduce a")
+                print("    discrepancy.")
+            else:
+                print(f"    The surviving `trades` ledger holds {n_ledger} row(s) for this")
+                print(f"    date while trades_placed reads {current}. If the ledger is the")
+                print(f"    truth, --trades-placed {n_ledger} is the correction - but")
+                print("    verify against the rows listed below before committing to it.")
         else:
             print(f"  trades_placed   {s.get('trades_placed')}  ->  {args.trades_placed}")
     surviving = _rows(db, "SELECT ticker, side, timestamp, status FROM trades "
@@ -262,6 +361,15 @@ def main() -> int:
                 conn.execute(f"DELETE FROM mae_mfe_data WHERE {predicate}")
             except Exception as e:
                 print(f"  mae_mfe_data [{name}]: delete failed - {e}")
+        # AFTER the deletes, so a row that is both junk and orphaned is deleted
+        # rather than kept with a NULL link - the delete predicates are the
+        # stronger evidence, and order is what makes that true rather than a
+        # coincidence of which ran first.
+        for name, predicate, _ in NULL_MAE_PREDICATES:
+            try:
+                conn.execute(f"UPDATE mae_mfe_data SET trade_id = NULL WHERE {predicate}")
+            except Exception as e:
+                print(f"  mae_mfe_data [{name}]: unlink failed - {e}")
         conn.execute("DELETE FROM paper_account")
         conn.execute(
             "UPDATE daily_stats SET realized_pnl = realized_pnl - ?, "

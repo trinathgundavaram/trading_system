@@ -452,6 +452,71 @@ class TestSecrets:
 
 
 # =============================================================================
+#  §45  launchd restart is not stop-then-start
+# =============================================================================
+class TestLaunchdRestartRace:
+    """`launchctl bootout` returns when the request is ACCEPTED, not when the
+    job is gone. restart raced its own bootout and launchd answered
+
+        Bootstrap failed: 5: Input/output error
+        Try re-running the command as root for richer errors.
+
+    which names neither the cause nor the fix and sends you after a
+    permissions problem that does not exist."""
+
+    def _mgr(self):
+        import importlib.machinery
+        import importlib.util
+
+        loader = importlib.machinery.SourceFileLoader(
+            "services", str(REPO / "scripts" / "services.py"))
+        spec = importlib.util.spec_from_loader("services", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod, mod.LaunchdManager()
+
+    def test_start_waits_for_the_label_to_leave_the_domain(self):
+        mod, mgr = self._mgr()
+        calls = []
+        # Loaded for the first two polls, then gone.
+        states = iter([True, True, False, False, False])
+
+        with mock.patch.object(mgr, "_is_loaded", side_effect=lambda n: next(states)), \
+             mock.patch.object(mod.subprocess, "run",
+                               side_effect=lambda cmd, **kw: calls.append(cmd[1])
+                               or mock.Mock(returncode=0)):
+            mgr.start("scheduler")
+
+        assert calls == ["bootout", "bootstrap"], calls
+
+    def test_bootstrap_is_not_preceded_by_a_pointless_bootout(self):
+        """Nothing loaded means nothing to tear down. Booting out something
+        that is not there produced the 'not running' noise that trained people
+        to ignore this command's output."""
+        mod, mgr = self._mgr()
+        calls = []
+        with mock.patch.object(mgr, "_is_loaded", return_value=False), \
+             mock.patch.object(mod.subprocess, "run",
+                               side_effect=lambda cmd, **kw: calls.append(cmd[1])
+                               or mock.Mock(returncode=0)):
+            mgr.start("scheduler")
+        assert calls == ["bootstrap"], calls
+
+    def test_is_loaded_is_false_when_launchctl_is_absent(self):
+        """'Is it loaded?' has a sensible answer on a machine with no launchd,
+        and it is no - not a traceback."""
+        mod, mgr = self._mgr()
+        with mock.patch.object(mod.subprocess, "run", side_effect=FileNotFoundError):
+            assert mgr._is_loaded("scheduler") is False
+
+    def test_the_wait_gives_up_rather_than_hanging(self):
+        mod, mgr = self._mgr()
+        mgr.BOOTOUT_TIMEOUT_S = 0.3
+        with mock.patch.object(mgr, "_is_loaded", return_value=True):
+            assert mgr._wait_until_gone("scheduler") is False
+
+
+# =============================================================================
 #  §13  the dependency guard reads metadata, not `pip freeze`
 # =============================================================================
 class TestDependencyCheck:
@@ -494,7 +559,14 @@ class TestDependencyCheck:
             if pinned in have:
                 continue
             mod = pinned.replace("-", "_")
-            if importlib.util.find_spec(mod) is not None:
+            try:
+                found = importlib.util.find_spec(mod) is not None
+            except (ImportError, ValueError):
+                # find_spec raises rather than returning None for a name whose
+                # parent package is absent, and for an already-imported module
+                # with no __spec__. Neither is evidence either way.
+                continue
+            if found:
                 lying.append(pinned)
         assert not lying, f"reported NOT INSTALLED but importable: {lying}"
 

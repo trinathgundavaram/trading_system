@@ -50,6 +50,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent.parent
@@ -204,9 +205,47 @@ class LaunchdManager(ServiceManager):
 """)
         print(f"  wrote {self.plist_path(name)}")
 
+    # launchctl bootout is ASYNCHRONOUS (2026-07-26). It returns as soon as the
+    # request is accepted, not when the job is gone - so `restart`, which is
+    # stop-then-start, raced its own bootout and bootstrap landed while the
+    # label was still registered in the domain. launchd reports that as
+    #
+    #     Bootstrap failed: 5: Input/output error
+    #     Try re-running the command as root for richer errors.
+    #
+    # which names neither the cause nor the fix, and sends you looking for a
+    # permissions problem that is not there. Root would not have helped.
+    BOOTOUT_TIMEOUT_S = 10.0
+
+    def _is_loaded(self, name) -> bool:
+        """False, rather than an exception, when launchctl cannot be run at
+        all. 'Is it loaded?' has a sensible answer on a machine with no
+        launchd, and it is no."""
+        try:
+            return subprocess.run(["launchctl", "print", self._domain(name)],
+                                  capture_output=True).returncode == 0
+        except (FileNotFoundError, OSError):
+            return False
+
+    def _wait_until_gone(self, name) -> bool:
+        """Poll until the label leaves the domain. Returns False on timeout,
+        so the caller can say so rather than failing obscurely one line later."""
+        deadline = time.time() + self.BOOTOUT_TIMEOUT_S
+        while time.time() < deadline:
+            if not self._is_loaded(name):
+                return True
+            time.sleep(0.25)
+        return False
+
     def start(self, name):
-        subprocess.run(["launchctl", "bootout", self._domain(name)],
-                       capture_output=True)
+        if self._is_loaded(name):
+            subprocess.run(["launchctl", "bootout", self._domain(name)],
+                           capture_output=True)
+            if not self._wait_until_gone(name):
+                print(f"  WARNING: {self.label(name)} was still loaded "
+                      f"{self.BOOTOUT_TIMEOUT_S:.0f}s after bootout; bootstrapping "
+                      f"anyway, and 'Bootstrap failed: 5' below means it had not "
+                      f"finished exiting. Re-run `./service.sh start` in a moment.")
         subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}",
                         str(self.plist_path(name))], check=True)
         print(f"  started {self.label(name)}")
@@ -214,6 +253,11 @@ class LaunchdManager(ServiceManager):
     def stop(self, name):
         r = subprocess.run(["launchctl", "bootout", self._domain(name)],
                            capture_output=True)
+        if r.returncode == 0:
+            # Wait here too, so `stop` means stopped. Otherwise anything that
+            # follows - a pg_dump, a migration, a reset - runs while the
+            # scheduler is still mid-cycle and holding connections.
+            self._wait_until_gone(name)
         print(f"  {'stopped' if r.returncode == 0 else 'not running:'} {self.label(name)}")
 
     def uninstall(self, name):

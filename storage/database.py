@@ -131,6 +131,18 @@ _POOL = None  # process-wide pool, shared by every Database() instance in
               # set of real connections instead of each opening their own).
 
 
+# Pool bounds. 2-20 remains the default and is what the release machine runs;
+# the environment override exists because 2 is not always available (2026-07-25).
+# A server with a small max_connections, a pgbouncer in front, or a single-client
+# Postgres like PGlite - which scripts/rehearse_cutover.py uses precisely so the
+# cutover can be rehearsed without provisioning a second server - all reject the
+# second connection, and the failure surfaces as "server closed the connection
+# unexpectedly" from inside Database.__init__, which reads like the server died
+# rather than like a pool that asked for more than it could have.
+PG_POOL_MIN = max(1, int(os.getenv("TP_PG_POOL_MIN", "2")))
+PG_POOL_MAX = max(PG_POOL_MIN, int(os.getenv("TP_PG_POOL_MAX", "20")))
+
+
 def _get_pool():
     global _POOL
     if _POOL is not None:
@@ -138,14 +150,14 @@ def _get_pool():
     with _POOL_LOCK:
         if _POOL is None:
             _POOL = psycopg2.pool.ThreadedConnectionPool(
-                minconn=2, maxconn=20,
+                minconn=PG_POOL_MIN, maxconn=PG_POOL_MAX,
                 host=PG_HOST, port=PG_PORT, dbname=PG_DB,
                 user=PG_USER, password=PG_PASSWORD,
                 connect_timeout=10,
             )
             logger.info(f"storage.database: Postgres pool ready "
                         f"(host={PG_HOST}:{PG_PORT} db={PG_DB} user={PG_USER}, "
-                        f"pool size 2-20)")
+                        f"pool size {PG_POOL_MIN}-{PG_POOL_MAX})")
     return _POOL
 
 

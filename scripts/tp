@@ -189,11 +189,39 @@ def registry_save(reg: dict) -> None:
     p.write_text(json.dumps(reg, indent=2))
 
 
+def _port_is_free(port: int) -> bool:
+    """Can this port actually be bound right now?
+
+    The registry is not the whole truth (2026-07-25). It knows about versions
+    tp installed; it knows nothing about `./run.sh --ui` from the working tree,
+    or anything else on the machine. §38 promises each version its own port,
+    and that promise held between managed versions while silently colliding
+    with the unmanaged UI that had been up all evening on BASE_PORT - so the
+    first `tp run` of a newly installed version died on
+    `[errno 48] address already in use`, which reads like a tp bug and is not.
+
+    SO_REUSEADDR is deliberately NOT set: the question is whether uvicorn will
+    be able to bind, and uvicorn does not set it either."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
 def registry_add(tag: str) -> dict:
     reg = registry_load()
     if tag not in reg:
         used = {v["port"] for v in reg.values()}
-        port = next(p for p in range(BASE_PORT, BASE_PORT + 50) if p not in used)
+        port = next((p for p in range(BASE_PORT, BASE_PORT + 50)
+                     if p not in used and _port_is_free(p)), None)
+        if port is None:
+            die(f"no free port in {BASE_PORT}-{BASE_PORT + 49}. Registry holds "
+                f"{sorted(used)}; the rest are held by processes tp did not "
+                f"start (check: lsof -nP -iTCP:{BASE_PORT} -sTCP:LISTEN)")
         reg[tag] = {
             "port": port,
             "db": "tp_" + tag.replace(".", "_").replace("-", "_"),
@@ -580,8 +608,25 @@ def cmd_remove(args) -> int:
 # =============================================================================
 def cmd_backup(args) -> int:
     root = tp_root()
+
+    # --db names the database DIRECTLY, bypassing the registry (2026-07-25).
+    # The positional `tag` is a VERSION, resolved to that version's database,
+    # and that is the wrong shape for a restore point taken before an
+    # operation: phase2_5_cutover.sh's B2 passed 'phase2_5_cutover' as a label
+    # and got `unknown version`, which is the harmless failure. The dangerous
+    # one is silent - with a PRIMARY set, a bare `tp backup` dumps the PRIMARY
+    # version's database, which need not be the database the operation is
+    # about to modify. A restore point for the wrong database is worse than no
+    # restore point, because it is believed.
+    db_override = getattr(args, "db", None)
+    label = getattr(args, "label", None)
     tag = getattr(args, "tag", None) or read_primary()
-    if tag:
+
+    if db_override:
+        db = db_override
+        tag = label or "adhoc"
+        note(f"backing up {db} (named explicitly, not via the registry)")
+    elif tag:
         db = registry_get(tag).get("db")
         if not db:
             die(f"unknown version: {tag}")
@@ -610,7 +655,10 @@ def cmd_backup(args) -> int:
     archive = root / "archive"
     archive.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = archive / f"{tag}_{ts}.sql.gz"
+    # The label is in the FILENAME on purpose. An archive of forty dumps named
+    # working_<timestamp> cannot answer "which one is from before the cutover",
+    # which is the only question anyone asks of a restore point.
+    out = archive / f"{label or tag}_{ts}.sql.gz"
 
     # gzip in Python rather than a shell pipe: `pg_dump | gzip` hides
     # pg_dump's exit status behind gzip's on every shell, which is how a
@@ -968,7 +1016,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_remove)
 
     p = sub.add_parser("backup", help="verified, pruned pg_dump into the archive")
-    p.add_argument("tag", nargs="?")
+    p.add_argument("tag", nargs="?", help="a VERSION tag; its database is looked "
+                                          "up in the registry")
+    p.add_argument("--db", help="database name, used verbatim - for a restore "
+                                "point before an operation, where the registry "
+                                "is the wrong question")
+    p.add_argument("--label", help="names the archive file, e.g. phase2_5_cutover")
     p.set_defaults(func=cmd_backup)
 
     p = sub.add_parser("autobackup", help="daily scheduled job that runs `tp backup`")

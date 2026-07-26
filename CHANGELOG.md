@@ -20,7 +20,133 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
-Nothing.
+**Decision function: UNCHANGED.** Nothing here touches scoring, sizing, entry
+or exit logic. No config value a rule reads has moved.
+
+### Fixed — the cutover could not have completed
+
+- **`migrations/012` died before reading a row, on every database `tp install`
+  creates.** Its guard ran `trade_id !~ '^[0-9]+$'` unconditionally, but
+  `storage/database.py`'s `SCHEMA` had since been updated to declare
+  `trade_id INTEGER` — so on any database built by `init_db()`, Postgres
+  answered `operator does not exist: integer !~ unknown` and step B5 of
+  `phase2_5_cutover.sh` aborted. The migration was written against the live
+  box's TEXT column and had only ever been reasoned about, never executed.
+
+  Two shapes exist in the world and only one had been considered: the LEGACY
+  live database (`trade_id TEXT`, `id TEXT` holding uuid4, no FK) and the
+  FRESH one that `Database.init_db()` now produces, born in the post-012 shape.
+  `tp install` makes a new database per version — that is the whole point of
+  §38 — so FRESH is the common case going forward and LEGACY exists on exactly
+  one machine, once. 012 now detects which it is looking at, applies only what
+  is missing, and is idempotent, which also restores `--from B5` as a usable
+  resume point after a partial failure.
+
+- **`tp` allocated a port the registry thought was free and the OS did not.**
+  `registry_add()` picked the lowest port not claimed by another *managed*
+  version, which says nothing about `./run.sh --ui` from the working tree or
+  anything else on the machine. §38's promise that each version gets its own
+  port held between managed versions while colliding with the unmanaged UI,
+  so the first `tp run` of a new version died on `[errno 48] address already
+  in use`. It now tests whether the port can actually be bound, and says which
+  process to look for when none in the range can.
+
+### Added — the two pieces Phase 4 was waiting on
+
+- **`scripts/compare_versions.py` (§40).** Deferred since v1.3.0 and named in
+  two places as the thing that makes a claim measurable: Phase 3's exit
+  criterion ("same backtest in two tags, identical numbers") and Phase 4's
+  justification ("a measured before-and-after"). Until now both were
+  assertions.
+
+  It treats the comparison as two questions, not one, and decides which
+  applies from the config fingerprint. **Same fingerprint** means the two runs
+  were meant to be the same computation, so any divergence is a
+  reproducibility defect — an unpinned numeric library, a different pandas,
+  one side on `ta_fallback.py` (§13). **Different fingerprint** means the
+  decision function moved, so difference is the *result*; what would be a
+  fault there is *no* difference, since a recalibration that changes nothing
+  measurable has not been shown to do anything. Conflating those two is how a
+  reproducibility bug gets filed as "expected, we changed the scoring" and how
+  an inert recalibration gets declared validated.
+
+  Trades are compared as a set keyed on (ticker, entry date), not just at
+  summary level: two runs can agree on trade count, win rate and profit factor
+  while disagreeing about which trades those were.
+
+- **`scripts/phase4_recalibrate.py` (§19–§21).** The recalibration harness —
+  the machinery, deliberately not the numbers.
+
+  `assess` is the gate and the most important part: it refuses a sample that
+  is too small (150, reusing `learning.min_trades_before_bayesian` rather than
+  inventing a second answer), too short (90 days — a fit to one regime is a
+  fit to that regime), missing the §48 epoch, or thin on linked excursion rows.
+  It also names every feature that never varies in the sample, which is the
+  placeholder problem stated in numbers instead of prose.
+
+  `propose` derives §19 weights from measured rank correlation with outcome,
+  §20 thresholds from the realised outcome distribution, and §21 sizing input
+  from the MAE distribution — and writes a proposal file. There are no default
+  weights, no fallback thresholds and no hardcoded tiers anywhere in it: if the
+  sample cannot support a number it says so and exits non-zero rather than
+  emitting a plausible one.
+
+  **It edits no config.** A recalibration that silently rewrote `config.yaml`
+  would move the decision function with no release, no declared fingerprint
+  change and no §35 boundary — and a test asserts the script contains no yaml
+  writer, because that property is worth more than the intention behind it.
+
+  `receipt` writes the §32 validation receipt. `engine/live_trader.py` has
+  looked for that file since Phase 1 and never found one, because nothing had
+  ever written it — so "validation receipt gate blocks arming" had been
+  passing for the least interesting possible reason. A passing receipt needs a
+  backtest that ran, a comparison that exists, and a `--signed-off-by`, since
+  a receipt records that a person read the numbers and an unattributed one
+  records nothing. A failing receipt is written rather than skipped: the code
+  distinguishes "last validation FAILED" from "no receipt", and the first is
+  the more useful thing to find.
+
+- **`scripts/diagnose_drawdown.py`** — read-only, and written the night the
+  kill switch tripped on a 16.48% paper running drawdown. §11's control fired
+  correctly; what it could not tell anyone is whether the *number* was real.
+  `storage/database.py` already documents the trap — a curve at ~984 that
+  jumps to 1491 on a re-seed makes every later day read a ~34% drawdown — and
+  `_paper_epoch_start()` guards the RESET case but not a re-seed *within* the
+  current epoch, which is the case on this machine because §48 has not run.
+
+  The detector is an accounting identity rather than a threshold. Since
+  `total_value = cash + market_value`: market movement leaves cash flat, a buy
+  or sell moves the two legs in opposite directions and cancels, and only a
+  balance change leaves cash moving unmatched. The first version instead
+  flagged any large move not matched by realized P&L, and promptly called an
+  ordinary 7.8% market decline "unexplained" — unrealized losses do not touch
+  `realized_pnl`. Tests now pin all four events.
+
+  It then rebases the series and reports what the drawdown would be if the
+  balance changes had not happened. Rebasing rather than "measuring from the
+  last jump", because the latter handles a permanent re-seed and misses the
+  worse case completely: a transient spike, where one bad balance sample
+  becomes the all-time peak and every subsequent day is measured against a
+  number the account held for one sample. On a seeded reproduction that case
+  reads 35.21% unrebased and 1.83% rebased.
+
+### Added
+
+- **`scripts/rehearse_cutover.py`** — runs the whole migration sequence against
+  a throwaway database, in both shapes, and asserts what the cutover assumes:
+  that 010 and 012 REFUSE while contamination is present, that both shapes
+  converge on `trade_id INTEGER` with exactly one FK, that 012 is re-runnable,
+  and that deleting a position NULLs the excursion row rather than cascading
+  it — the property `reset_paper_account()`'s docstring promises and nothing
+  tested. It refuses to open the live database or any `tp_v*` version database,
+  since it drops tables. This is what found the 012 defect above.
+
+- **`TP_PG_POOL_MIN` / `TP_PG_POOL_MAX`.** The pool was hardcoded 2-20, so a
+  server that cannot give out two connections — a small `max_connections`, a
+  pgbouncer, or the single-client Postgres the rehearsal runs against — failed
+  inside `Database.__init__` as "server closed the connection unexpectedly",
+  which reads like the server died rather than like a pool asking for more
+  than it can have. Defaults are unchanged at 2-20.
 
 ## [2.1] — v2.1.0 — 2026-07-25
 
