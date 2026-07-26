@@ -41,6 +41,7 @@ import threading
 
 from engine.cache import cache
 from mcp_clients.base import SourceCircuitBreaker, StdioMCPClient, run_async
+from storage import secrets as _secrets
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +61,22 @@ _warned_no_creds = False
 
 
 def _credentials() -> dict | None:
-    """Returns the env dict for the server spawn, or None if not configured."""
-    user = os.getenv("ROBINHOOD_USERNAME", "").strip()
-    pw = os.getenv("ROBINHOOD_PASSWORD", "").strip()
+    """Returns the env dict for the server spawn, or None if not configured.
+
+    Resolved through storage.secrets (2026-07-26), not a bare os.getenv: a
+    process launched by scripts/services.py (any `tp promote`-managed
+    scheduler/ui/maverick) runs from a versioned worktree whose .env this
+    module's own loader can never see (see market_data.py's _key() docstring
+    for the full explanation) - storage.secrets additionally checks the OS
+    Keychain, which is machine-wide rather than per-directory, so credentials
+    mirrored in with `./scripts/tp secrets import .env` resolve the same way
+    everywhere."""
+    user = _secrets.get("ROBINHOOD_USERNAME", required=False).strip()
+    pw = _secrets.get("ROBINHOOD_PASSWORD", required=False).strip()
     if not user or not pw:
         return None
     env = {"ROBINHOOD_USERNAME": user, "ROBINHOOD_PASSWORD": pw}
-    totp = os.getenv("ROBINHOOD_TOTP_SECRET", "").strip()
+    totp = _secrets.get("ROBINHOOD_TOTP_SECRET", required=False).strip()
     if totp:
         env["ROBINHOOD_TOTP_SECRET"] = totp
     return env

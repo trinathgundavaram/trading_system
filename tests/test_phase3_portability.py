@@ -609,6 +609,11 @@ class TestStaleUiPortIsReclaimed:
         mgr = mock.Mock()
         mgr.stop.side_effect = lambda n: order.append(f"stop:{n}")
         mgr.start.side_effect = lambda n: order.append(f"start:{n}")
+        # No other installed registration for this service (2026-07-26's
+        # other_registrations() check) - a bare Mock() would otherwise return
+        # a truthy Mock here and main() would refuse the restart before ever
+        # reaching stop/free_port/start, which is not what this test is about.
+        mgr.other_registrations.return_value = []
         with mock.patch.object(mod, "manager", return_value=mgr), \
              mock.patch.object(mod, "_commands", return_value={"ui": ["python", "main.py", "--ui"]}), \
              mock.patch.object(mod, "_free_ui_port",

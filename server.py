@@ -771,9 +771,14 @@ async def robinhood_status():
     breaker, and whether live trading is currently ARMED (mode=EXECUTE +
     auto_trade). robin_stocks caches its login session on disk, so this
     doesn't re-login on every call."""
-    import os as _os
     cfg = _load_config()
-    configured = bool(_os.getenv("ROBINHOOD_USERNAME") and _os.getenv("ROBINHOOD_PASSWORD"))
+    # storage.secrets, not a bare os.getenv (2026-07-26): a `tp promote`-
+    # managed process runs from a versioned worktree whose local .env never
+    # exists, and secrets.present() additionally checks the OS Keychain
+    # (machine-wide, not per-directory) - see market_data.py's _key()
+    # docstring for the full incident this fixes ("shows NOT_CONFIGURED
+    # despite data having just been fetched").
+    configured = secrets.present("ROBINHOOD_USERNAME") and secrets.present("ROBINHOOD_PASSWORD")
     out = {
         "configured": configured,
         "watch_execute": cfg.get("trading", {}).get("watch_execute", "WATCH"),
@@ -949,8 +954,7 @@ async def get_real_summary(live: bool = False):
             "entry_time": p.get("entry_time"), "trade_mode": p.get("trade_mode"),
         })
 
-    import os as _os
-    configured = bool(_os.getenv("ROBINHOOD_USERNAME") and _os.getenv("ROBINHOOD_PASSWORD"))
+    configured = secrets.present("ROBINHOOD_USERNAME") and secrets.present("ROBINHOOD_PASSWORD")
     probe = _robinhood_account_probe(cfg) if configured else {
         "read_ok": False, "buying_power": None, "portfolio_value": None,
         "account_number": None, "account_source": "not_configured",
@@ -1952,21 +1956,32 @@ async def get_data_sources():
       NOT_CONFIGURED  optional provider with no API key in .env
       NO_DATA_YET     nothing has reported since the last restart
     """
-    import os as _os
     import time as _time
     db = Database()
     health = {h["name"]: h for h in db.get_source_health()}
 
     from mcp_clients import market_data as _md
+    # storage.secrets.present(), not a bare os.getenv (2026-07-26): this
+    # endpoint was reporting NOT_CONFIGURED for providers that were actively,
+    # successfully fetching data (visible right below in `health`, written
+    # cross-process by the scheduler). Root cause - os.getenv only sees THIS
+    # process's environment, and a `tp promote`-managed UI service runs from
+    # a versioned worktree (~/tp/versions/<tag>) whose local .env never
+    # exists (git worktree add never checks out a gitignored file). present()
+    # goes through the full documented chain instead (environment -> .env ->
+    # OS Keychain) - the Keychain tier is machine-wide, not per-directory, so
+    # a key mirrored in with `./scripts/tp secrets import .env` now resolves
+    # identically no matter which installed version is asking. See
+    # mcp_clients/market_data.py's _key() docstring for the longer version.
     provider_keys = {
-        "alpaca": bool(_os.getenv("ALPACA_API_KEY") and _os.getenv("ALPACA_API_SECRET")),
-        "finnhub": bool(_os.getenv("FINNHUB_API_KEY")),
-        "tiingo": bool(_os.getenv("TIINGO_API_KEY")),
-        "twelvedata": bool(_os.getenv("TWELVEDATA_API_KEY")),
-        "alphavantage": bool(_os.getenv("ALPHAVANTAGE_API_KEY")),
-        "fmp": bool(_os.getenv("FMP_API_KEY")),
-        "robinhood": bool(_os.getenv("ROBINHOOD_USERNAME") and _os.getenv("ROBINHOOD_PASSWORD")),
-        "robinhood-orders": bool(_os.getenv("ROBINHOOD_USERNAME") and _os.getenv("ROBINHOOD_PASSWORD")),
+        "alpaca": secrets.present("ALPACA_API_KEY") and secrets.present("ALPACA_API_SECRET"),
+        "finnhub": secrets.present("FINNHUB_API_KEY"),
+        "tiingo": secrets.present("TIINGO_API_KEY"),
+        "twelvedata": secrets.present("TWELVEDATA_API_KEY"),
+        "alphavantage": secrets.present("ALPHAVANTAGE_API_KEY"),
+        "fmp": secrets.present("FMP_API_KEY"),
+        "robinhood": secrets.present("ROBINHOOD_USERNAME") and secrets.present("ROBINHOOD_PASSWORD"),
+        "robinhood-orders": secrets.present("ROBINHOOD_USERNAME") and secrets.present("ROBINHOOD_PASSWORD"),
         # 2026-07-22 (unlimited free data source research): both keyless -
         # "configured" means "usable at all", not "env var present". defeatbeta
         # is configured only when the optional package actually imported (see
@@ -1999,7 +2014,8 @@ async def get_data_sources():
         h = health.get(name)
         if name in provider_keys and not provider_keys[name]:
             status = "NOT_CONFIGURED"
-            note = "No API key in .env - add it to activate (see .env.template)"
+            note = ("No API key found in the environment, .env, or the OS Keychain - "
+                     "add it to activate (see .env.template)")
         elif not h:
             status = "NO_DATA_YET"
             note = "No health report since last restart - will appear after the next cycle touches it"

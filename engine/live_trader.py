@@ -55,6 +55,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from mcp_clients.base import SourceCircuitBreaker
+from storage import secrets as _secrets
 
 logger = logging.getLogger("trading")
 
@@ -233,8 +234,16 @@ def _login() -> bool:
             return True
         if now - _login_state["checked_at"] < _LOGIN_FAIL_CACHE_SECONDS and _login_state["error"]:
             return False
-        user = os.getenv("ROBINHOOD_USERNAME", "").strip()
-        pw = os.getenv("ROBINHOOD_PASSWORD", "").strip()
+        # Resolved through storage.secrets, not a bare os.getenv (2026-07-26):
+        # this process may be a `tp promote`-managed service running from a
+        # versioned worktree whose local .env never exists (git worktree add
+        # never checks out a gitignored file, and nothing copies one in) -
+        # storage.secrets additionally checks the OS Keychain, which is
+        # machine-wide rather than per-directory, so credentials mirrored in
+        # with `./scripts/tp secrets import .env` resolve the same way from
+        # every installed version, not just the primary checkout.
+        user = _secrets.get("ROBINHOOD_USERNAME", required=False).strip()
+        pw = _secrets.get("ROBINHOOD_PASSWORD", required=False).strip()
         if not user or not pw:
             _login_state.update(checked_at=now, error="no credentials in .env")
             logger.warning("live_trader: ROBINHOOD_USERNAME/PASSWORD not set - live trading unavailable")
@@ -242,7 +251,7 @@ def _login() -> bool:
         try:
             rh = _rh()
             kwargs = {"store_session": True}
-            totp_secret = os.getenv("ROBINHOOD_TOTP_SECRET", "").strip()
+            totp_secret = _secrets.get("ROBINHOOD_TOTP_SECRET", required=False).strip()
             if totp_secret:
                 import pyotp
                 kwargs["mfa_code"] = pyotp.TOTP(totp_secret).now()

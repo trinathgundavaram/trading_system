@@ -73,6 +73,47 @@ def _log_path(name: str) -> Path:
     return d / f"service_{name}.log"
 
 
+def _resolved_secrets() -> dict:
+    """Every SECRET_KEY/OPTIONAL_KEY that currently resolves, by value - added
+    2026-07-26 (external report: "APIs/MCPs shown as not configured whereas
+    there was data fetched from them earlier").
+
+    Before this, a launchd/systemd/Task-Scheduler-managed service's
+    EnvironmentVariables held ONLY the six fixed keys below - no market-data
+    or broker credentials at all. Every provider client in this codebase
+    (market_data.py's REST providers, robinhood_mcp.py, live_trader.py) reads
+    its key with a bare os.getenv(), so the service process's actual ability
+    to fetch data depended entirely on falling through to a local .env file -
+    which works for the PRIMARY checkout (its .env sits right next to
+    services.py) but silently fails for anything `tp install`/`tp promote`
+    manages: `git worktree add` never checks out a gitignored path, so
+    ~/tp/versions/<tag>/.env never exists, and nothing ever created one.
+
+    `tp run <tag>` (the FOREGROUND path) already avoided this by resolving
+    every secret through storage.secrets - which additionally checks the OS
+    Keychain, a machine-wide store independent of which worktree is asking -
+    and injecting the resolved values straight into the child's environment.
+    This does the identical thing for the SERVICE path, so `tp promote`
+    stops being the one code path that quietly drops every credential.
+
+    Best-effort: a machine with storage/secrets.py unimportable (a stripped
+    checkout, a broken venv) gets the old six-key environment back, exactly
+    as before this function existed, rather than failing the whole install."""
+    try:
+        from storage import secrets
+        out = {}
+        for k in secrets.SECRET_KEYS + secrets.OPTIONAL_KEYS:
+            v = secrets.get(k, required=False)
+            if v:
+                out[k] = v
+        return out
+    except Exception as e:
+        print(f"  WARNING: could not resolve secrets for the service environment ({e}) - "
+              f"this service may be unable to reach any key-gated provider until "
+              f"reinstalled with secrets available.")
+        return {}
+
+
 def _service_env() -> dict:
     """The environment every managed service needs.
 
@@ -88,6 +129,10 @@ def _service_env() -> dict:
         # Fail closed, same rule as docker-compose.yml: a background service
         # that was not explicitly promoted must not arm live execution.
         "TP_FORCE_PAPER": os.getenv("TP_FORCE_PAPER", "1"),
+        # See _resolved_secrets()'s docstring. Placed last so nothing above
+        # can ever be shadowed by a same-named secret (there is no overlap
+        # today, but the ordering is deliberate insurance).
+        **_resolved_secrets(),
     }
 
 
@@ -281,6 +326,40 @@ class ServiceManager:
 
     def status(self, name: str) -> str:
         raise NotImplementedError
+
+    def other_registrations(self, name: str) -> list:
+        """IDs of every OTHER installed registration of ``name`` still on this
+        machine - same service, different suffix (including no suffix at
+        all).
+
+        Added 2026-07-26. §38.5 says two installed versions must not fight
+        over one service name, and `tp promote` upholds that by uninstalling
+        the OLD version's suffixed registration on every promote. What it
+        does NOT cover is a bare `python3 scripts/services.py install ui`
+        run with no `--suffix` - which happens the moment anyone bypasses
+        `tp` and calls this file directly, including by habit from before
+        promoted versions existed. That writes the UNSUFFIXED registration
+        and never touches a suffixed one left over from a previous promote,
+        so both end up installed and KeepAlive/Restart=on-failure/ONLOGON
+        resurrects each one the instant the other kills it for the same
+        port - the same failure `_free_ui_port` documents, just one layer up
+        and for any of the three services, not only `ui`.
+
+        Default: no way to answer on this manager, so report none rather
+        than guess.
+
+        Deliberately does NOT auto-remove what it finds (see the call site in
+        main()): the whole failure mode this exists to catch is one
+        registration silently winning over another, and picking "whichever
+        one you happened to run install/start on" as the automatic winner
+        would just move that same silent-overwrite risk one level up - a
+        stray bare `install ui` would delete the pinned `v3.2.0` registration
+        (losing its TP_VERSION/TP_OUTPUT_DIR pinning) rather than the other
+        way around. Report and refuse instead, same rule _free_ui_port
+        already applies to killing a PID it cannot positively identify as
+        ours.
+        """
+        return []
 
 
 # =============================================================================
@@ -529,6 +608,15 @@ class LaunchdManager(ServiceManager):
                 return line.strip()
         return "loaded"
 
+    def other_registrations(self, name):
+        # Glob rather than ask launchd: a stray plist with nothing currently
+        # loaded is still the bug waiting to happen the next time anything
+        # bootstraps it, so it needs to be found and reported too, not just
+        # the ones launchd currently shows as active.
+        mine = self.plist_path(name)
+        return [p.stem for p in self.agents_dir.glob(f"{self.LABEL_PREFIX}*.{name}.plist")
+                if p != mine]
+
 
 # =============================================================================
 #  Linux - systemd user units
@@ -646,6 +734,10 @@ WantedBy=default.target
         r = self._systemctl("is-active", self.unit(name))
         return (r.stdout or r.stderr).strip() or "unknown"
 
+    def other_registrations(self, name):
+        mine = self.unit(name)
+        return [p.name for p in self.unit_dir.glob(f"tp-{name}*.service") if p.name != mine]
+
 
 # =============================================================================
 #  Windows - Task Scheduler
@@ -724,6 +816,23 @@ class WindowsTaskManager(ServiceManager):
         lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
         return lines[-1].strip() if lines else "installed (no detail reported)"
 
+    def other_registrations(self, name):
+        mine = self.task(name)
+        r = subprocess.run(["schtasks", "/Query", "/FO", "CSV", "/NH"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            return []
+        prefix = f"TradingPlatform_{name}"
+        others = []
+        for line in r.stdout.splitlines():
+            fields = line.split('","')
+            if not fields:
+                continue
+            taskname = fields[0].strip('"').lstrip("\\")
+            if taskname.startswith(prefix) and taskname != mine:
+                others.append(taskname)
+        return others
+
 
 def _shquote(s) -> str:
     import shlex
@@ -778,6 +887,48 @@ def main(argv=None) -> int:
             continue
         if args.action != "status":
             print(f"{args.action} {name}")
+
+        # Refuse to install/start/restart while an OTHER registration of the
+        # SAME service (different suffix, including no suffix) still exists.
+        # See other_registrations()'s docstring for why this is a refusal
+        # and not an automatic cleanup: this is what was missing on
+        # 2026-07-26. `tp promote` uninstalls the OLD version's suffixed
+        # registration on every promote, but a bare `services.py install ui`
+        # (no --suffix) never touches a leftover one - so both end up
+        # installed, both KeepAlive/Restart=on-failure/ONLOGON, and each one
+        # resurrects the instant the other is killed for the same port. From
+        # the browser's side that looks exactly like a frontend bug
+        # (repeated "Failed to fetch" that clears itself after a moment) when
+        # it is really "you have two of these installed". Checked for every
+        # service, not just `ui`: scheduler and maverick can duplicate the
+        # same way, they just do not fight over a shared port, so the
+        # symptom is quieter (duplicate scan cycles, doubled API usage)
+        # rather than a visible outage.
+        if args.action in ("install", "start", "restart"):
+            others = mgr.other_registrations(name)
+            if others:
+                print(f"  ERROR: {name} has {len(others)} OTHER installed registration(s) "
+                      f"besides this one:")
+                for other_id in others:
+                    print(f"    {other_id}")
+                print(f"  Refusing to {args.action} - whichever one runs would fight the "
+                      f"other for the same process/port the moment either one restarts.")
+                print(f"  Keep exactly ONE. Remove the ones you do not want, then re-run:")
+                if isinstance(mgr, LaunchdManager):
+                    for other_id in others:
+                        print(f"    launchctl bootout gui/{os.getuid()}/{other_id} && "
+                              f"rm ~/Library/LaunchAgents/{other_id}.plist")
+                elif isinstance(mgr, SystemdManager):
+                    for other_id in others:
+                        print(f"    systemctl --user disable --now {other_id} && "
+                              f"rm ~/.config/systemd/user/{other_id} && "
+                              f"systemctl --user daemon-reload")
+                elif isinstance(mgr, WindowsTaskManager):
+                    for other_id in others:
+                        print(f"    schtasks /End /TN {other_id} && "
+                              f"schtasks /Delete /TN {other_id} /F")
+                continue
+
         # Free the port BEFORE any action that ends in a running UI. `stop`
         # alone is excluded: it has no bind to protect, and killing a holder we
         # were not asked to start would be a surprise.

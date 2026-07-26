@@ -40,6 +40,7 @@ from datetime import datetime, timedelta
 
 from mcp_clients.base import SourceCircuitBreaker
 from mcp_clients.defeatbeta_data import DefeatBetaProvider
+from storage import secrets as _secrets
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,29 @@ def _load_dotenv():
 
 
 _load_dotenv()
+
+
+def _key(name: str) -> str:
+    """Resolve a provider API key through storage.secrets rather than a bare
+    os.getenv (2026-07-26). The two are NOT equivalent for any process
+    launched by scripts/services.py (i.e. every `tp promote`-managed
+    scheduler/ui/maverick): _load_dotenv() above and storage.secrets both
+    compute their .env path relative to THIS module's own location, which in
+    a `tp install`/`tp promote` worktree is `~/tp/versions/<tag>/.env` - a
+    file that is never created there (`git worktree add` never checks out a
+    gitignored path, and nothing copies it in). A key that is only in the
+    PRIMARY checkout's .env is therefore invisible to a promoted version no
+    matter how this function resolves it.
+
+    storage.secrets adds one thing neither loader here has: the OS Keychain,
+    which is a single machine-wide store, not a per-directory file - so a key
+    mirrored in with `./scripts/tp secrets import .env` resolves identically
+    from the primary checkout AND every promoted worktree. Without this, a
+    provider that was genuinely fetching data (via the primary checkout, or
+    before a promote) starts reporting NOT_CONFIGURED the moment traffic
+    moves to a promoted worktree, even though nothing about the actual
+    credential changed."""
+    return _secrets.get(name, required=False) or ""
 
 
 class _RateLimiter:
@@ -110,8 +134,8 @@ class AlpacaProvider:
     name = "alpaca"
 
     def __init__(self):
-        self.key = os.getenv("ALPACA_API_KEY", "")
-        self.secret = os.getenv("ALPACA_API_SECRET", "")
+        self.key = _key("ALPACA_API_KEY")
+        self.secret = _key("ALPACA_API_SECRET")
         self.breaker = SourceCircuitBreaker("alpaca", 3, 300)  # quotes
         # 2026-07-21: bars and assets get their OWN breakers, same rationale
         # as the FMP split above - quotes/bars/assets are independently
@@ -273,7 +297,7 @@ class FinnhubProvider:
     name = "finnhub"
 
     def __init__(self):
-        self.key = os.getenv("FINNHUB_API_KEY", "")
+        self.key = _key("FINNHUB_API_KEY")
         self.breaker = SourceCircuitBreaker("finnhub", 3, 300)
         self.limiter = _RateLimiter(1.1)  # ~55/min, under the 60/min free cap
 
@@ -362,7 +386,7 @@ class TiingoProvider:
     name = "tiingo"
 
     def __init__(self):
-        self.key = os.getenv("TIINGO_API_KEY", "")
+        self.key = _key("TIINGO_API_KEY")
         self.breaker = SourceCircuitBreaker("tiingo", 3, 600)
         self.limiter = _RateLimiter(1.5)
 
@@ -425,7 +449,7 @@ class TwelveDataProvider:
     name = "twelvedata"
 
     def __init__(self):
-        self.key = os.getenv("TWELVEDATA_API_KEY", "")
+        self.key = _key("TWELVEDATA_API_KEY")
         self.breaker = SourceCircuitBreaker("twelvedata", 2, 900)
         # Free tier is 8 credits/min - this provider is a LAST resort, not a
         # scanning source. 9s interval keeps a slow trickle inside the cap.
@@ -509,7 +533,7 @@ class AlphaVantageProvider:
     _DAILY_BUDGET = 20
 
     def __init__(self):
-        self.key = os.getenv("ALPHAVANTAGE_API_KEY", "")
+        self.key = _key("ALPHAVANTAGE_API_KEY")
         self.breaker = SourceCircuitBreaker("alphavantage", 2, 3600)
         self.limiter = _RateLimiter(15.0)
         self._calls_today = 0
@@ -627,7 +651,7 @@ class FMPProvider:
     _BASE = "https://financialmodelingprep.com/stable"
 
     def __init__(self):
-        self.key = os.getenv("FMP_API_KEY", "")
+        self.key = _key("FMP_API_KEY")
         self.breaker = SourceCircuitBreaker("fmp", 3, 900)
         # 2026-07-21: grades/analyst-estimates get their OWN breaker,
         # separate from movers/stock-list/earnings above. Those two started
