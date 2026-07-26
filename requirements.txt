@@ -108,7 +108,12 @@ uvicorn==0.51.0
 websockets==16.1
 requests==2.31.0
 pyyaml==6.0.1
-rich==13.7.1
+rich==14.2.0             # was 13.7.1, a number nobody had run: main.py imports
+                         # rich at module scope and the UI process has been up
+                         # on 14.2.0. §13's rule is that a pin describes the
+                         # environment actually running, not a plausible one.
+                         # 13.7.1 also broke fastmcp-slim (needs >=13.9.4) in
+                         # the shared conda base. ROUTINE tier - no re-validation.
 tabulate==0.9.0
 
 # -----------------------------------------------------------------------------

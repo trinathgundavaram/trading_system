@@ -12,7 +12,6 @@ Run by scripts/release.sh and by the pre-commit hook on requirements.txt.
 """
 import pathlib
 import re
-import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -46,13 +45,35 @@ def wanted() -> dict:
 
 
 def installed() -> dict:
-    res = subprocess.run([sys.executable, "-m", "pip", "freeze"],
-                         capture_output=True, text=True)
+    """What is importable by THIS interpreter, from its installed metadata.
+
+    NOT `pip freeze` (2026-07-25). freeze renders a package installed from a
+    local wheel or built by conda as
+
+        pandas @ file:///croot/pandas_1234567890/work
+
+    rather than `pandas==2.3.3`, because that is the form that would reinstall
+    it. The old parser here kept only lines containing '==', so on the release
+    machine - an Anaconda base env - sixteen packages that were present and
+    working were reported as NOT INSTALLED, two of them flagged
+    SCORE-AFFECTING. pytest was in that list while running the suite that had
+    just passed.
+
+    That is worse than a missing check. §13 exists to make a real pandas drift
+    impossible to miss, and a guard that cries wolf about sixteen packages is
+    one nobody reads by the third release. importlib.metadata reads the same
+    .dist-info the import system reads, so it reports the version actually
+    loaded regardless of how it got there."""
+    from importlib import metadata
+
     out = {}
-    for line in res.stdout.splitlines():
-        if "==" in line and not line.startswith("#"):
-            k, _, v = line.partition("==")
-            out[norm(k)] = v.strip()
+    for dist in metadata.distributions():
+        name = dist.metadata["Name"]
+        if not name:
+            continue  # a broken .dist-info with no METADATA; not ours to fix
+        version = (dist.version or "").strip()
+        if version:
+            out[norm(name)] = version
     return out
 
 

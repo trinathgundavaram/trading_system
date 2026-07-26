@@ -193,25 +193,8 @@ def keyring_backend_name() -> str:
         return "unknown"
 
 
-@functools.lru_cache(maxsize=64)
-def _keychain(name: str) -> str:
-    """Read ``tp_<name>`` from the OS keyring. '' if absent or unavailable.
-
-    Keeps the ``tp_`` prefix the macOS implementation used so credentials
-    already imported by ``scripts/tp secrets import`` on this machine are
-    found unchanged - the Keychain items are the same items, the library
-    reading them is what changed.
-
-    Falls back to the ``security`` binary on macOS if the keyring package is
-    not installed, so an existing install keeps working before anyone runs
-    pip."""
-    kr = _backend()
-    if kr is not None:
-        try:
-            return kr.get_password(SERVICE, f"tp_{name}") or ""
-        except Exception as e:
-            logger.warning(f"storage.secrets: keyring read failed for {name}: {e}")
-            return ""
+def _keychain_security_binary(name: str) -> str:
+    """Read the PRE-§44 item with the macOS ``security`` binary. '' if absent."""
     if platform.system() != "Darwin":
         return ""
     try:
@@ -224,6 +207,74 @@ def _keychain(name: str) -> str:
     except Exception:
         pass
     return ""
+
+
+@functools.lru_cache(maxsize=64)
+def _keychain(name: str) -> str:
+    """Read ``tp_<name>`` from the OS keyring. '' if absent or unavailable.
+
+    THREE LOCATIONS ARE READ, AND THE ORDER IS A MIGRATION (2026-07-25). §44
+    shipped claiming the ``tp_`` prefix meant "the Keychain items are the same
+    items, the library reading them is what changed". That was wrong, and it
+    is the kind of wrong that produces a silent credential outage on upgrade:
+
+        pre-§44   security -s tp_UI_AUTH_TOKEN -a $USER
+                  -> Keychain service='tp_UI_AUTH_TOKEN', account=$USER
+        §44       keyring.get_password("trading_platform", "tp_UI_AUTH_TOKEN")
+                  -> Keychain service='trading_platform', account='tp_UI_AUTH_TOKEN'
+
+    The prefix moved from the SERVICE field to the ACCOUNT field and the
+    service became a constant, so these are two different Keychain items.
+    Every secret stored by the old code became invisible to the new code the
+    moment ``keyring`` was installed - and because ``get()`` falls through to
+    the environment and ``.env`` first, the symptom is not an error but an
+    empty string arriving somewhere that treats empty as "not configured".
+    On a machine whose UI token lived only in the Keychain, that silently
+    503s every write endpoint on the dashboard.
+
+    So: read the new location, then the legacy location through keyring, then
+    the ``security`` binary (which is also the path when keyring is not
+    installed at all). Anything found in a legacy location is written forward
+    to the new one, so the migration happens once, on first read, without
+    anybody having to know it was needed."""
+    kr = _backend()
+    if kr is not None:
+        try:
+            val = kr.get_password(SERVICE, f"tp_{name}")
+            if val:
+                return val
+        except Exception as e:
+            logger.warning(f"storage.secrets: keyring read failed for {name}: {e}")
+        try:
+            legacy = kr.get_password(f"tp_{name}", os.environ.get("USER", "")) or ""
+        except Exception:
+            legacy = ""
+        if legacy:
+            return _migrate_forward(name, legacy, "the pre-§44 keyring location")
+
+    found = _keychain_security_binary(name)
+    if found:
+        return _migrate_forward(name, found, "the pre-§44 `security` item")
+    return ""
+
+
+def _migrate_forward(name: str, value: str, where: str) -> str:
+    """Copy a legacy secret into the §44 location. Never fatal, never logs the
+    value. The old item is deliberately NOT deleted: a rollback to v2.0.0 has
+    to keep working, and an upgrade that destroys the only copy of a
+    credential is a worse failure than reading two places forever."""
+    kr = _backend()
+    if kr is not None:
+        try:
+            kr.set_password(SERVICE, f"tp_{name}", value)
+            logger.warning(f"storage.secrets: {name} was found in {where} and has been "
+                           f"copied to the current one. The old item is left in place "
+                           f"for rollback; `./scripts/tp secrets check` now sees both.")
+        except Exception as e:
+            logger.warning(f"storage.secrets: {name} read from {where}, but writing it "
+                           f"to the current location failed ({e}) - it will be read from "
+                           f"the old one again next time.")
+    return value
 
 
 def set_(name: str, value: str) -> None:

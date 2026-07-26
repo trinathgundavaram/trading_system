@@ -16,7 +16,6 @@ alone - silently unpinning it would be the opposite of the point.
 """
 import pathlib
 import re
-import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -31,15 +30,30 @@ def norm(name: str) -> str:
     return _NORM.sub("-", name.strip().lower())
 
 
-def freeze() -> dict:
-    res = subprocess.run([sys.executable, "-m", "pip", "freeze"],
-                         capture_output=True, text=True)
+def freeze() -> tuple[dict, str]:
+    """Installed distributions as {normalised name: version}, plus a lock body.
+
+    Reads installed metadata rather than `pip freeze`, for the reason spelled
+    out in check_deps.py: freeze emits `pandas @ file:///croot/...` for a
+    conda-built or locally-installed wheel, which this parser dropped on the
+    floor - so on an Anaconda env the pins that most need checking were the
+    ones silently skipped.
+
+    It matters twice as much here. The lock file used to be raw freeze output,
+    so a `@ file://` line would be written into requirements.lock.txt - a path
+    on ONE machine, in the file whose entire purpose (§42) is letting another
+    machine rebuild this environment and get the same numbers. The lock is now
+    synthesised as name==version, which is portable by construction."""
+    from importlib import metadata
+
     out = {}
-    for line in res.stdout.splitlines():
-        if "==" in line and not line.startswith("#"):
-            k, _, v = line.partition("==")
-            out[norm(k)] = v.strip()
-    return out, res.stdout
+    for dist in metadata.distributions():
+        name = dist.metadata["Name"]
+        version = (dist.version or "").strip()
+        if name and version:
+            out[norm(name)] = version
+    body = "".join(f"{n}=={v}\n" for n, v in sorted(out.items()))
+    return out, body
 
 
 def main() -> int:

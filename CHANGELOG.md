@@ -83,6 +83,23 @@ identically. This is what makes Phase 4 provable rather than hopeful.
   on headless Linux. Environment stays FIRST, deliberately, because that is
   what makes containers and CI possible.
 
+  **The upgrade silently orphaned every stored secret — caught before tagging.**
+  §44 claimed that keeping the `tp_` prefix meant "the Keychain items are the
+  same items, the library reading them is what changed". It did not. The old
+  code stored service=`tp_UI_AUTH_TOKEN`, account=`$USER`; `keyring` stores
+  service=`trading_platform`, account=`tp_UI_AUTH_TOKEN`. The prefix moved from
+  one Keychain field to another, which makes two different items — so on any
+  machine with `keyring` installed, every credential written by v2.0.0 became
+  invisible. Not as an error: `get()` falls through to the environment, so the
+  caller receives `''`, and an empty `UI_AUTH_TOKEN` 503s every write endpoint
+  on a dashboard that otherwise looks healthy. `_keychain()` now reads the
+  current location, then the legacy one, then the `security` binary (which an
+  installed `keyring` used to short-circuit — on exactly the machine that has a
+  legacy item to find), and copies anything found forward so the migration
+  happens once, on first read. The old item is deliberately left in place: a
+  rollback to v2.0.0 has to keep working, and an upgrade that destroys the only
+  copy of a credential is worse than reading two locations forever.
+
 - background services exist on every OS — `scripts/services.py`, `service.sh` — §45
 
   `service.sh` was 100% launchd. Elsewhere the scheduler ran in a foreground
@@ -156,6 +173,28 @@ identically. This is what makes Phase 4 provable rather than hopeful.
 - `scripts/bootstrap.py` reports what is missing with the install command for
   *this* OS — §46.2
 - `psutil`, `keyring`, `keyrings.cryptfile`, `tzdata` pinned — `requirements.txt`
+- `rich` pinned 13.7.1 → **14.2.0**. 13.7.1 was a number nobody had run:
+  `main.py` imports `rich` at module scope and the UI process has been up on
+  14.2.0 throughout, so the pin described an environment that did not exist —
+  the exact failure §13 is for. Installing it also broke an unrelated package
+  in the shared conda base (`fastmcp-slim` needs `rich>=13.9.4`). ROUTINE tier:
+  presentation only, no score moves, no re-validation.
+- **§13's drift guard stopped crying wolf** — `scripts/check_deps.py`,
+  `scripts/pin_requirements.py`
+
+  Both read `pip freeze` and kept only lines containing `==`. A conda-built or
+  locally-installed distribution is rendered `pandas @ file:///croot/...`,
+  because that is the form that would reinstall it — so on the release machine,
+  an Anaconda base env, sixteen packages that were present and working were
+  reported NOT INSTALLED, two flagged SCORE-AFFECTING, `pytest` among them
+  while it was running the suite that had just passed. A guard that is wrong
+  about sixteen packages is one nobody reads by the third release, which
+  defeats the point of having it. Both now read installed metadata via
+  `importlib.metadata` — the same `.dist-info` the import system reads, so the
+  reported version is the one actually loaded however it was installed. As a
+  consequence `requirements.lock.txt` is synthesised as `name==version` rather
+  than raw freeze output, which could otherwise write a `file:///` path from
+  one machine into the file whose purpose (§42) is rebuilding elsewhere.
 - `tests/test_phase3_portability.py`, including a lint that fails the build if
   a macOS-only binary appears in the engine
 

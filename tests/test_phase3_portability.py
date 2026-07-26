@@ -355,6 +355,69 @@ class TestSecrets:
             secrets.get("ANYTHING", required=False)
         assert not loader.called
 
+    def test_a_pre_44_keyring_item_is_still_found(self):
+        """§44 moved the `tp_` prefix from the Keychain SERVICE field to the
+        ACCOUNT field, which makes the old and new items two different items -
+        so installing `keyring` made every previously stored secret vanish.
+        Silently: get() falls through to the environment, so the caller
+        receives '' rather than an error, and an empty UI_AUTH_TOKEN 503s every
+        write endpoint on a dashboard that looks healthy."""
+        from storage import secrets
+
+        class _LegacyOnly:
+            def get_password(self, service, account):
+                # The pre-§44 layout: service='tp_NAME', account=$USER.
+                return "legacy-value" if service == "tp_UI_AUTH_TOKEN" else None
+
+            def set_password(self, service, account, value):
+                self.written = (service, account, value)
+
+        kr = _LegacyOnly()
+        secrets._keychain.cache_clear()
+        with mock.patch.object(secrets, "_backend", return_value=kr):
+            assert secrets._keychain("UI_AUTH_TOKEN") == "legacy-value"
+        secrets._keychain.cache_clear()
+        assert kr.written == (secrets.SERVICE, "tp_UI_AUTH_TOKEN", "legacy-value"), \
+            "a legacy secret must be copied forward, so the migration happens once"
+
+    def test_the_current_location_wins_over_the_legacy_one(self):
+        """Order matters: after a rotation the new item is the real one, and
+        reading the stale legacy copy would resurrect a retired credential."""
+        from storage import secrets
+
+        class _Both:
+            def get_password(self, service, account):
+                return "current" if service == secrets.SERVICE else "legacy"
+
+            def set_password(self, *a):
+                raise AssertionError("nothing to migrate")
+
+        secrets._keychain.cache_clear()
+        with mock.patch.object(secrets, "_backend", return_value=_Both()):
+            assert secrets._keychain("UI_AUTH_TOKEN") == "current"
+        secrets._keychain.cache_clear()
+
+    def test_the_security_binary_is_still_tried_when_keyring_finds_nothing(self):
+        """Before this, an installed keyring short-circuited the `security`
+        path entirely - which is precisely the machine that has a pre-§44 item
+        to find."""
+        from storage import secrets
+
+        class _Empty:
+            def get_password(self, *a):
+                return None
+
+            def set_password(self, *a):
+                pass
+
+        secrets._keychain.cache_clear()
+        with mock.patch.object(secrets, "_backend", return_value=_Empty()), \
+             mock.patch.object(secrets, "_keychain_security_binary",
+                               return_value="from-security") as sec:
+            assert secrets._keychain("UI_AUTH_TOKEN") == "from-security"
+        secrets._keychain.cache_clear()
+        assert sec.called
+
     def test_set_without_a_backend_raises_rather_than_writing_a_file(self):
         """Somewhere that cannot store a secret encrypted must say so out
         loud. Writing plaintext 'as a convenience' is the failure §3 exists to
@@ -386,6 +449,66 @@ class TestSecrets:
         from storage import secrets
 
         assert isinstance(secrets.keyring_backend_name(), str)
+
+
+# =============================================================================
+#  §13  the dependency guard reads metadata, not `pip freeze`
+# =============================================================================
+class TestDependencyCheck:
+    """§13 is only worth having if its output is believable. On an Anaconda
+    env it reported sixteen present, working packages as NOT INSTALLED -
+    including pytest, while pytest was running it - because a conda-built or
+    locally-installed distribution appears in `pip freeze` as
+    `pandas @ file:///croot/...`, not `pandas==2.3.3`, and the parser kept only
+    lines containing '=='. Two of the sixteen were flagged SCORE-AFFECTING, so
+    the loudest possible warning was also the least trustworthy one."""
+
+    def _mod(self, name, path):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(name, REPO / path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_installed_set_includes_a_package_pip_freeze_renders_as_a_url(self):
+        """pytest itself is the fixture: it is unquestionably importable, so
+        any correct implementation reports it, whatever form it was installed
+        in."""
+        check_deps = self._mod("check_deps", "scripts/check_deps.py")
+
+        have = check_deps.installed()
+        assert check_deps.norm("pytest") in have
+        assert have[check_deps.norm("pytest")]
+
+    def test_no_pinned_package_is_reported_missing_while_importable(self):
+        """The specific false alarm: a name pinned in requirements.txt that
+        imports fine here must not appear as NOT INSTALLED."""
+        import importlib.util
+
+        check_deps = self._mod("check_deps", "scripts/check_deps.py")
+        want, have = check_deps.wanted(), check_deps.installed()
+
+        lying = []
+        for pinned in want:
+            if pinned in have:
+                continue
+            mod = pinned.replace("-", "_")
+            if importlib.util.find_spec(mod) is not None:
+                lying.append(pinned)
+        assert not lying, f"reported NOT INSTALLED but importable: {lying}"
+
+    def test_the_lock_body_is_portable(self):
+        """requirements.lock.txt used to be raw freeze output, so a
+        `@ file:///croot/...` line - a path on one machine - could land in the
+        file whose whole purpose (§42) is rebuilding this environment
+        elsewhere."""
+        pin = self._mod("pin_requirements", "scripts/pin_requirements.py")
+
+        _, body = pin.freeze()
+        assert body.strip(), "a lock body with no entries is not a lock"
+        for line in body.splitlines():
+            assert "==" in line and " @ " not in line and "file://" not in line, line
 
 
 # =============================================================================
