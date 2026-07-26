@@ -93,20 +93,29 @@ def build_pattern_features(ticker: str, td, mkt, buy_result, cfg: dict,
             f"bucket{i+1}_score": (b.points / b.max_points * 100 if b.max_points else 0.0)
             for i, b in enumerate(score_result.buckets)
         }
-        # HONESTY NOTE: rules/swing_buy_rules.py now scores 7 buckets (added
-        # VOLATILITY_EXPANSION), so this produces bucket1_score..bucket7_score.
-        # learning/pattern_database.py's NUMERIC_FEATURES only lists
-        # bucket1_score..bucket6_score - bucket7_score is silently dropped
-        # when this dict is written to the pattern database (Python dict
-        # extra keys are just ignored there, not an error). Not extended here
-        # since that's a real schema migration (NUMERIC_FEATURES + a DB
-        # column + backfill for existing rows) beyond what was asked for -
-        # flagging so it isn't mistaken for an oversight.
+        # HONESTY NOTE (resolved 2026-07-26, audit finding P1-01):
+        # rules/swing_buy_rules.py scores 7 buckets (added VOLATILITY_EXPANSION),
+        # so this produces bucket1_score..bucket7_score. bucket7_score used to
+        # be silently dropped by learning/pattern_database.py's NUMERIC_FEATURES
+        # (which only listed bucket1_score..bucket6_score), so the live scorer
+        # and the learning/similarity engine saw different feature spaces.
+        # NUMERIC_FEATURES now includes bucket7_score, and rows recorded before
+        # this fix (which never had the key at all) are treated as MISSING -
+        # not a measured zero - via KEY_ABSENT_AS_MISSING_NUMERIC there. No
+        # backfill/column migration was needed since `features` is stored as
+        # one JSON blob per row, not discrete columns.
     else:
         top_signal = buy_result.top_signals[0].name if buy_result.top_signals else "unspecified"
         rules_passed = [r.name for r in buy_result.rules_passed]
         final_score = buy_result.pct_score
-        bucket_scores = {f"bucket{i}_score": 0.0 for i in range(1, 7)}
+        # range(1, 8): the legacy buy_result.py path predates all 7 buckets
+        # (including VOLATILITY_EXPANSION), so every bucketN_score here is
+        # already a constant placeholder, not a real measurement - bucket7
+        # is included for the same reason bucket1..bucket6 are, so it isn't
+        # a key that's silently absent from this path's rows (see P1-01 note
+        # above; that fix is about the score_result path, which is the one
+        # that actually measures VOLATILITY_EXPANSION).
+        bucket_scores = {f"bucket{i}_score": 0.0 for i in range(1, 8)}
 
     # Outage hygiene flag (2026-07-15c, external review): patterns recorded
     # while EXTERNAL sources were down carry a redistributed-weight score

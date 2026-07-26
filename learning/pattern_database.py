@@ -28,7 +28,7 @@ NUMERIC_FEATURES = [
     "gap_pct", "change_pct", "volume_ratio", "premarket_gap", "premarket_rvol",
     "rsi14", "bb_pct", "adx", "cmf", "stochastic_k",
     "bucket1_score", "bucket2_score", "bucket3_score", "bucket4_score",
-    "bucket5_score", "bucket6_score", "final_score",
+    "bucket5_score", "bucket6_score", "bucket7_score", "final_score",
     "sector_rs_1d", "sector_rs_1m",
 ]
 CATEGORICAL_FEATURES = [
@@ -80,6 +80,28 @@ SCHEMA_1_UNRECORDED_CATEGORICAL = ("squeeze_active", "unusual_options", "opex_st
 # that is simply absent, which is a different situation.
 UNRECORDED = "__unrecorded__"
 
+# Sentinel distinguishing "key never written" from "key present with value
+# None/0.0" for numeric features. Plain dict.get(key) can't tell those apart,
+# and for bucket7_score (below) the difference matters: a real 0.0 reading of
+# the VOLATILITY_EXPANSION bucket is evidence, but a row recorded before that
+# bucket existed (or via the legacy buy_result.py path, which never wrote
+# bucket7_score at all - see engine/pattern_features.py) has no such evidence
+# and must not be silently scored as "measured zero volatility expansion".
+_KEY_ABSENT = object()
+
+# Numeric features that may be genuinely absent from a stored row's `features`
+# dict (as opposed to schema-1's *always-present-but-constant* fields above),
+# and must therefore be treated as MISSING - not zero - whenever the key is
+# not there at all. Audit finding P1-01 (external review, 2026-07-26): the
+# live scorer has produced 7 buckets since VOLATILITY_EXPANSION was added, but
+# this schema only recognized 6, so bucket7_score was silently dropped from
+# every similarity comparison even though rules/swing_buy_rules.py /
+# engine/pattern_features.py have been computing and storing it all along.
+# Fixed by adding it to NUMERIC_FEATURES above; this set is what keeps that
+# addition from retroactively asserting "measured zero" on the pre-existing
+# rows that predate it.
+KEY_ABSENT_AS_MISSING_NUMERIC = ("bucket7_score",)
+
 
 def _row_schema(feats: dict) -> int:
     return int(feats.get("feature_schema") or 1)
@@ -122,6 +144,11 @@ def _encode_patterns(patterns: list[dict], query_features: dict) -> tuple[np.nda
         row = []
         for f in NUMERIC_FEATURES:
             if stale and f in SCHEMA_1_UNRECORDED_NUMERIC:
+                row.append(np.nan)
+                continue
+            if f in KEY_ABSENT_AS_MISSING_NUMERIC and feats.get(f, _KEY_ABSENT) is _KEY_ABSENT:
+                # Key was never written for this row (pre-bucket7 row, or the
+                # legacy buy_result.py path) - MISSING, not a measured zero.
                 row.append(np.nan)
                 continue
             v = feats.get(f)

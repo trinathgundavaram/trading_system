@@ -3727,52 +3727,61 @@ async function renderLearningTab(el) {
   loadBacktestPanel(); // fire-and-forget - independent of the learning_runs early-return below
 
   const runsBody = document.getElementById("learning-runs-body");
-  let runs;
+  // 2026-07-26: everything - the fetch AND the HTML-building below - is now
+  // wrapped in ONE try/catch (same fix already applied to renderStrategyTab/
+  // renderPerformanceTab - see their comments for the exact failure shape).
+  // Previously only the fetch was guarded, so any exception while building
+  // the rule-attribution table or the champion/challenger summary (a
+  // malformed/partial learning_runs row, a field the backend hasn't started
+  // sending yet, etc.) was an UNCAUGHT rejection: the panel stayed on
+  // "Loading…" forever with nothing but a console error, rather than the
+  // "Couldn't load this panel" message tabErrorHTML actually produces -
+  // which meant a real failure here was invisible, not just unhelpfully
+  // worded.
   try {
-    runs = await fetchJSON("/api/learning/runs?limit=10");
+    const runs = await fetchJSON("/api/learning/runs?limit=10");
+    if (!runs.length) {
+      runsBody.innerHTML = emptyBlock('learning', 'No automated runs yet',
+        `scheduler.py runs this every ${state.config?.learning?.walk_forward_trigger_trades ?? 50} closed trades or ${state.config?.learning?.walk_forward_trigger_days ?? 30} days, whichever comes first.`);
+      return;
+    }
+    const latest = runs[0];
+    const props = Object.entries(latest.proposals?.proposals || {});
+    const stable = props.filter(([,p]) => p.stability?.stability_label === 'STABLE' && !p.attribution?.insufficient_data);
+    const other = props.filter(([,p]) => !(p.stability?.stability_label === 'STABLE' && !p.attribution?.insufficient_data));
+
+    const ruleRow = ([name, p]) => {
+      const a = p.attribution || {}, s = p.stability || {};
+      const edge = a.edge != null ? (a.edge*100).toFixed(1)+'pp' : '—';
+      const badge = s.stability_label === 'STABLE' ? 'pill-green' : s.stability_label === 'SPIKING' ? 'pill-yellow' : s.stability_label === 'VOLATILE' ? 'pill-red' : 'pill';
+      return `<tr>
+        <td><code style="font-size:12px;">${name}</code></td>
+        <td class="num">${a.n_fired ?? 0}</td>
+        <td class="num">${edge}</td>
+        <td><span class="pill ${badge}">${s.stability_label || '—'}</span></td>
+        <td class="subtle">${a.insufficient_data ? 'insufficient data (<20 fires)' : ''}</td>
+      </tr>`;
+    };
+
+    runsBody.innerHTML = `
+      <p class="field-desc" style="margin-bottom:10px;">
+        Last run: <b>${fmtCST(latest.run_at)}</b> —
+        trigger: <span class="subtle">${latest.trigger_reason}</span> —
+        ${latest.n_patterns} closed patterns analyzed —
+        ${latest.challenges_evaluated?.length || 0} active challenger test(s) evaluated.
+        Every result below is a <b>proposal for human review</b> — nothing is auto-applied to rule weights.
+      </p>
+      ${props.length ? `<div class="table-wrap"><table><thead><tr><th>Rule</th><th class="num">Fired</th><th class="num">Edge</th><th>Stability</th><th>Note</th></tr></thead><tbody>
+        ${[...stable, ...other].map(ruleRow).join('')}
+      </tbody></table></div>` : `<p class="field-desc">No rule attribution data yet — needs closed patterns with <code>rules_passed</code> populated.</p>`}
+      ${latest.challenges_evaluated?.length ? `<div style="margin-top:14px;">
+        <div class="field-label">Champion/Challenger</div>
+        ${latest.challenges_evaluated.map(c => `<p class="field-desc">${c.challenge_id?.slice(0,8) || '—'}: ${c.ready ? `<b>${c.recommendation}</b> (champion ${(c.champion_win_rate*100).toFixed(0)}% vs challenger ${(c.challenger_win_rate*100).toFixed(0)}%)` : (c.message || c.error || 'not ready')}</p>`).join('')}
+      </div>` : ''}
+    `;
   } catch (e) {
     runsBody.innerHTML = tabErrorHTML(e);
-    return;
   }
-  if (!runs.length) {
-    runsBody.innerHTML = emptyBlock('learning', 'No automated runs yet',
-      `scheduler.py runs this every ${state.config?.learning?.walk_forward_trigger_trades ?? 50} closed trades or ${state.config?.learning?.walk_forward_trigger_days ?? 30} days, whichever comes first.`);
-    return;
-  }
-  const latest = runs[0];
-  const props = Object.entries(latest.proposals?.proposals || {});
-  const stable = props.filter(([,p]) => p.stability?.stability_label === 'STABLE' && !p.attribution?.insufficient_data);
-  const other = props.filter(([,p]) => !(p.stability?.stability_label === 'STABLE' && !p.attribution?.insufficient_data));
-
-  const ruleRow = ([name, p]) => {
-    const a = p.attribution || {}, s = p.stability || {};
-    const edge = a.edge != null ? (a.edge*100).toFixed(1)+'pp' : '—';
-    const badge = s.stability_label === 'STABLE' ? 'pill-green' : s.stability_label === 'SPIKING' ? 'pill-yellow' : s.stability_label === 'VOLATILE' ? 'pill-red' : 'pill';
-    return `<tr>
-      <td><code style="font-size:12px;">${name}</code></td>
-      <td class="num">${a.n_fired ?? 0}</td>
-      <td class="num">${edge}</td>
-      <td><span class="pill ${badge}">${s.stability_label || '—'}</span></td>
-      <td class="subtle">${a.insufficient_data ? 'insufficient data (<20 fires)' : ''}</td>
-    </tr>`;
-  };
-
-  runsBody.innerHTML = `
-    <p class="field-desc" style="margin-bottom:10px;">
-      Last run: <b>${fmtCST(latest.run_at)}</b> —
-      trigger: <span class="subtle">${latest.trigger_reason}</span> —
-      ${latest.n_patterns} closed patterns analyzed —
-      ${latest.challenges_evaluated?.length || 0} active challenger test(s) evaluated.
-      Every result below is a <b>proposal for human review</b> — nothing is auto-applied to rule weights.
-    </p>
-    ${props.length ? `<div class="table-wrap"><table><thead><tr><th>Rule</th><th class="num">Fired</th><th class="num">Edge</th><th>Stability</th><th>Note</th></tr></thead><tbody>
-      ${[...stable, ...other].map(ruleRow).join('')}
-    </tbody></table></div>` : `<p class="field-desc">No rule attribution data yet — needs closed patterns with <code>rules_passed</code> populated.</p>`}
-    ${latest.challenges_evaluated?.length ? `<div style="margin-top:14px;">
-      <div class="field-label">Champion/Challenger</div>
-      ${latest.challenges_evaluated.map(c => `<p class="field-desc">${c.challenge_id?.slice(0,8) || '—'}: ${c.ready ? `<b>${c.recommendation}</b> (champion ${(c.champion_win_rate*100).toFixed(0)}% vs challenger ${(c.challenger_win_rate*100).toFixed(0)}%)` : c.message}</p>`).join('')}
-    </div>` : ''}
-  `;
 }
 
 // 2026-07-23: Learning tab's "Historical Replay (Backtest)" panel -

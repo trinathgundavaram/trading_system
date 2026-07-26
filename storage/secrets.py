@@ -146,6 +146,55 @@ def load_dotenv(path: Path | str | None = None) -> int:
 
 SERVICE = "trading_platform"
 
+# Max time to wait on a single OS keyring call (2026-07-26, external report -
+# "Learning tab loads then errors on multiple panels"). Two real
+# backtest_runs subprocess logs from production were found EMPTY - zero
+# bytes, not even the first print statement in run_backtest.py's main(),
+# which runs before any network call. The only thing between process start
+# and that print is load_config_dict() -> secrets.get() -> the keyring probe
+# below, and macOS Keychain access from a freshly-spawned, non-interactive
+# subprocess (no window-server session attached) can present an "Allow
+# access?" prompt that nothing will ever click - the call just blocks
+# forever. A hung subprocess never reaches run_and_persist()'s
+# status='failed' write either, so nothing surfaces as an error anywhere -
+# not the log, not the UI, not the database. It just silently never
+# finishes, and every later attempt to read backtest_runs/learning_runs
+# through the same process (or one waiting on the same lock) times out
+# client-side instead, which is what "Couldn't load this panel" actually was.
+_KEYRING_TIMEOUT_S = float(os.getenv("TP_KEYRING_TIMEOUT_S", "5"))
+
+
+def _run_with_timeout(fn, timeout: float = _KEYRING_TIMEOUT_S):
+    """Runs `fn()` on a daemon thread; raises TimeoutError if it doesn't
+    finish within `timeout` seconds.
+
+    A daemon thread, not signal.alarm or a ThreadPoolExecutor: signal-based
+    timeouts only work on the main thread, but server.py's request handlers
+    (which also resolve secrets, via require_token) do not run on it. A
+    ThreadPoolExecutor's worker threads are non-daemon and would keep a
+    short-lived process like run_backtest.py's subprocess alive past exit
+    waiting to join a thread that may never return. A daemon thread left
+    running after this function gives up is exactly as harmless as the hang
+    already was - invisible, doing nothing - except now the CALLER moves on
+    instead of hanging with it.
+    """
+    box: dict = {}
+
+    def _target():
+        try:
+            box["value"] = fn()
+        except Exception as e:
+            box["error"] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"timed out after {timeout}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
 
 def _strict() -> bool:
     """True when the plaintext ``.env`` tier is disabled (see module docstring)."""
@@ -168,7 +217,17 @@ def _backend():
         kr = keyring.get_keyring()
         if isinstance(kr, FailKeyring):
             raise RuntimeError("no usable keyring backend on this machine")
-        keyring.get_password(SERVICE, "__probe__")
+        # Timeout-guarded (see _run_with_timeout / _KEYRING_TIMEOUT_S above) -
+        # an OS permission prompt (e.g. macOS Keychain, "Allow access?") with
+        # no window-server session to answer it would otherwise hang this
+        # call, and every caller behind it, forever.
+        try:
+            _run_with_timeout(lambda: keyring.get_password(SERVICE, "__probe__"))
+        except TimeoutError:
+            raise RuntimeError(
+                f"keyring probe did not respond within {_KEYRING_TIMEOUT_S}s - "
+                f"likely an OS permission prompt with nobody to answer it "
+                f"(common for a background/non-interactive process)")
         logger.debug(f"storage.secrets: keyring backend {type(kr).__name__}")
         return keyring
     except ImportError:
@@ -239,14 +298,23 @@ def _keychain(name: str) -> str:
     anybody having to know it was needed."""
     kr = _backend()
     if kr is not None:
+        # Timeout-guarded, same reasoning as _backend()'s probe above: this is
+        # a per-secret Keychain read, and a passing probe does not guarantee a
+        # later per-item ACL prompt can't still block indefinitely.
         try:
-            val = kr.get_password(SERVICE, f"tp_{name}")
+            val = _run_with_timeout(lambda: kr.get_password(SERVICE, f"tp_{name}"))
             if val:
                 return val
+        except TimeoutError:
+            logger.warning(
+                f"storage.secrets: keyring read for {name} did not respond within "
+                f"{_KEYRING_TIMEOUT_S}s - treating as unavailable this call and "
+                f"falling through to legacy locations / environment")
         except Exception as e:
             logger.warning(f"storage.secrets: keyring read failed for {name}: {e}")
         try:
-            legacy = kr.get_password(f"tp_{name}", os.environ.get("USER", "")) or ""
+            legacy = _run_with_timeout(
+                lambda: kr.get_password(f"tp_{name}", os.environ.get("USER", "")) or "")
         except Exception:
             legacy = ""
         if legacy:

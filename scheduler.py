@@ -1239,7 +1239,36 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                     # trade WOULD have taken - that figure is the whole value
                     # of the counterfactual, and computing it costs nothing
                     # since sizing has already run.
-                    if portfolio_risk_result is not None and not portfolio_risk_result.allowed:
+                    if portfolio_risk_result is None and not watch_mode:
+                        # P1-07 (audit finding, external review 2026-07-26):
+                        # the try/except around PortfolioRiskEngine.evaluate()
+                        # above logs and swallows any exception, leaving
+                        # portfolio_risk_result=None - which this block used
+                        # to treat as "no opinion, proceed" (the `is not None`
+                        # guard skipped the whole check). For a REAL order
+                        # that is fail-OPEN: a risk-engine crash silently
+                        # removed the only thing standing between a signal
+                        # and an unbounded-concentration live trade. Live
+                        # mode now fails CLOSED - an unevaluable portfolio
+                        # risk check blocks the buy exactly like a measured
+                        # severe breach would. Paper/watch mode is left
+                        # advisory (unchanged) since nothing real is at stake
+                        # and blocking it would also break paper trading
+                        # whenever the risk engine has a transient bug.
+                        _would_have = getattr(position_size, "suggested_dollar_amount", None)
+                        logger.error(f"{ticker}: BUY blocked - portfolio risk could not be "
+                                     f"evaluated (see error above) and live mode fails closed")
+                        _log_rejected(db, ticker, "portfolio_risk_unavailable",
+                                      "portfolio risk engine raised an exception; "
+                                      "live mode fails closed rather than proceeding unchecked",
+                                      _buy_score, td.price, _would_have)
+                        db.log_ui_event("buy_blocked", {
+                            "ticker": ticker, "stage": "portfolio_risk_unavailable",
+                            "reason": "portfolio risk engine unavailable; live fails closed",
+                            "would_have_size": _would_have,
+                        })
+                        continue_buy = False
+                    elif portfolio_risk_result is not None and not portfolio_risk_result.allowed:
                         _would_have = getattr(position_size, "suggested_dollar_amount", None)
                         logger.info(f"{ticker}: BUY blocked by portfolio risk - "
                                     f"{portfolio_risk_result.reason}")

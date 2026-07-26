@@ -305,6 +305,41 @@ def _buying_power(account_number: str = None) -> float | None:
     return None
 
 
+def account_cash(cfg: dict) -> float | None:
+    """Uninvested cash in the live account, for rules/risk_rules.daily_loss_limit's
+    equity = cash + deployed-at-cost calculation (audit finding P1-08,
+    external review 2026-07-26).
+
+    Deliberately reads Robinhood's 'cash' field, not 'buying_power' -
+    buying_power can include margin extension, which would OVERSTATE equity
+    and make the percentage-based daily-loss limit too loose. That would trade
+    one wrong direction (limit too tight, since live equity previously omitted
+    cash entirely) for a worse one (limit too loose on a margin-enabled
+    account), which is not the fix.
+
+    Login + one profile read, same call live_trader already makes via
+    _buying_power() before every live order - this just runs at most once per
+    cycle (rules/risk_rules.py's daily_loss_limit is called once per cycle,
+    not per ticker) rather than per order. Returns None on any failure
+    (no credentials, login failure, network error) so the caller can fall back
+    to its pre-existing deployed-only figure exactly as before - this makes
+    the calculation more accurate when the account is reachable, and never
+    less safe when it is not.
+    """
+    if not _login():
+        return None
+    try:
+        acct = _account_number(cfg)
+        rh = _rh()
+        profile = rh.profiles.load_account_profile(account_number=acct) or {}
+        v = profile.get("cash")
+        if v not in (None, ""):
+            return float(v)
+    except Exception as e:
+        logger.warning(f"live_trader: account cash read failed: {e}")
+    return None
+
+
 def _wait_for_fill(order_id: str) -> dict | None:
     """Polls the order until filled; cancels and returns None if it doesn't
     fill inside FILL_WAIT_SECONDS (the local book must never record a fill

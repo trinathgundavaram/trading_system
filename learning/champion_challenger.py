@@ -25,7 +25,13 @@ class ChampionChallenger:
     def evaluate(self, challenge_id: str) -> dict:
         row = self.db.get_challenge(challenge_id)
         if not row:
-            return {"error": "challenge not found"}
+            # `ready: False` alongside `error` (2026-07-26): every OTHER
+            # non-ready return from this method sets ready=False, and
+            # server.py/the UI's Learning tab render `c.ready ? ... : ...`
+            # unconditionally - a dict with neither `ready` nor `message` set
+            # rendered as the literal string "undefined" in that branch.
+            return {"error": "challenge not found", "ready": False,
+                    "message": "challenge not found"}
 
         min_trades = self.cfg["learning"].get("champion_challenger_min_trades_for_significance", 30)
         champ_n, chal_n = row["champion_trades"], row["challenger_trades"]

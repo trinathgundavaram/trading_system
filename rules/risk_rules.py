@@ -85,7 +85,28 @@ def daily_loss_limit(db, cfg: dict, simulated: bool) -> float:
             acct = db.get_paper_account() or {}
             equity = float(acct.get("cash", 0) or 0) + deployed
         else:
-            equity = deployed
+            # P1-08 (audit finding, external review 2026-07-26): this used to
+            # be `equity = deployed` - live equity with NO cash added, while
+            # the paper branch above adds it. That is not a deliberate
+            # asymmetry, just an unfinished one: the paper book's cash is a
+            # free local DB read, while live cash needs a Robinhood API call,
+            # and that call was never wired in here.
+            #
+            # engine.live_trader.account_cash() makes that same call (reusing
+            # the login/account-number plumbing _buying_power() already uses
+            # before every live order) and returns None on anything short of
+            # a clean read - no credentials, login failure, network error -
+            # in which case this falls back to the exact pre-fix figure
+            # (deployed only). So a reachable account gets the correct,
+            # larger equity figure (a WIDER, more accurate limit); an
+            # unreachable one is no worse off than before.
+            live_cash = None
+            try:
+                from engine.live_trader import account_cash
+                live_cash = account_cash(cfg)
+            except Exception as e:
+                logger.warning(f"daily_loss_limit: live cash read failed: {e}")
+            equity = deployed + live_cash if live_cash is not None else deployed
     except Exception:
         return absolute
     return min(absolute, equity * pct / 100.0) if equity > 0 else absolute
