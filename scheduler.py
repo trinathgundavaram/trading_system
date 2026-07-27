@@ -1085,6 +1085,7 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                             buy_result, score_result, ticker_dict, regime, cfg,
                             portfolio_risk_result=portfolio_risk_result,
                             mode=effective_mode,  # 2026-07-22: applies day_size_multiplier for DAY legs
+                            db=db,  # 2026-07-27: dynamic sizing based on portfolio growth
                         )
                     except Exception as e:
                         logger.error(f"{ticker}: position sizing failed: {e}", exc_info=True)

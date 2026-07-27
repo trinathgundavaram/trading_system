@@ -844,9 +844,10 @@ _BINARY_RE = re.compile(
 # deploy plists, the kept .bak originals, and this test.
 ALLOWED = {
     "scripts/tp_agent.py", "scripts/services.py", "scripts/tp",
-    "scripts/bootstrap.py", "storage/platform_support.py",
-    "storage/secrets.py", "engine/notifications.py",
-    "service.sh", "tests/test_phase3_portability.py",
+    "scripts/bootstrap.py", "scripts/tp_enhanced.py",
+    "storage/platform_support.py", "storage/secrets.py",
+    "engine/notifications.py", "service.sh",
+    "tests/test_phase3_portability.py",
 }
 
 

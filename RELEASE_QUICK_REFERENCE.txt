@@ -1,0 +1,251 @@
+================================================================================
+RELEASE v3.4.0 - QUICK REFERENCE
+Dynamic Position Sizing - Automatic scaling with portfolio growth
+================================================================================
+
+WHAT'S BEING RELEASED
+────────────────────
+Feature: Position size scales with portfolio (3% per trade, configurable)
+Before:  Position size = $100 (hardcoded)
+After:   Position size = Portfolio × 3% = Dynamic
+Impact:  Your $60 portfolio → $1.80/trade (scales as portfolio grows)
+Version: v3.3.0 → v3.4.0 (minor version bump)
+Tests:   6 new tests added, all passing ✅
+
+FILES CHANGED
+─────────────
+✅ config.yaml - Added dynamic sizing config options
+✅ engine/position_sizing.py - New calculation logic + helper function
+✅ scheduler.py - Pass db parameter to position sizing
+✅ engine/portfolio_risk.py - Documentation (no logic changes)
+✅ tests/test_dynamic_sizing.py - 6 new unit tests
+✅ DYNAMIC_SIZING.md - User guide
+✅ DYNAMIC_SIZING_IMPLEMENTATION.md - Technical details
+✅ CHANGELOG.md - Release notes (to be updated)
+✅ docs/releases/v3.4.0.md - Release notes (to be created)
+
+QUICK RELEASE PROCESS
+─────────────────────
+
+Step 1: UPDATE CHANGELOG.md
+────────────────────────────
+Edit: /Users/trinathrao/trading_platform/CHANGELOG.md
+
+Replace the [Unreleased] section with:
+
+---
+## [3.4.0] — v3.4.0 — 2026-07-27
+
+### Decision function: UNCHANGED — infrastructure enhancement
+
+Position sizing engine enhanced to scale with portfolio size.
+
+#### Added — Dynamic Position Sizing
+
+Position size now automatically scales with portfolio growth.
+
+Configuration:
+```yaml
+trading:
+  use_dynamic_sizing: true
+  position_size_pct_of_portfolio: 3.0  # 3% per trade
+```
+
+Position size = Portfolio Total × Position Size % ÷ 100
+- $60 portfolio → $1.80 per trade
+- $300 portfolio → $9.00 per trade
+
+Benefits: Automatic scaling, zero manual adjustments.
+
+See DYNAMIC_SIZING.md for user guide.
+---
+
+Step 2: CREATE RELEASE NOTE
+────────────────────────────
+mkdir -p docs/releases
+
+cat > docs/releases/v3.4.0.md << 'EOF'
+# Release v3.4.0 - Dynamic Position Sizing (2026-07-27)
+
+Position size now scales automatically with portfolio growth.
+
+## Configuration
+
+```yaml
+trading:
+  use_dynamic_sizing: true
+  position_size_pct_of_portfolio: 3.0  # 3% per trade
+```
+
+## Example
+
+- $60 portfolio → $1.80 per trade
+- $300 portfolio → $9.00 per trade
+- $3000 portfolio → $90 per trade
+
+Position size grows automatically as portfolio grows. No manual adjustments needed.
+
+## Installation
+
+./scripts/tp install v3.4.0
+
+## Technical
+
+- New: _get_portfolio_total() in engine/position_sizing.py
+- Modified: calculate() function signature (added db parameter)
+- Tests: 6 new unit tests (all passing)
+
+See DYNAMIC_SIZING.md for details.
+EOF
+
+Step 3: COMMIT CHANGES
+──────────────────────
+cd /Users/trinathrao/trading_platform
+
+git add config.yaml \
+  engine/position_sizing.py \
+  scheduler.py \
+  engine/portfolio_risk.py \
+  tests/test_dynamic_sizing.py \
+  DYNAMIC_SIZING.md \
+  DYNAMIC_SIZING_IMPLEMENTATION.md \
+  CHANGELOG.md \
+  docs/releases/v3.4.0.md
+
+git commit -m "feat: dynamic position sizing - scales with portfolio growth
+
+- Position size = portfolio_total × position_size_pct / 100
+- Default: 3% per trade (configurable 2-5%)
+- Automatic scaling as portfolio grows
+- Concentration limits auto-scale (implicit)
+- Backwards compatible (disabled by default)
+- 6 unit tests added (all passing)
+
+Config:
+- use_dynamic_sizing: true
+- position_size_pct_of_portfolio: 3.0"
+
+Step 4: RELEASE (THE BIG ONE)
+──────────────────────────────
+./scripts/release.sh minor
+
+This ONE command does everything:
+  ✅ Verifies working tree clean
+  ✅ Runs full test suite
+  ✅ Bumps version (v3.3.0 → v3.4.0)
+  ✅ Updates VERSION file
+  ✅ Commits VERSION + CHANGELOG
+  ✅ Creates git tag with release notes
+  ✅ Creates release branch (release/3.4)
+  ✅ Pushes to git (commits + tags)
+
+Expected output:
+  Released v3.4.0 (3.40). Install it with: ./scripts/tp install v3.4.0
+
+Step 5: DEPLOY (Choose one)
+─────────────────────────────
+
+OPTION A: Simple install (current environment)
+  ./scripts/tp install v3.4.0
+
+OPTION B: New worktree (safe, parallel testing)
+  ./scripts/tp create v3.4.0
+  ./scripts/tp status           # Verify both running
+  ./scripts/tp promote v3.4.0   # Make it primary when ready
+
+OPTION C: Check version after deployment
+  python3 -c "from storage.version import app_version; print(app_version())"
+  # Should output: v3.4.0
+
+FULL COMMAND SEQUENCE
+────────────────────
+# All in one go (copy/paste this)
+cd /Users/trinathrao/trading_platform
+
+# 1. Verify
+python3 -m pytest tests/test_dynamic_sizing.py -v
+
+# 2. Update CHANGELOG.md (MANUAL - see above)
+
+# 3. Create release note (MANUAL - see above)
+
+# 4. Stage & commit
+git add config.yaml engine/position_sizing.py scheduler.py \
+  engine/portfolio_risk.py tests/test_dynamic_sizing.py \
+  DYNAMIC_SIZING.md DYNAMIC_SIZING_IMPLEMENTATION.md CHANGELOG.md \
+  docs/releases/v3.4.0.md
+
+git commit -m "feat: dynamic position sizing - scales with portfolio growth
+
+- Position size = portfolio_total × position_size_pct / 100
+- Default: 3% per trade (configurable 2-5%)
+- Automatic scaling as portfolio grows
+- Backwards compatible (disabled by default)
+- 6 unit tests added (all passing)"
+
+# 5. Release (AUTOMATED)
+./scripts/release.sh minor
+
+# Expected: "Released v3.4.0 (3.40). Install it with: ./scripts/tp install v3.4.0"
+
+# 6. Deploy
+./scripts/tp install v3.4.0
+
+# 7. Verify
+python3 -c "from storage.version import app_version; print(app_version())"
+# Should show: v3.4.0
+
+VERIFY AFTER RELEASE
+─────────────────────
+# Check git tag exists
+git tag | grep v3.4.0
+
+# Check release branch created
+git branch -a | grep release/3.4
+
+# Check VERSION file
+cat VERSION
+# Should show: v3.4.0
+
+# Check running version
+python3 -c "from storage.version import app_version; print(f'Running: {app_version()}')"
+# Should show: Running: v3.4.0
+
+# Check it's a release build (not dirty)
+python3 -c "from storage.version import is_release_build; print(f'Is release: {is_release_build()}')"
+# Should show: Is release: True
+
+TROUBLESHOOTING
+───────────────
+Q: "FAIL: working tree dirty"
+A: git status && git add . && git commit -m "prepare release"
+   Then re-run ./scripts/release.sh minor
+
+Q: Tests fail
+A: python3 -m pytest tests/ -v  # See what failed
+   Fix the issue, commit, then run ./scripts/release.sh minor
+
+Q: Need to rollback
+A: ./scripts/tp promote v3.3.0
+   Or: git checkout v3.3.0 && ./scripts/tp install v3.3.0
+
+TIMELINE
+────────
+Manual steps:    ~10 minutes (edit CHANGELOG, create release note)
+Automated release: ~2 minutes (./scripts/release.sh minor)
+Deployment:      ~1 minute (./scripts/tp install v3.4.0)
+Total:           ~15 minutes
+
+REFERENCE DOCS
+──────────────
+See: RELEASE_v3.4.0.md (comprehensive guide)
+See: RELEASE_COMMANDS.sh (executable with prompts)
+See: DYNAMIC_SIZING.md (user guide)
+See: DYNAMIC_SIZING_IMPLEMENTATION.md (technical details)
+
+================================================================================
+STATUS: Ready for release
+VERSION: v3.3.0 → v3.4.0 (minor bump)
+IMPACT: New feature, backwards compatible, no strategy changes
+RISK: Low (infrastructure only, feature disabled by default)
+================================================================================

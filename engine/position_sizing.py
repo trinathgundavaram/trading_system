@@ -53,6 +53,35 @@ def _cfg_section(cfg: dict) -> dict:
     return (cfg or {}).get("position_sizing", {}) or {}
 
 
+def _get_portfolio_total(db, simulated=True) -> float:
+    """Calculate total value of all open positions in portfolio.
+
+    Args:
+        db: Database/storage object with get_all_positions(simulated) method
+        simulated: True for paper book, False for live book
+
+    Returns:
+        Sum of all open position dollar amounts (excludes closed positions)
+    """
+    if db is None:
+        return 0.0
+
+    try:
+        positions = db.get_all_positions(simulated=simulated)
+        if not positions:
+            return 0.0
+
+        # Sum only open positions (closed_at is None)
+        total = sum(
+            float(p.get("dollar_amount", 0.0))
+            for p in positions
+            if p.get("closed_at") is None
+        )
+        return total
+    except Exception:
+        return 0.0
+
+
 def _score_tier(pct_score: float, tiers: list) -> tuple:
     """tiers sorted descending by min_score by config convention - returns
     (size_pct, label) for the first tier the score clears."""
@@ -101,7 +130,7 @@ def _regime_multiplier(regime) -> float:
 
 
 def calculate(buy_result, score_result, ticker_data: dict, regime, cfg: dict,
-              portfolio_risk_result=None, mode: str = "SWING") -> PositionSizeResult:
+              portfolio_risk_result=None, mode: str = "SWING", db=None) -> PositionSizeResult:
     """
     buy_result: rules/swing_buy_rules.py's BuyResultCompat (or equivalent) -
         only buy_result.should_buy / .pct_score are used.
@@ -126,9 +155,26 @@ def calculate(buy_result, score_result, ticker_data: dict, regime, cfg: dict,
         setup traded as a swing position. Case-insensitive; defaults to
         "SWING" (multiplier 1.0, i.e. no change) for any caller that doesn't
         pass a mode - existing callers/tests are unaffected.
+    db: OPTIONAL storage/database object for dynamic position sizing. If provided
+        and use_dynamic_sizing is True, position size scales with portfolio growth
+        as: base_allocation = portfolio_total × position_size_pct_of_portfolio / 100
     """
     scfg = _cfg_section(cfg)
-    base_allocation = float((cfg or {}).get("trading", {}).get("trade_size_usd", 100))
+    trading_cfg = (cfg or {}).get("trading", {})
+    fallback_allocation = float(trading_cfg.get("trade_size_usd", 100))
+
+    # Dynamic sizing: scales position with portfolio growth
+    use_dynamic_sizing = trading_cfg.get("use_dynamic_sizing", False)
+    base_allocation = fallback_allocation
+
+    if use_dynamic_sizing and db is not None:
+        portfolio_total = _get_portfolio_total(db, simulated=True)
+        if portfolio_total > 0:
+            position_pct = float(trading_cfg.get("position_size_pct_of_portfolio", 3.0))
+            base_allocation = portfolio_total * position_pct / 100.0
+        else:
+            # Empty portfolio (first trade): fall back to static sizing
+            base_allocation = fallback_allocation
     max_position_usd = float((cfg or {}).get("risk", {}).get("max_position_size_usd", base_allocation))
 
     if not scfg.get("enabled", True) or buy_result is None or not getattr(buy_result, "should_buy", False) \

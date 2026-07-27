@@ -33,50 +33,23 @@ Position sizing engine enhanced to scale with portfolio size.
 
 **Feature**: Automatically scale position size as portfolio grows.
 
-Position size now calculates as a percentage of current portfolio instead of a fixed dollar amount:
+Position size now calculates as a percentage of current portfolio instead of a fixed dollar amount:culates as a percentage of current portfolio instead of a fixed dollar amount:
 
-```
 Position size = Portfolio Total × Position Size % ÷ 100
 Position size = $60 × 3% ÷ 100 = $1.80 per trade
 Position size = $300 × 3% ÷ 100 = $9.00 per trade (automatic as portfolio grows)
-```
 
-**Configuration** (`config.yaml`):
-```yaml
-trading:
-  use_dynamic_sizing: true              # Enable (default: false)
-  position_size_pct_of_portfolio: 3.0   # 3% per trade (tunable 2-5%)
-  trade_size_usd: 100                   # Fallback for first trade
-```
+culates as a percentage of current portfolio instead of a fixed dollar amount:
 
-**Benefits**:
-- ✅ Eliminates manual position size adjustments as account grows
-- ✅ Position size scales proportionally with account (risk management stays constant)
-- ✅ Backwards compatible (disabled by default)
-- ✅ Fallback to static sizing on first trade (empty portfolio)
-- ✅ Concentration limits already scale automatically (implicit)
+Position size = Portfolio Total × Position Size % ÷ 100
+Position size = $60 × 3% ÷ 100 = $1.80 per trade
+Position size = $300 × 3% ÷ 100 = $9.00 per trade (automatic as portfolio grows)
+culates as a percentage of current portfolio instead of a fixed dollar amount:
 
-**Technical**:
-- New: `engine/position_sizing.py:_get_portfolio_total()` - calculates open position sum
-- Modified: `engine/position_sizing.py:calculate()` - accepts `db` parameter for dynamic calc
-- Updated: `scheduler.py` - passes `db` to position sizing engine
-- Tests: 6 new unit tests in `tests/test_dynamic_sizing.py` (all passing)
-
-**Usage**:
-1. Edit `config.yaml`: set `use_dynamic_sizing: true`
-2. Restart scheduler
-3. Next cycle: position sizes scale automatically
-
-**Tuning**:
-- Conservative (more positions, lower risk): `position_size_pct_of_portfolio: 2.0`
-- Standard (default): `position_size_pct_of_portfolio: 3.0`
-- Aggressive (fewer positions, higher risk): `position_size_pct_of_portfolio: 5.0`
-
-**Fallback**: When disabled or on first trade, reverts to static `trade_size_usd` from config.
-
-**Related**:
-- See `DYNAMIC_SIZING.md` for user guide
-- See `DYNAMIC_SIZING_IMPLEMENTATION.md` for technical deep-dive
+Position size = Portfolio Total × Position Size % ÷ 100
+Position size = $60 × 3% ÷ 100 = $1.80 per trade
+Position size = $300 × 3% ÷ 100 = $9.00 per trade (automatic as portfolio growsq
+c C
 
 ## [3.3.2] — v3.3.2 — 2026-07-27
 
