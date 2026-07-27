@@ -1,0 +1,265 @@
+================================================================================
+SCHEDULER FIX v3.3.1 - DEPLOYMENT EXECUTION GUIDE
+================================================================================
+
+STATUS: Code changes ready, files staged for commit
+CURRENT VERSION: v3.3.0
+TARGET VERSION: v3.3.1
+
+================================================================================
+STEP 1: COMMIT THE CODE
+================================================================================
+
+Run from: ~/trading_platform
+
+Command:
+--------
+git commit -m "fix: scheduler race condition - disable coalesce and add DB-level interlock
+
+§49 Phase 4 - Fix for 2026-07-27 incident where 8 AM scheduled cycle was
+silently dropped while manual run was in progress.
+
+Root cause: APScheduler coalesce=True silently drops scheduled slots that
+fire while job is running.
+
+Changes:
+1. Line 2093: coalesce=True → coalesce=False (missed slots queue for retry)
+2. Lines 206-256: DB-level interlock (scheduled cycles skip if one running)
+3. Lines 2096-2115: Heartbeat monitoring (alerts if cycles degrading)
+
+Fixes: Silent scheduler death on manual/scheduled overlap"
+
+Verify:
+-------
+git log --oneline -1
+git show --stat HEAD
+
+
+================================================================================
+STEP 2: CREATE RELEASE TAG
+================================================================================
+
+Run from: ~/trading_platform
+
+Command:
+--------
+git tag -a v3.3.1 -m "v3.3.1: scheduler race condition fix
+
+Fixes critical race condition where scheduled cycles silently dropped
+when manual runs overlapped scheduled fire times.
+
+2026-07-27 incident: Manual run 07:57-08:00:44 caused 8 AM scheduled
+slot to be coalesced away. This pairs with 2026-07-22 child-process-timeout
+fix for complete scheduler protection.
+
+No database changes. Backward compatible. Rollback: tp promote v3.3.0"
+
+Verify:
+-------
+git describe --tags
+git show v3.3.1 | head -15
+
+
+================================================================================
+STEP 3: PUSH TO REMOTE
+================================================================================
+
+Run from: ~/trading_platform
+
+Commands:
+---------
+git push origin main
+git push origin v3.3.1
+
+Verify:
+-------
+git log --oneline -1
+git branch -vv
+
+
+================================================================================
+STEP 4: BACKUP CURRENT VERSION
+================================================================================
+
+Run from: ~/trading_platform
+
+Command:
+--------
+./scripts/tp backup --label pre_v3_3_1
+
+Expected Output:
+----------------
+Should see backup directory created with timestamp
+
+
+================================================================================
+STEP 5: INSTALL NEW VERSION
+================================================================================
+
+Run from: ~/trading_platform
+
+Command:
+--------
+./scripts/tp install v3.3.1
+
+⚠️  CRITICAL: Watch the output for "pandas_ta" availability
+    If you see: "WARNING: pandas_ta unavailable"
+    STOP HERE - fix the venv before proceeding to step 6
+
+Expected Output:
+----------------
+Creating fresh database for v3.3.0
+Virtual environment setup
+pandas_ta available
+Installation complete
+
+
+================================================================================
+STEP 6: PROMOTE TO PRIMARY
+================================================================================
+
+Run from: ~/trading_platform
+
+Command:
+--------
+./scripts/tp promote v3.3.1
+
+Expected Output:
+----------------
+Uninstalling v3.3.0 services
+Marking v3.3.1 as primary
+Installing v3.3.1 services
+Services running
+
+
+================================================================================
+STEP 7: VERIFY DEPLOYMENT
+================================================================================
+
+Run from: ~/trading_platform
+
+Commands:
+---------
+./scripts/tp list
+./service.sh status
+sleep 2
+curl -s localhost:$(./scripts/tp list | awk '/v3.3.1/{print $3}')/api/health
+
+Expected Output:
+----------------
+✅ v3.3.1 marked as PRIMARY
+✅ scheduler service running
+✅ ui service running
+✅ maverick service running
+✅ Health check returns 200 OK
+
+
+================================================================================
+STEP 8: MONITOR INITIAL CYCLES
+================================================================================
+
+Run from: ~/trading_platform
+
+Command:
+--------
+./service.sh logs scheduler | tail -50
+
+Expected Output (wait ~5 min for next cycle):
+----------------------------------------------
+✅ "Cycle #X started (scheduler)"
+✅ "Cycle #X done in Ys"
+✅ Market context fetched
+✅ No errors or exceptions
+
+NOT Expected:
+❌ "Scheduled cycle skipped - another cycle is already in progress"
+   (This is OK only if testing manual/scheduled overlap)
+
+
+================================================================================
+STEP 9: TEST THE FIX (Optional but Recommended)
+================================================================================
+
+Run from: ~/trading_platform
+
+Test Scenario: Manual run during scheduled slot
+
+Commands:
+---------
+# Wait until just before a scheduled cycle (x:58-59 if 5-min interval)
+curl -X POST http://localhost:8001/api/cycle/run_now
+
+# Immediately check logs
+./service.sh logs scheduler | tail -30
+
+Expected Behavior:
+------------------
+1. Manual cycle starts (triggered_by=manual)
+2. If scheduled slot fires during execution:
+   → Log message: "Scheduled cycle skipped - another cycle is already in progress"
+3. Manual cycle completes normally
+4. Next scheduled slot runs normally (triggered_by=scheduler)
+5. NO duplicate or overlapping cycles occur
+
+
+================================================================================
+DEPLOYMENT COMPLETE ✅
+================================================================================
+
+Deployment Status: v3.3.1 is now primary
+Scheduler Status: ✅ Protected against race conditions
+Rollback Status: Can revert to v3.3.0 anytime with: ./scripts/tp promote v3.3.0
+
+
+================================================================================
+MONITORING CHECKLIST
+================================================================================
+
+For the next 24 hours, check:
+
+□ Scheduled cycles fire at regular intervals (every 5 min by default)
+□ Manual runs always proceed without blocking
+□ No "Scheduled cycle skipped" messages during normal operation
+□ No errors in scheduler.log
+□ Heartbeat monitoring: No "Scheduler WARNING" messages
+□ API health endpoint returns 200 OK
+□ UI loads and shows active cycles
+
+Quick check commands:
+  ./service.sh logs scheduler | grep -E "Cycle #|WARNING|ERROR"
+  curl -s http://localhost:8001/api/cycles/latest | jq .
+
+
+================================================================================
+ROLLBACK INSTRUCTIONS (if needed)
+================================================================================
+
+If something goes wrong, rollback is immediate and lossless:
+
+Command:
+--------
+./scripts/tp promote v3.3.0
+
+Then verify:
+-----------
+./scripts/tp list
+./service.sh status
+
+This reverts to v3.3.0. The v3.3.0 database and worktree are unchanged.
+You can re-promote v3.3.1 later after investigation.
+
+
+================================================================================
+DOCUMENTATION FILES
+================================================================================
+
+Technical Details: SCHEDULER_ISSUE_ANALYSIS.md
+Step-by-Step Guide: QUICK_DEPLOYMENT.md
+Full Automation:   DEPLOYMENT_COMMANDS.sh
+Copy & Paste:      DEPLOY_NOW.md
+This File:         EXECUTE_DEPLOYMENT.txt
+
+
+================================================================================
+END OF DEPLOYMENT GUIDE
+================================================================================

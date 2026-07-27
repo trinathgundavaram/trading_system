@@ -235,10 +235,32 @@ def run_cycle(force: bool = False):
     db.clear_stale_cycle() / set_cycle_running() / set_cycle_finished() now
     all live inside run_supervised() itself (see that module) - kept out of
     this thin wrapper so there's exactly one place that owns the
-    running/finished bookkeeping around the child process's lifetime."""
+    running/finished bookkeeping around the child process's lifetime.
+
+    2026-07-27 (§49 Phase 4, Trinath: 8 AM run was coalesced away while manual
+    run was in progress): Scheduled cycles (force=False) now skip if a cycle
+    is already running, preventing APScheduler's coalesce=True from silently
+    dropping scheduled slots. Manual runs (force=True) always proceed. This
+    interlock at the run_cycle() boundary - paired with coalesce=False in
+    APScheduler config - ensures missed scheduled slots requeue instead of
+    vanishing forever."""
     from engine.cycle_supervisor import run_supervised
     cfg = load_config()
     timeout_minutes = float(cfg.get("trading", {}).get("hard_kill_minutes", 15))
+
+    # 2026-07-27 (§49): Database-level interlock for scheduled cycles.
+    # Scheduled runs (force=False) skip silently if a cycle is already running.
+    # Manual runs (force=True) always proceed - they override any in-flight cycle.
+    if not force:
+        try:
+            status = db.get_cycle_status()
+            if status.get("is_running"):
+                logger.info("Scheduled cycle skipped - another cycle is already in progress "
+                           f"(started {status.get('started_at', '?')})")
+                return
+        except Exception as e:
+            logger.warning(f"Could not check cycle status (proceeding anyway): {e}")
+
     run_supervised(force=force, timeout_seconds=max(60.0, timeout_minutes * 60))
 
 
@@ -2061,9 +2083,14 @@ def start():
 
     interval = _effective_scan_interval(cfg)
     scheduler = BlockingScheduler(timezone=ET)
+    # 2026-07-27 (§49 Phase 4): Disable coalesce so missed scheduled slots queue
+    # for execution after the current cycle finishes, rather than being silently
+    # dropped. The DB-level interlock in run_cycle() prevents them from executing
+    # if a cycle is already running, so queued slots will execute in FIFO order
+    # after the current one completes (not stack up or run concurrently).
     scheduler.add_job(
         run_cycle, "cron", day_of_week="mon-fri", hour="9-16", minute=f"*/{interval}",
-        id="trading_cycle", max_instances=1, coalesce=True,
+        id="trading_cycle", max_instances=1, coalesce=False,
     )
 
     def _record_next_run(event=None):
@@ -2071,6 +2098,19 @@ def start():
         if job and job.next_run_time:
             try:
                 db.set_next_cycle_time(job.next_run_time.isoformat())
+                # 2026-07-27 (§49 Phase 4): Scheduler heartbeat monitoring.
+                # Detect if the scheduler is falling behind (cycles taking longer
+                # than expected, causing the next scheduled slot to slip).
+                if job.last_execution_time:
+                    now = datetime.now(ET)
+                    elapsed = (now - job.last_execution_time).total_seconds()
+                    expected_interval = interval * 60
+                    if elapsed > expected_interval * 1.5:
+                        logger.warning(
+                            f"Scheduler WARNING: Last cycle finished {elapsed / 60:.1f} min ago, "
+                            f"expected interval is {interval} min - cycles may be getting coalesced "
+                            f"or delayed. Check DB for stale cycle_status rows or hung MCP calls."
+                        )
             except Exception as e:
                 logger.warning(f"Failed to record next cycle time: {e}")
 

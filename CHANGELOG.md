@@ -22,6 +22,88 @@ different strategy, and averaging the two sets together is a measurement error.
 
 Nothing.
 
+## [3.3.2] — v3.3.2 — 2026-07-27
+
+### Decision function: UNCHANGED — service bootstrap fixes
+
+`scripts/classify_change.py` reports PATCH and this ships as **patch**.
+`rules/swing_buy_rules.py`, `rules/sell_rules.py`, `rules/exit_scorer.py`,
+`rules/dynamic_thresholds.py`, `rules/hard_vetoes.py` and `config.yaml` are
+untouched — nothing about the strategy moved, so pre- and post-release trade
+history remains poolable.
+
+#### Fixed — launchctl bootstrap "Input/output error" (exit 5) on service start
+
+**Incident**: `launchctl bootstrap` returned "Input/output error" (exit 5) when
+starting scheduler service, leaving all services unable to start. This happened
+after launchctl persistence layer corruption or race conditions during service
+reinstall.
+
+**The fix**: Enhanced retry logic in `scripts/services.py:LaunchdManager.start()`:
+
+1. First attempt: standard bootstrap with full cleanup on exit 5
+2. Second attempt: bootout unconditionally + retry bootstrap
+3. Third attempt: retry with `sudo` (different user context may have different
+   launchd persistence state)
+4. Timeout handling: explicit grace periods to let launchctl finish cleanup
+
+This matches what users had to manually run: `launchctl bootout` multiple times
+plus `sudo launchctl bootstrap` as a last resort. Now it's automatic.
+
+**Action required:** No special action needed. On next service restart or
+`./service.sh start`, the enhanced retry will transparently handle stuck
+registrations.
+
+## [3.3.1] — v3.3.1 — 2026-07-27
+
+### Decision function: UNCHANGED — scheduler race-condition fix
+
+`scripts/classify_change.py` reports PATCH and this ships as **patch**.
+`rules/swing_buy_rules.py`, `rules/sell_rules.py`, `rules/exit_scorer.py`,
+`rules/dynamic_thresholds.py`, `rules/hard_vetoes.py` and `config.yaml` are
+untouched — nothing about the strategy moved, so pre- and post-release trade
+history remains poolable.
+
+#### Fixed — scheduler silently died when manual runs overlapped scheduled cycles
+
+**Incident (2026-07-27 08:00 ET):** Manual cycle started 07:57:26, finished
+08:00:44. The 8 AM scheduled cycle (should fire at 08:00:00) was silently
+coalesced away and never ran. Scheduler remained silent until the next manual
+trigger at 08:11:04.
+
+**Root cause:** APScheduler's `coalesce=True` configuration + manual/scheduled
+run overlap. When multiple scheduled slots fire while a job is running, they
+are coalesced (combined) into a single execution. Once coalesced, they are
+gone forever — there is no automatic retry. See `docs/releases/v3.3.1.md` for
+full detail.
+
+**The fix is two-part:**
+
+1. **Disabled coalescing in APScheduler** (`scheduler.py:2093`)
+   - Changed `coalesce=True` → `coalesce=False`
+   - Missed scheduled slots now queue for execution instead of being dropped
+   - Paired with database-level interlock (see below) to prevent pileup
+
+2. **Added database-level interlock** (`scheduler.py:206-256`)
+   - Scheduled cycles check if another cycle is running before proceeding
+   - If running, scheduled cycle skips silently (DB check is cheap, ~1ms)
+   - Prevents overlapping cycles while allowing queued slots to execute in FIFO order
+   - Manual cycles (force=True) always proceed, unaffected
+
+3. **Added scheduler heartbeat monitoring** (`scheduler.py:2096-2115`)
+   - Logs warning if last cycle finished more than 1.5x expected interval ago
+   - Enables early detection of scheduler degradation
+   - Pairs with existing child-process timeout (2026-07-22 fix) for complete protection
+
+**This pairs with the 2026-07-22 fix** (child-process hard timeout) to provide
+complete scheduler robustness: timeouts prevent wedging, coalesce=False +
+interlock prevents silent dropping.
+
+**Action required:** No special action needed. Services restart automatically.
+Monitor logs for 24 hours to verify scheduled cycles run at regular intervals
+with no "Scheduled cycle skipped" messages (except during manual+scheduled
+overlap, which is expected and handled correctly).
+
 ## [3.3] — v3.3.0 — 2026-07-26
 
 ### Decision function: UNCHANGED — service-management and provider-key resolution fixes

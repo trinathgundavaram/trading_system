@@ -529,15 +529,28 @@ class LaunchdManager(ServiceManager):
         # Exit 5 with the job not visibly loaded is nearly always a teardown
         # that had not finished. Retry once, after boot-ing out unconditionally
         # this time - which is safe whether or not anything is there.
+        # 2026-07-27: Enhanced retry logic for "Input/output error" (exit 5).
         if r.returncode == 5:
             subprocess.run(["launchctl", "bootout", self._domain(name)],
                            capture_output=True)
-            self._wait_until_gone(name)
+            self._wait_until_gone(name, timeout=3.0)
             r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
                                capture_output=True, text=True)
             if r.returncode == 0:
                 print(f"  started {self.label(name)} (after clearing a stale registration)")
                 return
+
+            # If still failing, try with sudo (different user context may help)
+            if r.returncode == 5:
+                try:
+                    r = subprocess.run(
+                        ["sudo", "launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
+                        capture_output=True, text=True, timeout=15)
+                    if r.returncode == 0:
+                        print(f"  started {self.label(name)} (with elevated privileges)")
+                        return
+                except Exception as e:
+                    print(f"  (sudo attempt failed: {e})")
 
         self._explain_bootstrap_failure(name, plist, r)
 
