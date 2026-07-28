@@ -10,15 +10,18 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-# Import from the main tp script
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from scripts import tp
+# Import from the main tp script (no .py extension)
+tp_path = Path(__file__).parent / "tp"
+spec = importlib.util.spec_from_file_location("tp", tp_path)
+tp = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tp)
 
 IS_MAC = sys.platform == "darwin"
 
