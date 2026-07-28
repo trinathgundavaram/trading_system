@@ -53,16 +53,23 @@ def test_is_watch_mode():
     assert paper_trader.is_watch_mode({})  # defaults to WATCH
 
 
-def test_seed_clones_real_book(db):
+def test_seed_creates_purse_without_cloning_real_book(db):
+    """2026-07-27: ensure_seeded() used to clone every open real position
+    into the paper book (trade_mode='SEED') on first creation, logging a
+    "buy" to paper_trades but never debiting paper_account.cash for it -
+    SEED positions sat on top of the purse for free (a live $240.11
+    reconcile.py drift traced straight back to this). Paper mode now starts
+    as a clean cash-only purse; robinhood_sync.py's seed-paper CLI
+    (unchanged) is the only path that mirrors the real book into paper, and
+    it does so with correct cash accounting (see that script)."""
     db.open_position("NVDA", 150.0, 2.0, 300.0, simulated=False)
     account = paper_trader.ensure_seeded(db, CFG)
     assert account["cash"] == 500.0
-    sim = db.get_all_positions(simulated=True)
-    assert len(sim) == 1 and sim[0]["ticker"] == "NVDA"
-    assert sim[0]["entry_price"] == 150.0 and sim[0]["shares"] == 2.0
-    # idempotent - second call must not re-clone or reset cash
+    assert db.get_all_positions(simulated=True) == []
+    # idempotent - second call must not touch cash or create anything
     paper_trader.ensure_seeded(db, CFG)
-    assert len(db.get_all_positions(simulated=True)) == 1
+    assert db.get_all_positions(simulated=True) == []
+    assert db.get_paper_account()["cash"] == 500.0
 
 
 def test_buy_debits_purse_and_sell_credits(db):
@@ -109,11 +116,18 @@ def test_position_sizing_amount_used(db):
 
 
 def test_books_are_isolated(db):
-    """A real close must never touch the simulated clone and vice versa -
-    the exact confirm_fill.py-vs-paper_trader hazard the simulated flag
-    exists to prevent."""
+    """A real close must never touch a simulated position on the same
+    ticker and vice versa - the exact confirm_fill.py-vs-paper_trader
+    hazard the simulated flag exists to prevent.
+
+    Previously exercised via ensure_seeded()'s real-book clone; that
+    cloning was removed 2026-07-27 (see
+    test_seed_creates_purse_without_cloning_real_book), so the sim-side
+    ORCL row is opened directly here instead - the isolation property
+    under test was never about how the sim row got there."""
     db.open_position("ORCL", 100.0, 1.0, 100.0, simulated=False)
-    paper_trader.ensure_seeded(db, CFG)  # clones ORCL into sim book
+    paper_trader.ensure_seeded(db, CFG)  # purse only, no clone
+    db.open_position("ORCL", 100.0, 1.0, 100.0, simulated=True)
     # real sell (confirm_fill path, default simulated=False)
     closed_real = db.close_position("ORCL", 110.0)
     assert closed_real["pnl"] == pytest.approx(10.0)
@@ -156,10 +170,18 @@ def test_snapshot_accounting(db):
 
 def test_trade_mode_attribution(db):
     """Every buy is stamped with the trading mode it was bought under
-    (SWING/DAY/HYBRID), seed clones get SEED, and sells inherit the mode of
-    the position they close."""
-    db.open_position("NVDA", 150.0, 1.0, 150.0, simulated=False)
+    (SWING/DAY/HYBRID), a SEED-tagged position keeps SEED through the
+    ledger, and sells inherit the mode of the position they close.
+
+    SEED positions are no longer created by ensure_seeded() (removed
+    2026-07-27 - see test_seed_creates_purse_without_cloning_real_book);
+    robinhood_sync.py's seed-paper CLI is the only remaining path that
+    creates them, via the same open_position()/log_paper_trade() pair
+    reproduced directly here rather than pulling in that whole script."""
     paper_trader.ensure_seeded(db, CFG)
+    db.open_position("NVDA", 150.0, 1.0, 150.0, simulated=True, trade_mode="SEED")
+    db.log_paper_trade("NVDA", "buy", 150.0, 1.0, 150.0,
+                        reason="seeded_from_robinhood", trade_mode="SEED")
     seed_pos = db.get_open_position("NVDA", simulated=True)
     assert seed_pos["trade_mode"] == "SEED"
 
