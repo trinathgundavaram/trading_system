@@ -269,12 +269,32 @@ def main() -> int:
         db = Database()
         pos = db.get_all_positions()
         synthetic = [p for p in pos if p["ticker"] in ("AAA", "BBB", "CCC", "NEW", "FIX")]
-        in_window = [p for p in pos if str(p.get("entry_time") or "") >= "2026-07-25T00:00:00"]
+        # 2026-07-28 (Trinath, found via a false positive on this exact check):
+        # this used to be an OPEN lower bound - entry_time >= 2026-07-25T00:00:00,
+        # no upper bound - which was correct for one specific verification run
+        # right after the 2026-07-25 incident (before any legitimate trading had
+        # happened yet) but wrong for a check that lives permanently in the
+        # release gate: three days later it was flagging real July 27/28 trading
+        # as "test residue" and its own remediation (repair_test_damage.py
+        # --apply) would have deleted the live paper account and real trade
+        # history along with it - confirmed via scripts/inspect_test_window.py,
+        # zero rows remaining from 2026-07-25 itself, all 17 flagged rows were
+        # real. Bounded to the incident's own documented window instead -
+        # repair_test_damage.py's docstring and its own stray-row safety check
+        # both put every artefact the test suite wrote at 03:52:54-03:52:55 UTC
+        # on 2026-07-25; 03:52:00-03:53:00 is that window with a margin, not a
+        # new constant invented here.
+        in_window = [p for p in pos
+                     if "2026-07-25T03:52:00" <= str(p.get("entry_time") or "") < "2026-07-25T03:53:00"]
         check("no synthetic test tickers in positions", not synthetic,
               f"{len(synthetic)} rows: {sorted({p['ticker'] for p in synthetic})}"
               if synthetic else "")
-        check("no positions created in the test window", not in_window,
-              f"{len(in_window)} rows - run scripts/repair_test_damage.py --apply"
+        check("no positions created in the 2026-07-25 test-suite incident window",
+              not in_window,
+              f"{len(in_window)} rows - run scripts/repair_test_damage.py --apply "
+              f"--window-start 2026-07-25T03:52:00 (verify against "
+              f"scripts/inspect_test_window.py first - do not use the default "
+              f"open-ended window, it will also catch real activity)"
               if in_window else "")
 
         with db._conn() as c:
