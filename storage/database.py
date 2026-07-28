@@ -894,6 +894,18 @@ class Database:
             # instead of looking like a normal finish.
             self._add_column_if_missing(conn, "cycle_status", "pid", "INTEGER")
             self._add_column_if_missing(conn, "cycle_status", "kill_reason", "TEXT")
+            # 2026-07-27 (Trinath: a manual backtest ran too long and there was
+            # no way to stop it short of finding the PID by hand in Terminal):
+            # same cross-process pid handle as cycle_status.pid above, but for
+            # the backtest subprocess (run_backtest.py, spawned by
+            # engine/backtest_loop.py's spawn_backtest_subprocess() whether
+            # triggered by the weekly auto-run, the Learning tab's "Run
+            # backtest now" button, or the bare CLI). Written by the row's own
+            # process via os.getpid() in log_backtest_run_start() below - the
+            # backtest_runs row is always created by the process actually
+            # doing the replay, so that's always the correct pid to kill, no
+            # extra plumbing from the spawning side needed.
+            self._add_column_if_missing(conn, "backtest_runs", "pid", "INTEGER")
             self._migrate_paper_trading(conn)
             self._migrate_rotation_log(conn)
             self._migrate_phase1_columns(conn)
@@ -2004,6 +2016,52 @@ class Database:
                 (datetime.utcnow().isoformat(),),
             )
             return True
+
+    def reap_stale_backtest_run(self) -> bool:
+        """backtest_runs' counterpart to clear_stale_cycle() above - added
+        2026-07-27 after a backtest_runs row was found stuck at
+        status='running' with no OS process behind it (`ps aux` showed
+        nothing) and no supervisor equivalent to engine/cycle_supervisor.py's
+        15-min hard kill ever existed for the backtest subprocess to mark it
+        otherwise. A crashed/killed/OOM'd child that never reaches
+        log_backtest_run_complete()/log_backtest_run_failed() leaves this row
+        stuck forever, which both misleads the Learning tab and blocks the
+        next run via get_running_backtest_run()'s 409 check.
+
+        LIVENESS, not age (unlike clear_stale_cycle's time-based check): the
+        pid column (2026-07-27) makes this precise instead of a guess - a
+        multi-ticker/multi-year replay can legitimately run for a long time,
+        so a fixed age cutoff would either kill a slow-but-healthy run or be
+        set so loose it never actually catches a stale one. This instead
+        directly asks the OS "is that pid still there", so a run that is
+        genuinely still working is never touched regardless of how long
+        it's been. A row with no pid at all is unconditionally stale - that
+        can now only mean it predates this column, i.e. from before a
+        service restart ago.
+
+        Returns True if it found and cleared a stale row (worth logging, not
+        silently papering over - same rationale as clear_stale_cycle)."""
+        run = self.get_running_backtest_run()
+        if not run:
+            return False
+        pid = run.get("pid")
+        if pid:
+            try:
+                import psutil
+                if psutil.pid_exists(int(pid)):
+                    return False  # genuinely still running - leave it alone
+            except ImportError:
+                # No psutil, no way to check - refuse to guess a run is dead
+                # when it might not be; better to leave a truly-stale row
+                # stuck than to falsely fail a live one.
+                return False
+        self.log_backtest_run_failed(
+            run["id"],
+            error=("Stale run reaped: no OS process found for this run "
+                    + (f"(pid {pid} no longer exists)" if pid else "(no pid recorded - predates pid tracking)")
+                    + " - it crashed, was killed, or the host restarted without it shutting down cleanly."),
+        )
+        return True
 
     # ---------- ticker info cache (company names, validation) ----------
     def upsert_ticker_info(self, ticker: str, company_name: str = None, last_price: float = None,
@@ -4531,13 +4589,20 @@ class Database:
     def log_backtest_run_start(self, tickers: list, start_date: str, end_date: str,
                                 triggered_by: str = "manual") -> int:
         import json
+        # pid = this process's own OS pid (2026-07-27). Whatever process calls
+        # this IS the one that runs the actual replay (see backtest_runs.pid's
+        # migration comment above) - capturing os.getpid() here, rather than
+        # having the spawning side pass one in, means server.py's abort
+        # endpoint always has a correct cross-process handle regardless of
+        # which of the three call paths (weekly auto/manual button/bare CLI)
+        # started this run.
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(
-                """INSERT INTO backtest_runs (started_at, status, triggered_by, tickers, start_date, end_date)
-                VALUES (?,?,?,?,?,?) RETURNING id""",
+                """INSERT INTO backtest_runs (started_at, status, triggered_by, tickers, start_date, end_date, pid)
+                VALUES (?,?,?,?,?,?,?) RETURNING id""",
                 (datetime.utcnow().isoformat(), "running", triggered_by,
-                 json.dumps(tickers), start_date, end_date),
+                 json.dumps(tickers), start_date, end_date, os.getpid()),
             )
             row = cur.fetchone()
             return row["id"] if row else None

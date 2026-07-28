@@ -20,7 +20,83 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
-Nothing.
+### Decision function: UNCHANGED — paper-account accounting fix + operational tooling
+
+`scripts/classify_change.py` would report PATCH/MINOR (infrastructure and
+bookkeeping only). `rules/swing_buy_rules.py`, `rules/sell_rules.py`,
+`rules/exit_scorer.py`, `rules/dynamic_thresholds.py`, `rules/hard_vetoes.py`
+and `config.yaml` are untouched — nothing about the strategy moved, so
+pre- and post-release trade history remains poolable.
+
+#### Fixed — paper account showed more than its $10,000 basis; SEED tickers visible in paper mode
+
+**Root cause**: `engine/paper_trader.py`'s `ensure_seeded()` cloned every open
+real position into the paper book (`trade_mode='SEED'`) on the very first
+WATCH-mode cycle, logging each as a "buy" in `paper_trades` but never
+debiting `paper_account.cash` for it — unlike the manual
+`robinhood_sync.py seed-paper` CLI, which correctly rebases `starting_cash`
+to include the mirrored cost. The result: SEED positions sat on top of the
+$10,000 purse for free (visible both as extra total value and as a
+`reconcile.py` "paper cash disagrees with the trade ledger" finding equal
+to the exact cost of whatever was open in the real book at seed time).
+
+- `engine/paper_trader.py` — `ensure_seeded()` no longer clones real
+  positions into the paper book at all. Paper mode now starts from a clean
+  cash-only purse; `robinhood_sync.py seed-paper` remains available (and
+  unchanged) for anyone who explicitly wants a cost-correct real-account
+  mirror.
+- `scripts/fix_uncosted_seed_positions.py` (new) — one-time cleanup for
+  SEED rows created by the pre-fix code path. Deletes the position and its
+  `seeded_from_real_portfolio` ledger row without touching cash, since cash
+  was never debited for them. `--apply` to write, dry run by default.
+- `scripts/diagnose_cash_drift.py` (new) — read-only breakdown of a
+  `reconcile.py` cash-ledger drift by `reason` and `trade_mode`, plus the
+  most recent ledger rows, for tracing any future drift back to its source
+  without inventing numbers.
+
+**Action required:** run `python3 scripts/fix_uncosted_seed_positions.py --apply`
+once on any account that was seeded before this fix, then
+`python3 scripts/reconcile.py` to confirm the drift clears.
+
+#### Added — abort switch for a runaway backtest subprocess
+
+The scan cycle has had a hard kill switch (`/api/cycle/cancel`,
+`engine/cycle_supervisor.py`) since 2026-07-22; the backtest subprocess
+(`run_backtest.py`, spawned by `engine/backtest_loop.py`) never had an
+equivalent, because nothing recorded its PID anywhere reachable.
+
+- `storage/database.py` — new `backtest_runs.pid` column, captured via
+  `os.getpid()` in `log_backtest_run_start()` (the row is always created by
+  the process actually doing the replay, whichever of the three call paths
+  started it).
+- `engine/backtest_loop.py` — new `kill_running_backtest()`, reusing
+  `cycle_supervisor`'s portable SIGTERM→grace→SIGKILL process-group kill
+  rather than a second implementation of the same thing.
+- `server.py` — new `POST /api/backtest/abort`.
+- `ui/index.html` — new "Abort backtest" button on the Learning tab,
+  visible only while a run is in progress.
+- `storage/database.py` — new `reap_stale_backtest_run()`: a crashed/killed
+  backtest that never reaches `log_backtest_run_complete()`/
+  `log_backtest_run_failed()` used to leave its `backtest_runs` row stuck at
+  `status='running'` forever (found live: a run with no OS process behind
+  it, `ps aux` showed nothing). Liveness-checked via the new `pid` column
+  (`psutil.pid_exists`), not a time guess, so a genuinely long-running
+  replay is never touched. Wired into `/api/backtest/status` and
+  `/api/backtest/run` so a stale row self-heals instead of blocking the
+  next run with a permanent 409.
+
+**Action required:** restart services (`./service.sh restart`) to pick this
+up. Any run already stuck `status='running'` from before this deployed has
+no `pid` recorded and will self-clear on the first `/api/backtest/status`
+poll after restart — no manual DB fix needed.
+
+#### Added — running code version shown in the UI
+
+- `server.py` — new `GET /api/version`: reads the `VERSION` file (same
+  source `scripts/version.py --current` uses) plus, best-effort, the git
+  commit and whether HEAD is ahead of that tag.
+- `ui/index.html` — shown in the sidebar under the brand name, fetched once
+  at boot.
 
 ## [3.4.0] — v3.4.0 — 2026-07-27
 

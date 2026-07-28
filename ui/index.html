@@ -537,6 +537,11 @@
     <div class="navgroup" id="nav"></div>
     <div class="spacer"></div>
     <div class="conn" id="conn-pill"><span class="dot"></span><span id="conn-text">Connecting…</span></div>
+    <!-- 2026-07-27 (Trinath's ask: the app never showed what code it was
+         running). VERSION is a release tag, not a live value, so this is
+         fetched once at boot (loadVersion() below) rather than on every
+         status poll like the badges above it. -->
+    <div class="sub" id="brand-version" title="Loading…"></div>
   </div>
 
   <div id="main">
@@ -1369,6 +1374,30 @@ function renderBrandPosture() {
   el.textContent = text;
   el.style.color = color;
   el.title = tip;
+}
+
+/* server.py's GET /api/version - VERSION file plus, best-effort, the git
+   commit it was started from (see that endpoint's docstring for why both:
+   VERSION only moves on a tagged release, so it alone can't distinguish a
+   clean checkout of that tag from a tag plus untagged commits on top).
+   Fetched once at boot, not on the 10s status poll - the running code
+   doesn't change without a restart. */
+async function loadVersion() {
+  const el = document.getElementById("brand-version");
+  if (!el) return;
+  try {
+    const v = await (await fetch("/api/version")).json();
+    let text = v.version || "unversioned";
+    if (v.commit_short) text += ` · ${v.commit_short}`;
+    if (v.ahead_of_tag) text += "+";
+    if (v.dirty) text += " (uncommitted changes)";
+    el.textContent = text;
+    el.title = v.commit
+      ? `Commit ${v.commit}${v.ahead_of_tag ? " (past the " + v.version + " tag)" : " (exactly the " + v.version + " tag)"}${v.dirty ? " - uncommitted local changes present" : ""}`
+      : `VERSION file: ${v.version} (git info unavailable)`;
+  } catch (e) {
+    el.textContent = "";
+  }
 }
 
 /* ============================== DASHBOARD ============================== */
@@ -3701,7 +3730,10 @@ async function renderLearningTab(el) {
     <div class="panel" style="margin-top:14px;">
       <div class="panel-head" style="justify-content:space-between;display:flex;">
         <div style="display:flex;align-items:center;gap:8px;">${svg('learning',15)}<span class="panel-title">Historical Replay (Backtest)</span></div>
-        <button class="btn btn-sm backtest-run-trigger" onclick="runBacktestNow(event)">${svg('refresh',13)}<span>Run backtest now</span></button>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-sm btn-danger backtest-abort-trigger" style="display:none;" onclick="abortBacktestNow(event)" title="Force-kill the running backtest subprocess immediately (same hard kill /api/cycle/cancel uses for a stuck scan cycle) and mark the run failed so it doesn't block the next one.">${svg('x',13)}<span>Abort backtest</span></button>
+          <button class="btn btn-sm backtest-run-trigger" onclick="runBacktestNow(event)">${svg('refresh',13)}<span>Run backtest now</span></button>
+        </div>
       </div>
       <p class="field-desc" style="margin-bottom:12px;">engine/backtest_engine.py's Stage 1 market-data-only replay - runs the REAL rules/hard_vetoes.py + rules/swing_buy_rules.py against historical bars for config.yaml's backtest.tickers/months. Also runs automatically once a week (engine/backtest_loop.py, scheduler.py) - this button just triggers one on demand.</p>
       <div id="backtest-body">Loading…</div>
@@ -3811,9 +3843,47 @@ async function loadBacktestPanel() {
 
 function _setBacktestButtonRunning(running) {
   const btn = document.querySelector(".backtest-run-trigger");
+  if (btn) {
+    btn.disabled = running;
+    btn.innerHTML = running ? `${svg("refresh",13)}<span>Running…</span>` : `${svg("refresh",13)}<span>Run backtest now</span>`;
+  }
+  // 2026-07-27 (Trinath: a backtest ran too long and there was no way to
+  // stop it short of finding the PID by hand): only shown while a run is
+  // actually in flight, same "can't click it against nothing" rule
+  // cancelRunBtnHtml() uses for the scan-cycle Cancel button.
+  const abortBtn = document.querySelector(".backtest-abort-trigger");
+  if (abortBtn) {
+    abortBtn.style.display = running ? "" : "none";
+    if (!running) {
+      abortBtn.disabled = false;
+      abortBtn.innerHTML = `${svg("x",13)}<span>Abort backtest</span>`;
+    }
+  }
+}
+
+async function abortBacktestNow(evt) {
+  const btn = evt ? evt.currentTarget : document.querySelector(".backtest-abort-trigger");
   if (!btn) return;
-  btn.disabled = running;
-  btn.innerHTML = running ? `${svg("refresh",13)}<span>Running…</span>` : `${svg("refresh",13)}<span>Run backtest now</span>`;
+  btn.disabled = true;
+  btn.innerHTML = `${svg("x",13)}<span>Aborting…</span>`;
+  try {
+    const res = await authFetch("/api/backtest/abort", { method: "POST" });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast(`Couldn't abort: ${body.detail || res.statusText}`, "error");
+      btn.disabled = false;
+      btn.innerHTML = `${svg("x",13)}<span>Abort backtest</span>`;
+      return;
+    }
+    toast(body.note || "Backtest force-killed.", body.status === "killed" ? "info" : "error");
+    if (_backtestPollTimer) { clearInterval(_backtestPollTimer); _backtestPollTimer = null; }
+    _setBacktestButtonRunning(false);
+    if (currentTab === "learning") loadBacktestPanel();
+  } catch (e) {
+    toast(`Couldn't reach the server: ${e.message}`, "error");
+    btn.disabled = false;
+    btn.innerHTML = `${svg("x",13)}<span>Abort backtest</span>`;
+  }
 }
 
 function _startBacktestPolling() {
@@ -5098,6 +5168,7 @@ async function loadNewsBody() {
 async function boot() {
   renderNav();
   renderBookToggle();
+  loadVersion();  // fire-and-forget - doesn't block first paint on anything
   await loadStatus();
   await loadTickerNames();
   await loadTickerHealth();

@@ -123,6 +123,43 @@ def spawn_backtest_subprocess(tickers: list, start: str, end: str, warmup_days: 
         return subprocess.Popen(args, cwd=str(_REPO_ROOT), stdout=logf, stderr=subprocess.STDOUT)
 
 
+def kill_running_backtest(reason: str = "user_abort") -> bool:
+    """HARD kill switch for server.py's POST /api/backtest/abort (2026-07-27,
+    Trinath: a manual backtest had been running for a long time and there was
+    no way to stop it short of finding the PID by hand in Terminal - the
+    scheduler's own runaway cycles already get this via
+    engine/cycle_supervisor.py's /api/cycle/cancel, the backtest subprocess
+    never did).
+
+    Reads the running backtest_runs row's pid - recorded by
+    Database.log_backtest_run_start() via os.getpid(), so this works no
+    matter which of the three paths (weekly auto-trigger, the Learning tab's
+    "Run backtest now" button, or a bare `python run_backtest.py` from the
+    CLI) started it - and kills that whole process group via
+    cycle_supervisor's portable kill primitive (same SIGTERM -> grace ->
+    SIGKILL, POSIX process-group / Windows psutil-tree behavior already
+    proven out for the scan-cycle kill switch, not a second implementation of
+    the same thing). Marks the run 'failed' afterward so the Learning tab
+    shows why it stopped and the next run isn't blocked by a stale 'running'
+    row. Returns True if it cleared a run (killed a live one, OR found the
+    'running' row already had no process behind it - reap_stale_backtest_run()
+    handles that second case so clicking Abort on an already-dead run still
+    reports success instead of a confusing "nothing to abort"), False if
+    nothing was running at all."""
+    from storage.database import Database
+    db = Database()
+    if db.reap_stale_backtest_run():
+        return True  # row was already stale (no live process) - reaped, done
+    run = db.get_running_backtest_run()
+    pid = run.get("pid") if run else None
+    if not run or not pid:
+        return False
+    from engine.cycle_supervisor import _kill_process_tree
+    _kill_process_tree(int(pid), reason=reason)
+    db.log_backtest_run_failed(run["id"], error=f"Aborted by user ({reason})")
+    return True
+
+
 def maybe_run_weekly(db, cfg: dict) -> dict | None:
     """Returns {"spawned": True, "pid": ...} if a run was kicked off this
     call, else None (trigger condition not met, or backtest.enabled is

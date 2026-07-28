@@ -44,8 +44,25 @@ def is_watch_mode(cfg: dict) -> bool:
 
 
 def ensure_seeded(db, cfg: dict) -> dict:
-    """Idempotent. First WATCH-mode cycle creates the purse and clones the
-    real book; every later call is a cheap single-row SELECT."""
+    """Idempotent. First WATCH-mode cycle creates the purse; every later
+    call is a cheap single-row SELECT.
+
+    2026-07-27 (Trinath's ask): this used to ALSO clone the real book into
+    the simulated book as trade_mode='SEED', purely for display. That clone
+    logged a "buy" to paper_trades (reason='seeded_from_real_portfolio') but
+    never actually debited paper_account.cash for it - unlike the manual
+    `robinhood_sync.py seed-paper` CLI, which correctly sets starting_cash to
+    (buying_power + cost) and debits cash by cost in the same operation. The
+    result: SEED positions sat on top of the $10,000 purse for free, cash
+    read as though nothing had been bought while the ledger said otherwise,
+    and reconcile.py's "paper cash disagrees with the trade ledger" check
+    flagged the exact cost of whatever was open in the real book at seed
+    time (found here as a live $240.11 drift). Paper mode should not show
+    real-account tickers it never actually paid for, so the clone is
+    removed rather than fixed in place. If you want the paper book to
+    mirror the real one again, use `python3 robinhood_sync.py seed-paper` -
+    that path rebases starting_cash to include the mirrored cost, so it
+    lands inside the basis instead of on top of it."""
     account = db.get_paper_account()
     if account:
         return account
@@ -53,29 +70,10 @@ def ensure_seeded(db, cfg: dict) -> dict:
     starting_cash = float(cfg.get("paper_trading", {}).get("starting_cash", 1000.0))
     account = db.init_paper_account(starting_cash)
 
-    cloned = 0
-    for pos in db.get_all_positions(simulated=False):
-        # Clone at the REAL entry price/time so unrealized P/L continuity
-        # matches the actual portfolio. pattern_id stays None on the clone -
-        # the real row keeps the pattern linkage (confirm_fill.py closes it
-        # with the real outcome; double-closing the same pattern from both
-        # books would corrupt the learning data).
-        db.open_position(
-            pos["ticker"], pos["entry_price"], pos["shares"], pos["dollar_amount"],
-            pattern_id=None, simulated=True, entry_time=pos.get("entry_time"),
-            trade_mode="SEED",
-        )
-        db.log_paper_trade(
-            pos["ticker"], "buy", pos["entry_price"], pos["shares"],
-            pos["dollar_amount"], reason="seeded_from_real_portfolio",
-            trade_mode="SEED",
-        )
-        cloned += 1
-
-    logger.info(f"Paper account seeded: ${starting_cash:.2f} cash, "
-                f"{cloned} real position(s) cloned into the simulated book")
+    logger.info(f"Paper account seeded: ${starting_cash:.2f} cash, no real "
+                f"positions cloned (see ensure_seeded() docstring, 2026-07-27)")
     db.log_ui_event("paper_account_seeded", {
-        "starting_cash": starting_cash, "positions_cloned": cloned,
+        "starting_cash": starting_cash, "positions_cloned": 0,
     })
     return db.get_paper_account()
 

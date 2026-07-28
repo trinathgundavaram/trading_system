@@ -1441,8 +1441,15 @@ async def run_backtest_now(background_tasks: BackgroundTasks,
     scope/tickers the weekly automatic trigger (engine/backtest_loop.py,
     scheduler.py) uses. Runs as a background task so the HTTP request
     returns immediately - the UI polls /api/backtest/status to show
-    progress and /api/backtest/latest once it's done."""
+    progress and /api/backtest/latest once it's done.
+
+    2026-07-27: reap_stale_backtest_run() runs first so a crashed/killed
+    prior run (no OS process behind its 'running' row - see that method's
+    docstring for the incident) can't block this button forever with a
+    409. Real still-running runs are untouched - the reap check is a
+    liveness check against the recorded pid, not a guess."""
     db = Database()
+    db.reap_stale_backtest_run()
     running = db.get_running_backtest_run()
     if running is not None:
         raise HTTPException(409, f"A backtest is already running (started {running['started_at']})")
@@ -1458,8 +1465,14 @@ async def get_backtest_status():
     (reads backtest_runs.status, not just this process's in-memory lock) so
     the UI shows 'running' correctly whether the in-progress run was started
     by this button or by scheduler.py's weekly auto-trigger in the other
-    process."""
+    process.
+
+    2026-07-27: also self-heals a stale 'running' row (reap_stale_backtest_run())
+    on every poll, so the Learning tab stops showing "Still running…" for a
+    run whose process is actually gone within one 5s poll interval, without
+    needing anyone to notice and clear it by hand."""
     db = Database()
+    db.reap_stale_backtest_run()
     running = db.get_running_backtest_run()
     return {"running": running is not None, "run": running}
 
@@ -1477,6 +1490,37 @@ async def get_backtest_runs(limit: int = 10):
     """Recent backtest_runs history for the Learning tab."""
     db = Database()
     return db.get_recent_backtest_runs(limit)
+
+
+@app.post("/api/backtest/abort")
+async def abort_running_backtest(_: bool = Depends(require_token)):
+    """HARD kill switch for a runaway backtest subprocess (2026-07-27,
+    Trinath: a manual backtest had been running for a long time with no way
+    to stop it short of finding the PID by hand in Terminal - the scan cycle
+    already had this via /api/cycle/cancel, the backtest subprocess never
+    did). Reads the running backtest_runs row's pid (recorded via os.getpid()
+    by Database.log_backtest_run_start(), so this works whether the run was
+    started by the weekly auto-trigger, the Learning tab's "Run backtest now"
+    button, or the bare CLI) and kills that whole process group via the same
+    portable kill primitive engine/cycle_supervisor.py uses for the scan
+    cycle, then marks the run 'failed' so the Learning tab shows why it
+    stopped and the next run isn't blocked by a stale 'running' row.
+
+    Runs started before this pid column existed won't have one - nothing
+    this endpoint can do about those, they need killing by hand (`ps aux |
+    grep run_backtest.py`, then `kill <pid>`) the same way every backtest
+    used to.
+
+        curl -X POST http://localhost:8080/api/backtest/abort
+    """
+    from engine.backtest_loop import kill_running_backtest
+    killed = kill_running_backtest(reason="user_abort")
+    if not killed:
+        return {"status": "no_backtest_running",
+                "note": "Nothing to abort - no backtest is currently running "
+                         "(or it predates the pid column and needs killing by hand)."}
+    return {"status": "killed",
+            "note": "Backtest force-killed immediately (the process and every subprocess it spawned)."}
 
 
 @app.get("/api/strategy")
@@ -1835,6 +1879,57 @@ async def get_threshold_regret_runs(limit: int = 20):
     same shape as /api/backtest/runs."""
     db = Database()
     return db.get_recent_threshold_regret_runs(limit)
+
+
+@app.get("/api/version")
+async def get_version():
+    """Which code this running server actually is (2026-07-27, Trinath's
+    ask: the app didn't show this anywhere). VERSION is the canonical
+    release tag - scripts/version.py's own `--current` reads the exact same
+    file, so this is the same source of truth every release script uses,
+    not a second copy of the number that can drift from it.
+
+    Also reports the git commit this process was started from, when
+    available, because VERSION only moves on a tagged release (scripts/
+    release.sh) and this repo routinely has commits on top of the last tag
+    (dynamic-sizing work landed after v3.3.0's tag, for example) - `ahead`
+    tells you whether HEAD is exactly the tagged release or has since moved,
+    without which "v3.3.0" could quietly mean two different code states.
+    Best-effort: a missing git binary or a non-repo checkout (e.g. a tarball
+    deploy) degrades to null commit fields rather than failing the request -
+    a docker/production checkout may not even have a `.git` directory."""
+    version = "unversioned"
+    version_path = BASE_DIR / "VERSION"
+    if version_path.exists():
+        version = version_path.read_text().strip()
+
+    commit, commit_short, ahead_of_tag, dirty = None, None, None, None
+    try:
+        import subprocess
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=BASE_DIR, capture_output=True,
+            text=True, timeout=3).stdout.strip() or None
+        if commit:
+            commit_short = commit[:7]
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=BASE_DIR, capture_output=True,
+            text=True, timeout=3).stdout
+        dirty = bool(status.strip())
+        tag_commit = subprocess.run(
+            ["git", "rev-list", "-n", "1", version], cwd=BASE_DIR, capture_output=True,
+            text=True, timeout=3).stdout.strip()
+        if tag_commit and commit:
+            ahead_of_tag = tag_commit != commit
+    except Exception:
+        pass  # best-effort - see docstring
+
+    return {
+        "version": version,
+        "commit": commit,
+        "commit_short": commit_short,
+        "ahead_of_tag": ahead_of_tag,
+        "dirty": dirty,
+    }
 
 
 @app.get("/api/status")
