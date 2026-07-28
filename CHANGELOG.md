@@ -18,15 +18,79 @@ different strategy, and averaging the two sets together is a measurement error.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 
-## [Unreleased]
+## [3.4] — v3.4.0 — 2026-07-28
 
-### Decision function: UNCHANGED — paper-account accounting fix + operational tooling
+### Decision function: dynamic position sizing touches it; everything else in this release does not
 
-`scripts/classify_change.py` would report PATCH/MINOR (infrastructure and
-bookkeeping only). `rules/swing_buy_rules.py`, `rules/sell_rules.py`,
-`rules/exit_scorer.py`, `rules/dynamic_thresholds.py`, `rules/hard_vetoes.py`
-and `config.yaml` are untouched — nothing about the strategy moved, so
-pre- and post-release trade history remains poolable.
+`scripts/classify_change.py` reports **MAJOR** against v3.3.0, driven
+entirely by `engine/position_sizing.py` — explicitly a decision-function
+path in `DECISION_PATHS` (position SIZE is part of "a buy, a size, or an
+exit," same as the rest of this file's own stated rule). Shipping this tag
+as **minor** anyway, deliberately overriding the classifier, for one
+specific reason: `use_dynamic_sizing` defaults to `false` (see below), so
+no trade — real or paper — is sized any differently than before v3.4.0
+unless someone explicitly flips it on in `config.yaml`. The classifier is
+correctly flagging that the CODE PATH can change the decision function; the
+override rests on the DEFAULT behavior not changing, and nothing having
+opted in yet. **Revisit this call the moment `use_dynamic_sizing: true`
+actually ships in a live `config.yaml`** — pre/post trade history stops
+being poolable from that point forward, not from this tag.
+
+Everything else in this release — `engine/paper_trader.py`'s SEED-clone
+fix, the backtest abort switch, the version endpoint — touches none of
+`rules/swing_buy_rules.py`, `rules/sell_rules.py`, `rules/exit_scorer.py`,
+`rules/dynamic_thresholds.py`, `rules/hard_vetoes.py`, or `config.yaml`'s
+decision keys. Unambiguously PATCH/MINOR on its own; only riding along with
+dynamic sizing in the same tag because both were unreleased since v3.3.0.
+
+#### Added — Dynamic Position Sizing
+
+**Feature**: Automatically scale position size as portfolio grows.
+
+Position size now calculates as a percentage of current portfolio instead of a fixed dollar amount:
+
+```
+Position size = Portfolio Total × Position Size % ÷ 100
+Position size = $60 × 3% ÷ 100 = $1.80 per trade
+Position size = $300 × 3% ÷ 100 = $9.00 per trade (automatic as portfolio grows)
+```
+
+**Configuration** (`config.yaml`):
+```yaml
+trading:
+  use_dynamic_sizing: true              # Enable (default: false)
+  position_size_pct_of_portfolio: 3.0   # 3% per trade (tunable 2-5%)
+  trade_size_usd: 100                   # Fallback for first trade
+```
+
+**Benefits**:
+- Eliminates manual position size adjustments as account grows
+- Position size scales proportionally with account (risk management stays constant)
+- Backwards compatible (disabled by default)
+- Fallback to static sizing on first trade (empty portfolio)
+- Concentration limits already scale automatically (implicit)
+
+**Technical**:
+- New: `engine/position_sizing.py:_get_portfolio_total()` - calculates open position sum
+- Modified: `engine/position_sizing.py:calculate()` - accepts `db` parameter for dynamic calc
+- Updated: `scheduler.py` - passes `db` to position sizing engine
+- Tests: 6 new unit tests in `tests/test_dynamic_sizing.py` (all passing)
+
+**Usage**:
+1. Edit `config.yaml`: set `use_dynamic_sizing: true`
+2. Restart scheduler
+3. Next cycle: position sizes scale automatically
+
+**Tuning**:
+- Conservative (more positions, lower risk): `position_size_pct_of_portfolio: 2.0`
+- Standard (default): `position_size_pct_of_portfolio: 3.0`
+- Aggressive (fewer positions, higher risk): `position_size_pct_of_portfolio: 5.0`
+
+**Fallback**: When disabled or on first trade, reverts to static `trade_size_usd` from config.
+
+**Related**:
+- See `DYNAMIC_SIZING.md` for user guide
+- See `DYNAMIC_SIZING_IMPLEMENTATION.md` for technical deep-dive
 
 #### Fixed — paper account showed more than its $10,000 basis; SEED tickers visible in paper mode
 
@@ -97,62 +161,6 @@ poll after restart — no manual DB fix needed.
   commit and whether HEAD is ahead of that tag.
 - `ui/index.html` — shown in the sidebar under the brand name, fetched once
   at boot.
-
-## [3.4.0] — v3.4.0 — 2026-07-27
-
-### Decision function: UNCHANGED — infrastructure enhancement
-
-`scripts/classify_change.py` reports PATCH (infrastructure only, no strategy changes).
-Position sizing engine enhanced to scale with portfolio size.
-
-#### Added — Dynamic Position Sizing
-
-**Feature**: Automatically scale position size as portfolio grows.
-
-Position size now calculates as a percentage of current portfolio instead of a fixed dollar amount:
-
-```
-Position size = Portfolio Total × Position Size % ÷ 100
-Position size = $60 × 3% ÷ 100 = $1.80 per trade
-Position size = $300 × 3% ÷ 100 = $9.00 per trade (automatic as portfolio grows)
-```
-
-**Configuration** (`config.yaml`):
-```yaml
-trading:
-  use_dynamic_sizing: true              # Enable (default: false)
-  position_size_pct_of_portfolio: 3.0   # 3% per trade (tunable 2-5%)
-  trade_size_usd: 100                   # Fallback for first trade
-```
-
-**Benefits**:
-- ✅ Eliminates manual position size adjustments as account grows
-- ✅ Position size scales proportionally with account (risk management stays constant)
-- ✅ Backwards compatible (disabled by default)
-- ✅ Fallback to static sizing on first trade (empty portfolio)
-- ✅ Concentration limits already scale automatically (implicit)
-
-**Technical**:
-- New: `engine/position_sizing.py:_get_portfolio_total()` - calculates open position sum
-- Modified: `engine/position_sizing.py:calculate()` - accepts `db` parameter for dynamic calc
-- Updated: `scheduler.py` - passes `db` to position sizing engine
-- Tests: 6 new unit tests in `tests/test_dynamic_sizing.py` (all passing)
-
-**Usage**:
-1. Edit `config.yaml`: set `use_dynamic_sizing: true`
-2. Restart scheduler
-3. Next cycle: position sizes scale automatically
-
-**Tuning**:
-- Conservative (more positions, lower risk): `position_size_pct_of_portfolio: 2.0`
-- Standard (default): `position_size_pct_of_portfolio: 3.0`
-- Aggressive (fewer positions, higher risk): `position_size_pct_of_portfolio: 5.0`
-
-**Fallback**: When disabled or on first trade, reverts to static `trade_size_usd` from config.
-
-**Related**:
-- See `DYNAMIC_SIZING.md` for user guide
-- See `DYNAMIC_SIZING_IMPLEMENTATION.md` for technical deep-dive
 
 ## [3.3.2] — v3.3.2 — 2026-07-27
 
