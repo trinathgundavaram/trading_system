@@ -22,7 +22,7 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ### Decision function: dynamic position sizing touches it; everything else in this release does not
 
-`scripts/classify_change.py` reports **MAJOR** against v3.3.0, driven
+`scripts/classify_change.py` reports **MAJOR** against v3.3.2, driven
 entirely by `engine/position_sizing.py` — explicitly a decision-function
 path in `DECISION_PATHS` (position SIZE is part of "a buy, a size, or an
 exit," same as the rest of this file's own stated rule). Shipping this tag
@@ -41,7 +41,7 @@ fix, the backtest abort switch, the version endpoint — touches none of
 `rules/swing_buy_rules.py`, `rules/sell_rules.py`, `rules/exit_scorer.py`,
 `rules/dynamic_thresholds.py`, `rules/hard_vetoes.py`, or `config.yaml`'s
 decision keys. Unambiguously PATCH/MINOR on its own; only riding along with
-dynamic sizing in the same tag because both were unreleased since v3.3.0.
+dynamic sizing in the same tag because both were unreleased since v3.3.2.
 
 #### Added — Dynamic Position Sizing
 
