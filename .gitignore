@@ -89,3 +89,35 @@ node_modules/
 # service environment - including anything exported into it - so it is local
 # by nature and must not be committed.
 _run_*.bat
+
+# scripts/sweep_*_configs.py and scripts/walk_forward_regime_timed.py's
+# resumable checkpoints + run logs (2026-07-28) - local research artefacts,
+# not code, and can be multi-MB.
+sweep_checkpoint.json
+sweep_regime_checkpoint.json
+walk_forward_checkpoint.json
+sweep_*.log
+sma*_buffer*.json
+
+# scripts/intraday_momentum_sweep.py, scripts/walk_forward_intraday_momentum.py,
+# scripts/fetch_alpaca_minute_bars.py (2026-07-31) - same "local research
+# artefact, not code" reasoning as above, but bigger: a multi-year 1-minute
+# bar CSV is 100MB+ (spy_1min.csv was ~118MB for 2016-2026). Never belongs in
+# git regardless of size limits - it's raw market data, fully reproducible
+# from Alpaca, and machine/account-specific by nature (see that script's own
+# docstring on where it needs to be run from).
+intraday_sweep_checkpoint.json
+intraday_walk_forward_checkpoint.json
+*_1min.csv
+*_daily_from_minute.csv
+
+# scripts/walk_forward_core_engine.py's resumable checkpoint + run log
+# (2026-08-01/02) - same "local research artefact, not code" convention as
+# the sweep checkpoints above.
+walk_forward_core_engine_checkpoint.json
+wf_run.log
+
+# spy_daily_ohlc.csv - derived SPY daily OHLCV (from the Alpaca minute-bar
+# fetch), same "reproducible market data, not code" reasoning as *_1min.csv
+# above. tests/test_rsi2_spy_swing.py already skips gracefully when absent.
+spy_daily_ohlc.csv

@@ -53,6 +53,29 @@ paper_trading:
   price_watch:
     enabled: true
     interval_seconds: 30
+rsi2_sleeve:
+  # RSI(2)/Connors-style SPY mean-reversion sleeve (2026-08-02) - a
+  # SEPARATE strategy from the swing engine above, with its own dedicated
+  # cash ledger (storage/database.py's rsi2_account, not paper_account) so
+  # it never competes with swing for the same purse. See docs/beating_the_
+  # market_analysis_2026-07-28.md sec 11-12 for the validated backtest and
+  # sec 12's blend analysis this sizing was framed around (Trinath named a
+  # 20-40% equity-allocation range as an illustrative example, not a final
+  # number). rsi_threshold/exit_mode are deliberately NOT configurable here
+  # - they are frozen constants in rules/rsi2_spy_swing.py per Trinath's own
+  # explicit instruction not to keep tuning the validated rule set.
+  paper_enabled: false  # explicit opt-in required - false until Trinath turns this on
+  # $3,000 = 30% of paper_trading.starting_cash above (the midpoint of
+  # Trinath's own 20-40% illustrative range) - a PROPOSED default, not a
+  # confirmed final figure. Only applies at seed time, same convention as
+  # paper_trading.starting_cash above (engine/rsi2_paper_trader.ensure_
+  # seeded() returns early once the account row exists).
+  paper_starting_cash: 3000
+  # Live trading is NOT wired yet (2026-08-02) - intentionally left out of
+  # this file until (a) Trinath gives a concrete real-dollar figure (not an
+  # illustrative range) and (b) a dedicated RSI2 validation-receipt gate
+  # exists, mirroring run_backtest.py's existing one for swing rather than
+  # riding on it. See the live-trading task in this session's plan.
 screener:
   enabled: true
   refresh_minutes: 15
@@ -749,6 +772,71 @@ backtest:
   months: 36
   warmup_days: 260
   max_hold_days: 20
+  # execution_cost_bps (2026-07-28, Trinath's directive #2 after reviewing
+  # the 2542-trade/PF-1.14 run: "add execution costs now... the current edge
+  # is not large enough to ignore friction"). Round-trip slippage+spread
+  # haircut in basis points, split evenly across entry and exit fills - see
+  # engine/execution_costs.py's module docstring for the model and for the
+  # post-hoc sensitivity table that motivated this (PF 1.14 at 0bps -> 1.05
+  # at 20bps -> 1.01 at 30bps -> 0.93 at 50bps on that run). Default 0 (OFF)
+  # so this cannot silently change any existing/automatic run's numbers -
+  # set explicitly here, or pass run_backtest.py --execution-cost-bps, to
+  # activate. 20-30 is a reasonable "realistic friction" starting point for
+  # a swing-traded, not-mega-cap-only universe; raise it for a more
+  # conservative/less liquid assumption.
+  execution_cost_bps: 0
+  # entry_filter (2026-07-28, Trinath's directive #3: "test a stricter
+  # regime gate or a 'BULL-only/high-conviction only' subset"). BACKTEST-
+  # ONLY research knob - rules/swing_buy_rules.py and every live/paper path
+  # are completely unaware of this key, see engine/backtest_engine.py's
+  # passes_entry_filter() docstring. A candidate that clears the real
+  # threshold but fails this filter is skipped exactly like a sub-threshold
+  # score (the replay's i-pointer advances to the next candidate), which is
+  # what makes a filtered run's numbers a real end-to-end test rather than a
+  # post-hoc slice of an unfiltered run's trades.
+  #
+  # The 2026-07-28 review found min_tier: standard + exclude_regimes: [BULL]
+  # held up far better under execution costs than the unfiltered set (PF
+  # 1.28 vs 1.02 @ 25bps on a fresh 60-ticker run, n=375) - both fields
+  # default to "off" here so that result has to be deliberately re-enabled,
+  # not silently baked into every future run.
+  entry_filter:
+    min_tier: null          # null (off) | weak | standard | strong
+    exclude_regimes: []     # e.g. [BULL] - values are engine/regime_engine.py's regime labels
+    # max_vix (2026-07-28, from docs/beating_the_market_analysis_2026-07-28.md
+    # §2.4): the 5-year lookback found 2022 - a real bear market - was this
+    # filter's worst year by far (PF 0.53), and exclude_regimes: [BULL] does
+    # nothing to protect against it. VIX is only one of five weighted votes
+    # into dominant_regime, so a direct threshold here catches elevated
+    # volatility even when the regime vote still lands BULL/CHOPPY. null=off.
+    max_vix: null            # e.g. 25 - candidate-days with vix_close above this are rejected
+    # max_realized_vol_pct (2026-07-28, same-day follow-up to max_vix above):
+    # exclude_regimes: [BEAR] + max_vix: 25 STILL failed to protect 2022 -
+    # every one of that year's surviving trades in that test was labeled
+    # CHOPPY, zero BEAR, because engine/regime_engine.py's dominant_regime
+    # vote hardcodes Fear&Greed and Advance/Decline ratio to neutral in
+    # Stage 1 (no free historical source exists for either), structurally
+    # padding the CHOPPY vote regardless of real conditions. This threshold
+    # is computed DIRECTLY from SPY price data (trailing annualized realized
+    # volatility - see engine/backtest_engine.py's realized_vol_pct()) and
+    # never touches dominant_regime or the fake F&G/AD-ratio inputs at all,
+    # so it cannot inherit that bias. Roughly VIX-scale but NOT the same
+    # thing - realized (already-happened) vol, not implied (forward-looking)
+    # vol. null=off.
+    max_realized_vol_pct: null   # e.g. 25 - candidate-days above this trailing realized vol are rejected
+    # min_spy_trend_pct (2026-07-28, same-day follow-up #2): max_realized_vol_pct
+    # ALSO failed to protect 2022 - it removed some 2022 candidates but the
+    # REMAINING ones got worse (PF 0.24, not better), because 2022's losses
+    # aren't concentrated in high-volatility days. Three independent same-day
+    # signals (regime label, VIX, realized vol) have all failed the same way -
+    # this is deliberately NOT a fourth same-day threshold. It's SPY's price
+    # as a % above/below its own 200-day SMA (engine/backtest_engine.py's
+    # spy_trend_pct()) - a slow-moving, multi-month read meant to catch a
+    # SUSTAINED downtrend the other three structurally cannot. null=off;
+    # 0 means "only trade with SPY at/above its 200-day SMA" (a classic
+    # systematic trend filter); negative values (e.g. -5) allow some cushion
+    # below the SMA before rejecting.
+    min_spy_trend_pct: null
   # ticker_source (2026-07-24, "pick tickers automatically instead of a
   # hand-curated list, will that help or create noise"): "screener_discovered"
   # means the tickers list below is IGNORED and engine/backtest_loop.py's
@@ -846,3 +934,19 @@ notifications:
   # unset ${VAR} with no fallback, and a webhook is genuinely optional.
   webhook_url: ${NOTIFY_WEBHOOK_URL:-}
   high_conviction_buy_pct: 80
+
+# Intraday momentum backtest (2026-07-30) - engine/intraday_momentum_backtest.py,
+# phase 1 of docs/intraday_momentum_scoping_2026-07-30.md (the Zarattini/Aziz/
+# Barbon "Beat the Market" SPY noise-boundary strategy). BACKTEST-ONLY, same as
+# every key under `backtest:` used elsewhere in this file - engine/live_trader.py,
+# engine/paper_trader.py, and engine/order_execution.py never read this section.
+#
+# Unlike backtest.execution_cost_bps (default 0.0 = off), this section's cost
+# defaults are NOT zero - see engine/intraday_execution_costs.py's module
+# docstring for why: they default to the paper's OWN disclosed $/share cost
+# assumption, because the entire point of this backtest is testing whether the
+# paper's reported numbers survive the paper's own stated friction. Set both to
+# 0.0 explicitly for a frictionless comparison run.
+intraday_backtest:
+  commission_per_share: 0.0035
+  slippage_per_share: 0.001

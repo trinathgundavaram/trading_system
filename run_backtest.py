@@ -65,6 +65,45 @@ def main():
     p.add_argument("--warmup-days", type=int, default=260,
                     help="Trading days of history fetched before --start for SMA200/weekly-trend warmup (default: 260)")
     p.add_argument("--max-hold-days", type=int, default=20, help="Max simulated hold before a time-based exit (default: 20)")
+    p.add_argument("--execution-cost-bps", type=float, default=None,
+                    help="Round-trip slippage+spread haircut in bps, split across entry/exit fills "
+                         "(default: config.yaml's backtest.execution_cost_bps, itself 0/off unless set). "
+                         "See engine/execution_costs.py. Pass e.g. 20 or 30 for a realistic-friction run.")
+    p.add_argument("--min-entry-tier", choices=["weak", "standard", "strong"], default=None,
+                    help="BACKTEST-ONLY research filter: reject threshold-clearing candidates scored below "
+                         "this tier instead of taking the trade (default: config.yaml's "
+                         "backtest.entry_filter.min_tier, itself off unless set). Does not touch live/paper "
+                         "trading - see engine/backtest_engine.py's passes_entry_filter().")
+    p.add_argument("--exclude-regimes", nargs="+", default=None,
+                    help="BACKTEST-ONLY research filter: reject candidates scored during these regimes "
+                         "(e.g. --exclude-regimes BULL, or BULL BEAR). Default: config.yaml's "
+                         "backtest.entry_filter.exclude_regimes, itself empty unless set.")
+    p.add_argument("--max-vix", type=float, default=None,
+                    help="BACKTEST-ONLY research filter: reject candidates on a day where vix_close exceeds "
+                         "this level, independent of dominant_regime (see docs/"
+                         "beating_the_market_analysis_2026-07-28.md sec 2.4 - regime alone did not protect "
+                         "against 2022's bear market). Default: config.yaml's backtest.entry_filter.max_vix, "
+                         "itself off unless set. e.g. --max-vix 25.")
+    p.add_argument("--max-realized-vol", type=float, default=None,
+                    help="BACKTEST-ONLY research filter: reject candidates on a day where SPY's trailing "
+                         "annualized realized volatility exceeds this level - computed DIRECTLY from price "
+                         "data, independent of dominant_regime/VIX (see docs/"
+                         "beating_the_market_analysis_2026-07-28.md sec 7 - exclude_regimes:[BEAR]+max_vix "
+                         "still failed to catch 2022 because the regime classifier's fake F&G/AD-ratio "
+                         "inputs biased it toward CHOPPY). Default: config.yaml's "
+                         "backtest.entry_filter.max_realized_vol_pct, itself off unless set. e.g. 25.")
+    p.add_argument("--min-spy-trend-pct", type=float, default=None,
+                    help="BACKTEST-ONLY research filter: reject candidates when SPY is more than this %% "
+                         "below its own 200-day SMA (0 = require SPY at/above its 200-SMA; negative allows "
+                         "some cushion). A slow-moving, multi-month trend read, deliberately NOT another "
+                         "same-day threshold - see docs/beating_the_market_analysis_2026-07-28.md sec 7d "
+                         "(three same-day signals all failed to protect against 2022). Default: config.yaml's "
+                         "backtest.entry_filter.min_spy_trend_pct, itself off unless set. e.g. 0 or -5.")
+    p.add_argument("--stop-loss-swing-pct", type=float, default=None,
+                    help="BACKTEST-ONLY override of risk.<risk_level>.stop_loss_swing_pct for this run only - "
+                         "does NOT touch config.yaml, so live/paper trading's real stop width is unaffected. "
+                         "For re-testing docs/backtest_eval_2026-07-26.md's finding that the current 8%% TURBO "
+                         "cap was binding on higher-ATR names (proven then, never applied) - try 14 or 16.")
     p.add_argument("--out-dir", default=None, help="Output directory (default: output/backtest_results/<timestamp>)")
     p.add_argument("--no-db", action="store_true", help="Skip backtest_runs DB logging - file output only")
     p.add_argument("--triggered-by", default="manual",
@@ -80,6 +119,43 @@ def main():
     # dict-shaped loader (load_config() returns a dot-access SimpleNamespace
     # instead, used by the legacy engine/executor.py path only).
     cfg_dict = load_config_dict()
+    if args.execution_cost_bps is not None:
+        # CLI override for a quick sensitivity run without editing
+        # config.yaml - copy the backtest sub-dict rather than mutating the
+        # loader's cached dict in place (load_config_dict() may return a
+        # shared object reused by other callers in-process).
+        cfg_dict = dict(cfg_dict)
+        cfg_dict["backtest"] = dict((cfg_dict.get("backtest") or {}),
+                                     execution_cost_bps=args.execution_cost_bps)
+    if (args.min_entry_tier is not None or args.exclude_regimes is not None
+            or args.max_vix is not None or args.max_realized_vol is not None
+            or args.min_spy_trend_pct is not None):
+        cfg_dict = dict(cfg_dict)
+        bt = dict(cfg_dict.get("backtest") or {})
+        existing_ef = dict(bt.get("entry_filter") or {})
+        if args.min_entry_tier is not None:
+            existing_ef["min_tier"] = args.min_entry_tier
+        if args.exclude_regimes is not None:
+            existing_ef["exclude_regimes"] = args.exclude_regimes
+        if args.max_vix is not None:
+            existing_ef["max_vix"] = args.max_vix
+        if args.max_realized_vol is not None:
+            existing_ef["max_realized_vol_pct"] = args.max_realized_vol
+        if args.min_spy_trend_pct is not None:
+            existing_ef["min_spy_trend_pct"] = args.min_spy_trend_pct
+        bt["entry_filter"] = existing_ef
+        cfg_dict["backtest"] = bt
+    if args.stop_loss_swing_pct is not None:
+        # Overlay ONLY the active risk_level's stop_loss_swing_pct, in a
+        # copy - config.yaml's own value (and every other risk level) is
+        # untouched, and this cfg_dict only ever feeds this one backtest run.
+        cfg_dict = dict(cfg_dict)
+        risk_level = cfg_dict.get("risk_level", "MODERATE")
+        risk_cfg = dict(cfg_dict.get("risk") or {})
+        level_cfg = dict(risk_cfg.get(risk_level) or {})
+        level_cfg["stop_loss_swing_pct"] = args.stop_loss_swing_pct
+        risk_cfg[risk_level] = level_cfg
+        cfg_dict["risk"] = risk_cfg
 
     db = None
     if not args.no_db:
@@ -105,8 +181,29 @@ def main():
         except Exception as e:
             print(f"Note: screener_discovered ticker resolution failed ({e}) - using --tickers instead.")
 
+    from engine.execution_costs import get_round_trip_bps
+    from engine.backtest_engine import entry_filter_from_cfg
+    cost_bps = get_round_trip_bps(cfg_dict)
+    ef = entry_filter_from_cfg(cfg_dict)
     print(f"Stage 1 historical replay: {len(tickers)} tickers, {start} .. {end}, "
           f"risk_level={cfg_dict.get('risk_level')}, mode=swing (see engine/backtest_engine.py docstring for scope)")
+    print(f"Execution cost model: {f'{cost_bps} bps round-trip' if cost_bps else 'OFF (frictionless fills)'}")
+    if (ef["min_tier"] or ef["exclude_regimes"] or ef.get("max_vix") or ef.get("max_realized_vol_pct")
+            or ef.get("min_spy_trend_pct") is not None):
+        print(f"Entry filter (backtest-only): min_tier={ef['min_tier'] or 'any'}, "
+              f"exclude_regimes={sorted(ef['exclude_regimes']) or 'none'}, "
+              f"max_vix={ef.get('max_vix') if ef.get('max_vix') is not None else 'none'}, "
+              f"max_realized_vol_pct="
+              f"{ef.get('max_realized_vol_pct') if ef.get('max_realized_vol_pct') is not None else 'none'}, "
+              f"min_spy_trend_pct="
+              f"{ef.get('min_spy_trend_pct') if ef.get('min_spy_trend_pct') is not None else 'none'}")
+    else:
+        print("Entry filter (backtest-only): OFF (all tiers/regimes/VIX/realized-vol/trend levels accepted)")
+    risk_level = cfg_dict.get("risk_level", "MODERATE")
+    effective_stop_pct = (cfg_dict.get("risk", {}).get(risk_level, {}) or {}).get("stop_loss_swing_pct")
+    if args.stop_loss_swing_pct is not None:
+        print(f"Stop-loss width (backtest-only override): {effective_stop_pct}% "
+              f"(config.yaml's live default is unchanged)")
     print(f"Tickers: {', '.join(tickers)}")
 
     result = run_and_persist(tickers, start, end, cfg_dict, db=db, triggered_by=args.triggered_by,

@@ -96,6 +96,8 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
+from engine import execution_costs
+
 logger = logging.getLogger(__name__)
 
 
@@ -247,6 +249,64 @@ def compute_regime_asof(spy_window: pd.DataFrame, vix_close: float):
     return regime_calculate(spy_price, spy_sma50, spy_sma200, vix_close or 18.0, fg_score=50, ad_ratio=0.5)
 
 
+def realized_vol_pct(spy_window: pd.DataFrame, lookback_days: int = 20) -> float:
+    """Trailing annualized realized volatility of SPY daily closes, computed
+    DIRECTLY from real price data (2026-07-28, from docs/
+    beating_the_market_analysis_2026-07-28.md sec 7's finding: excluding BEAR
+    via dominant_regime failed to catch 2022 because two of the regime vote's
+    five inputs - Fear&Greed and Advance/Decline ratio - are hardcoded neutral
+    in Stage 1, biasing the classifier toward CHOPPY regardless of what the
+    market is actually doing; every one of 2022's surviving trades in that
+    test was labeled CHOPPY, zero BEAR).
+
+    This is deliberately independent of engine/regime_engine.py's classifier
+    and of dominant_regime entirely - it never routes through the fake F&G/
+    AD-ratio inputs, so it can't inherit their bias. Same annualization
+    convention as VIX (stdev of daily returns * sqrt(252) * 100) so a
+    threshold here is roughly comparable in scale to a VIX threshold, but it
+    is measuring REALIZED (already-happened) volatility, not the market's
+    IMPLIED (forward-looking) volatility VIX represents - a real distinction,
+    not a drop-in replacement, and worth reading as a complementary signal
+    rather than "VIX but backtest-only."
+
+    Returns None if there isn't enough history in spy_window yet (early in
+    the warmup period) - same "don't fake a filter decision on missing data"
+    posture as the rest of this module."""
+    closes = spy_window["close"].tail(lookback_days + 1)
+    if len(closes) < 2:
+        return None
+    rets = closes.pct_change().dropna()
+    if len(rets) < 2:
+        return None
+    return float(rets.std() * (252 ** 0.5) * 100)
+
+
+def spy_trend_pct(spy_window: pd.DataFrame) -> float:
+    """SPY's price as a % above (positive) or below (negative) its own
+    200-day SMA - the classic long-horizon trend filter systematic
+    strategies use specifically to sit out a SUSTAINED downtrend (2026-07-28,
+    docs/beating_the_market_analysis_2026-07-28.md sec 7d: three independent
+    single-day volatility/regime signals - dominant_regime, VIX, and
+    price-derived realized vol - all failed to protect against 2022, which
+    pointed at a multi-month grind no single-day snapshot can catch. This is
+    the "conceptually different" test flagged there: a slow-moving trend
+    read, not another same-day threshold.
+
+    Requires a genuine 200 days of SPY history to mean anything - returns
+    None rather than a misleading number during early warmup (unlike
+    compute_regime_asof's regime vote, which falls back to spy_price as its
+    own SMA when short on history - that fallback is fine for a 3-way vote
+    among 5 signals, but a dedicated trend filter with nothing else to lean
+    on should not fake its one input)."""
+    if len(spy_window) < 200:
+        return None
+    spy_price = float(spy_window["close"].iloc[-1])
+    spy_sma200 = float(spy_window["close"].rolling(200).mean().iloc[-1])
+    if not spy_sma200:
+        return None
+    return (spy_price / spy_sma200 - 1) * 100
+
+
 # ---------------------------------------------------------------------------
 # 4. Minimal DB shim - see module docstring's "known simplifications"
 # ---------------------------------------------------------------------------
@@ -324,6 +384,126 @@ def _entry_tier(pct_score: float) -> str:
     if pct_score >= 65:
         return "standard"
     return "weak"
+
+
+_TIER_RANK = {"weak": 0, "standard": 1, "strong": 2}
+
+
+def entry_filter_from_cfg(cfg: dict) -> dict:
+    """Reads backtest.entry_filter (2026-07-28, backtest-only - see
+    passes_entry_filter's docstring for why this deliberately does not touch
+    rules/swing_buy_rules.py). Tolerant of a missing/malformed section -
+    falls back to "no filter" rather than crashing a replay.
+
+    max_vix (2026-07-28 addition, from the "what would it take to beat the
+    market" review's §2.4: BEAR is already excludable via exclude_regimes
+    (dominant_regime is a plain string - "BEAR" needs no new code), but VIX
+    is one of FIVE weighted votes into engine/regime_engine.py's dominant
+    regime alongside SPY/SMA, F&G and A/D - a moderately elevated VIX during
+    an otherwise-bullish SPY trend can still land as BULL/CHOPPY. max_vix is
+    an independent, direct threshold on the same vix_close already fetched
+    per-candidate in run_replay, for testing regime protection that doesn't
+    rely on VIX first winning the dominant-regime vote."""
+    cfg = cfg or {}
+    ef = (cfg.get("backtest", {}) or {}).get("entry_filter", {}) or {}
+    min_tier = ef.get("min_tier")
+    if min_tier not in _TIER_RANK:
+        min_tier = None
+    exclude_regimes = ef.get("exclude_regimes") or []
+    if isinstance(exclude_regimes, str):
+        exclude_regimes = [exclude_regimes]
+    max_vix = ef.get("max_vix")
+    try:
+        max_vix = float(max_vix) if max_vix is not None else None
+    except (TypeError, ValueError):
+        max_vix = None
+    max_realized_vol_pct = ef.get("max_realized_vol_pct")
+    try:
+        max_realized_vol_pct = float(max_realized_vol_pct) if max_realized_vol_pct is not None else None
+    except (TypeError, ValueError):
+        max_realized_vol_pct = None
+    min_spy_trend_pct = ef.get("min_spy_trend_pct")
+    try:
+        min_spy_trend_pct = float(min_spy_trend_pct) if min_spy_trend_pct is not None else None
+    except (TypeError, ValueError):
+        min_spy_trend_pct = None
+    return {"min_tier": min_tier, "exclude_regimes": set(exclude_regimes), "max_vix": max_vix,
+            "max_realized_vol_pct": max_realized_vol_pct, "min_spy_trend_pct": min_spy_trend_pct}
+
+
+def passes_entry_filter(tier: str, regime: str, entry_filter: dict, vix: float = None,
+                        realized_vol_pct_value: float = None, spy_trend_pct_value: float = None) -> bool:
+    """Backtest-only pre-trade filter (2026-07-28, directive #3 from
+    Trinath's 2026-07-28 review: "test a stricter regime gate or a
+    'BULL-only/high-conviction only' subset"). A post-hoc analysis of the
+    2026-07-28 run had already shown standard-tier + non-BULL trades hold up
+    far better under execution costs (PF 1.28 @ 25bps on a fresh run, n=375,
+    vs. PF 1.02 unfiltered) than simply slicing outcome_pct after the fact
+    could prove - the trade was still TAKEN in that analysis, occupying a
+    slot in the sequential per-ticker walk that a real filter would instead
+    have skipped, letting the scan move on to the next candidate. This
+    function is what makes that difference real: a rejected candidate here
+    returns to run_replay's normal `i += 1, continue` path exactly like a
+    failed veto or a sub-threshold score, so the ticker's timeline actually
+    advances to the next opportunity instead of the trade counterfactually
+    not existing in a spreadsheet.
+
+    max_vix (2026-07-28): the 5-year lookback found 2022 (a real bear market)
+    was this filter's worst year by far (PF 0.53) while exclude_regimes:
+    [BULL] does nothing to protect against it - BULL exclusion targets
+    melt-up chop, not drawdowns. vix=None (no VIX data for this candidate-day)
+    never rejects - same "don't fake a filter decision on missing data"
+    posture as the rest of this module.
+
+    max_realized_vol_pct (2026-07-28, same-day follow-up): exclude_regimes:
+    [BEAR] + max_vix STILL failed to protect 2022 - every one of that year's
+    108 surviving trades in that test was labeled CHOPPY, zero BEAR, because
+    engine/regime_engine.py's dominant_regime vote has two of its five inputs
+    (Fear&Greed, Advance/Decline ratio) hardcoded neutral in Stage 1,
+    structurally padding the CHOPPY vote regardless of real conditions. This
+    parameter checks realized_vol_pct_value - computed by
+    realized_vol_pct() DIRECTLY from SPY price data, never touching
+    dominant_regime or the fake F&G/AD-ratio inputs at all - so it cannot
+    inherit that bias. realized_vol_pct_value=None (not enough SPY history
+    yet, e.g. early in the warmup window) never rejects, same posture as vix.
+
+    min_spy_trend_pct (2026-07-28, same-day follow-up #2): max_realized_vol_pct
+    ALSO failed to protect 2022 - it even made the surviving 2022 trades
+    worse (PF 0.24 vs 0.53 ungated), because 2022's losses aren't
+    concentrated in high-volatility days; a flat vol cutoff removes some of
+    this exit logic's biggest winners while leaving the grinding, moderate-
+    chop losses untouched. Three independent same-day signals (regime label,
+    VIX, realized vol) have now all failed the same way - this parameter is
+    deliberately NOT a fourth same-day threshold. It checks
+    spy_trend_pct_value - SPY's price as a % above/below its own 200-day SMA
+    (see spy_trend_pct()), a slow-moving, multi-month read intended to catch
+    a SUSTAINED downtrend the way the other three signals structurally
+    cannot. spy_trend_pct_value=None (short on 200-day history) never
+    rejects, same posture as the others.
+
+    Deliberately NOT wired into rules/swing_buy_rules.py or any live/paper
+    path - this is a research knob for validating the filter's edge
+    end-to-end (including this redeployment effect) BEFORE anyone decides
+    whether it's worth turning into a real decision-function change, which
+    would need its own review, classify_change.py run, and (per live_trader's
+    section 32) a fresh validation receipt. Default (empty cfg) accepts
+    every tier/regime/vix/realized-vol/trend reading, unchanged from
+    pre-2026-07-28 behaviour."""
+    if entry_filter["min_tier"] is not None:
+        if _TIER_RANK.get(tier, -1) < _TIER_RANK[entry_filter["min_tier"]]:
+            return False
+    if regime in entry_filter["exclude_regimes"]:
+        return False
+    if entry_filter.get("max_vix") is not None and vix is not None:
+        if vix > entry_filter["max_vix"]:
+            return False
+    if entry_filter.get("max_realized_vol_pct") is not None and realized_vol_pct_value is not None:
+        if realized_vol_pct_value > entry_filter["max_realized_vol_pct"]:
+            return False
+    if entry_filter.get("min_spy_trend_pct") is not None and spy_trend_pct_value is not None:
+        if spy_trend_pct_value < entry_filter["min_spy_trend_pct"]:
+            return False
+    return True
 
 
 def atr_series(bars: pd.DataFrame, length: int = 14) -> list:
@@ -443,11 +623,11 @@ def simulate_forward_exit(ticker_bars: pd.DataFrame, entry_idx: int, entry_price
         if low_ <= stop_price:
             return _exit_result(i, stop_price, entry_price, entry_idx, mae_pct, mfe_pct,
                                 stop_state.exit_kind, tier,
-                                stop_state=stop_state.value, risk_per_share=risk_per_share)
+                                stop_state=stop_state.value, risk_per_share=risk_per_share, cfg=cfg)
         if high_ >= target_price:
             return _exit_result(i, target_price, entry_price, entry_idx, mae_pct, mfe_pct,
                                 "take_profit", tier, stop_state=stop_state.value,
-                                risk_per_share=risk_per_share)
+                                risk_per_share=risk_per_share, cfg=cfg)
 
         # 2. Bar survived - advance the watermark and re-price for the NEXT bar.
         high_watermark = max(high_watermark, high_)
@@ -465,12 +645,21 @@ def simulate_forward_exit(ticker_bars: pd.DataFrame, entry_idx: int, entry_price
     exit_price = float(ticker_bars.iloc[last_idx]["close"])
     return _exit_result(last_idx, exit_price, entry_price, entry_idx, mae_pct, mfe_pct,
                         "time_stop", tier, stop_state=stop_state.value,
-                        risk_per_share=risk_per_share)
+                        risk_per_share=risk_per_share, cfg=cfg)
 
 
 def _exit_result(exit_idx, exit_price, entry_price, entry_idx, mae_pct, mfe_pct, reason, tier,
-                 stop_state=None, risk_per_share=None):
-    outcome_pct = (exit_price / entry_price - 1) * 100
+                 stop_state=None, risk_per_share=None, cfg=None):
+    # EXECUTION COSTS (2026-07-28, see engine/execution_costs.py's module
+    # docstring for the full rationale). Only the P&L numerator is
+    # cost-adjusted - eff_entry/eff_exit feed outcome_pct/outcome_r below.
+    # risk_per_share's denominator stays on the RAW entry_price (the stop
+    # machine's risk framing is unaware of fill-cost assumptions). Default
+    # cfg (None) or execution_cost_bps<=0 makes eff_entry==entry_price and
+    # eff_exit==exit_price, so this is a no-op unless explicitly configured.
+    cost_bps = execution_costs.get_round_trip_bps(cfg)
+    eff_entry, eff_exit = execution_costs.apply_execution_costs(entry_price, exit_price, cfg)
+    outcome_pct = (eff_exit / eff_entry - 1) * 100
     # R-MULTIPLE (2026-07-26). outcome_pct alone is not comparable ACROSS
     # configs with different stop widths: this replay equal-weights every
     # trade's percentage return, but a position sized to risk a fixed
@@ -489,6 +678,7 @@ def _exit_result(exit_idx, exit_price, entry_price, entry_idx, mae_pct, mfe_pct,
         "hold_days": exit_idx - entry_idx, "exit_reason": reason, "entry_tier": tier,
         "risk_pct": round(risk_per_share / entry_price * 100, 3) if risk_per_share else None,
         "outcome_r": round(outcome_r, 3) if outcome_r is not None else None,
+        "execution_cost_bps": cost_bps,
         # 2026-07-26: which stop-machine stage the position was in when it
         # exited. A stop hit in TREND_FOLLOWING is a profit being protected,
         # not a loss being capped - collapsing both into "stop_loss" is the
@@ -503,13 +693,23 @@ def _exit_result(exit_idx, exit_price, entry_price, entry_idx, mae_pct, mfe_pct,
 # ---------------------------------------------------------------------------
 
 def run_replay(tickers: list, start: str, end: str, cfg: dict,
-                warmup_days: int = 260, max_hold_days: int = 20) -> dict:
+                warmup_days: int = 260, max_hold_days: int = 20, progress_cb=None) -> dict:
     """Runs the REAL rules/hard_vetoes.py + rules/swing_buy_rules.py (which
     internally runs dynamic_thresholds/execution_quality/probabilistic_decision)
     against historical daily bars for each ticker independently. `warmup_days`
     of history are fetched BEFORE `start` so SMA200/weekly-trend rules have
     real data on day 1 of the actual replay window rather than reading as
-    stale for the first ~10 months."""
+    stale for the first ~10 months.
+
+    `progress_cb`, if given, is called as progress_cb(ticker_index_1_based,
+    total_tickers, ticker) right before each ticker's day-by-day replay
+    starts. Opt-in and silent by default (None) - this loop is the expensive
+    part (2026-07-28: a 44-ticker/5yr/standard-tier run took ~18 minutes of
+    real per-day hard-veto/scoring/regime computation, and caching the bars
+    on disk barely moved that number - the compute, not the network fetch,
+    is the bottleneck), so callers doing a long multi-config sweep
+    (scripts/sweep_backtest_configs.py) want visibility inside a single
+    config's run, not just at its start/end."""
     from rules import hard_vetoes, swing_buy_rules
 
     fetch_start = (pd.to_datetime(start) - pd.Timedelta(days=int(warmup_days * 1.6))).strftime("%Y-%m-%d")
@@ -528,6 +728,8 @@ def run_replay(tickers: list, start: str, end: str, cfg: dict,
     all_trades = []
     veto_counts: dict = {}
     n_scored = 0
+    entry_filter = entry_filter_from_cfg(cfg)
+    n_entry_filter_rejected = 0
     # Score-distribution telemetry (2026-07-24, added alongside the
     # SENTIMENT_MACRO/MARKET_BREADTH availability fix in
     # rules/swing_buy_rules.py): a "0 trades" run previously gave zero
@@ -542,7 +744,12 @@ def run_replay(tickers: list, start: str, end: str, cfg: dict,
     _near_misses: list = []
 
     try:
-        for ticker in tickers:
+        for _t_idx, ticker in enumerate(tickers, start=1):
+            if progress_cb is not None:
+                try:
+                    progress_cb(_t_idx, len(tickers), ticker)
+                except Exception:
+                    pass  # progress reporting must never break a real replay
             try:
                 bars = fetch_daily_bars(ticker, fetch_start, end)
             except Exception as e:
@@ -594,6 +801,28 @@ def run_replay(tickers: list, start: str, end: str, cfg: dict,
                         "deficit_pct": round(result.threshold - result.final_score_pct, 2),
                     })
 
+                # Only computed when the filter actually uses it - a per-bar
+                # stdev/SMA pass is cheap but pointless overhead across a
+                # 60-ticker/multi-year replay when these are off.
+                rv = (realized_vol_pct(spy_window)
+                      if entry_filter.get("max_realized_vol_pct") is not None else None)
+                spy_trend = (spy_trend_pct(spy_window)
+                             if entry_filter.get("min_spy_trend_pct") is not None else None)
+                if result.passed and not passes_entry_filter(
+                        _entry_tier(result.final_score_pct), regime.dominant_regime, entry_filter,
+                        vix=vix_close, realized_vol_pct_value=rv, spy_trend_pct_value=spy_trend):
+                    # 2026-07-28: candidate cleared the real threshold but
+                    # failed the backtest-only research filter (see
+                    # passes_entry_filter's docstring) - treated exactly like
+                    # a sub-threshold score, NOT like a trade that was taken
+                    # and then discarded. i advances so the ticker's timeline
+                    # moves on to the next opportunity, which is what makes
+                    # this different from (and more honest than) slicing
+                    # outcome_pct out of an unfiltered run after the fact.
+                    n_entry_filter_rejected += 1
+                    i += 1
+                    continue
+
                 if result.passed:
                     entry_price = td.price
                     exit_info = simulate_forward_exit(
@@ -629,11 +858,29 @@ def run_replay(tickers: list, start: str, end: str, cfg: dict,
         "veto_counts": veto_counts,
         "summary": summarize(all_trades),
         "score_distribution": _summarize_scores(_all_scores, _near_misses),
+        # 2026-07-28: how many threshold-clearing candidates the research
+        # filter (backtest.entry_filter) turned away, separate from
+        # veto_counts/near-misses since these candidates passed everything
+        # production would have required - see passes_entry_filter's
+        # docstring for why this is not the same as slicing trades post-hoc.
+        "n_entry_filter_rejected": n_entry_filter_rejected,
         "config": {
             "risk_level": risk_level, "base_threshold_pct": base_threshold,
             "stop_loss_swing_pct": stop_loss_swing_pct, "r_multiple": r_multiple,
             "mode": "swing", "max_hold_days": max_hold_days,
             "pandas_ta_used": _pandas_ta_available(),
+            # 2026-07-28: recorded on the run itself (not just per-trade) so
+            # summary.md/the Learning tab can show at a glance whether a given
+            # run's PF reflects frictionless fills or a cost-adjusted one -
+            # see engine/execution_costs.py.
+            "execution_cost_bps": execution_costs.get_round_trip_bps(cfg),
+            "entry_filter": {
+                "min_tier": entry_filter["min_tier"],
+                "exclude_regimes": sorted(entry_filter["exclude_regimes"]),
+                "max_vix": entry_filter.get("max_vix"),
+                "max_realized_vol_pct": entry_filter.get("max_realized_vol_pct"),
+                "min_spy_trend_pct": entry_filter.get("min_spy_trend_pct"),
+            },
         },
     }
 
@@ -817,12 +1064,39 @@ def run_and_persist(tickers: list, start: str, end: str, cfg: dict, db=None,
 def _render_summary_md(tickers: list, start: str, end: str, result: dict) -> str:
     s, cfg_used = result["summary"], result["config"]
     sd = result.get("score_distribution", {}) or {}
+    ef = cfg_used.get("entry_filter", {}) or {}
+    ef_active = bool(ef.get("min_tier") or ef.get("exclude_regimes") or ef.get("max_vix")
+                      or ef.get("max_realized_vol_pct") or ef.get("min_spy_trend_pct") is not None)
+    ef_line = (
+        f"min_tier={ef.get('min_tier') or 'any'}, exclude_regimes={ef.get('exclude_regimes') or 'none'}, "
+        f"max_vix={ef.get('max_vix') if ef.get('max_vix') is not None else 'none'}, "
+        f"max_realized_vol_pct="
+        f"{ef.get('max_realized_vol_pct') if ef.get('max_realized_vol_pct') is not None else 'none'}, "
+        f"min_spy_trend_pct="
+        f"{ef.get('min_spy_trend_pct') if ef.get('min_spy_trend_pct') is not None else 'none'} "
+        f"({result.get('n_entry_filter_rejected', 0)} threshold-clearing candidates rejected)"
+        if ef_active else
+        "OFF (all tiers/regimes/VIX/realized-vol/trend levels accepted, unchanged pre-2026-07-28 behaviour)"
+    )
     lines = [
         "# Stage 1 Historical Replay - Summary", "",
         f"**Window:** {start} to {end} | **Tickers:** {', '.join(tickers)}",
         f"**Risk level:** {cfg_used['risk_level']} (base threshold {cfg_used['base_threshold_pct']}%) | "
         f"**Mode:** {cfg_used['mode']} | **Max hold:** {cfg_used['max_hold_days']} trading days",
         f"**Indicator backend:** {'pandas_ta (full production fidelity)' if cfg_used['pandas_ta_used'] else 'engine/ta_fallback.py (pandas_ta not installed)'}",
+        # 2026-07-28: PF/expectancy below read very differently at 0bps
+        # (frictionless fills) vs. a realistic cost assumption - see
+        # engine/execution_costs.py - so this is called out right next to the
+        # other run-defining settings, not buried in the config JSON.
+        "**Execution cost model:** " + (
+            f"{cfg_used['execution_cost_bps']} bps round-trip, split across entry/exit"
+            if cfg_used.get("execution_cost_bps") else
+            "OFF (frictionless fills - see engine/execution_costs.py)"
+        ),
+        # 2026-07-28: same treatment as the cost model above - a filtered
+        # run's trade count/PF is meaningless without knowing the filter was
+        # on. Backtest-only, see passes_entry_filter's docstring.
+        "**Entry filter (backtest-only, research):** " + ef_line,
         "", "## Candidates scored", "",
         f"- Candidate-days scored (passed all vetoes): {result['n_scored']}",
         f"- Veto breakdown: {result['veto_counts'] or 'none fired'}",

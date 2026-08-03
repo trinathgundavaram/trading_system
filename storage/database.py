@@ -1055,6 +1055,53 @@ class Database:
             realized_pnl REAL,
             n_open INTEGER
         )""")
+        # RSI(2) SPY mean-reversion sleeve (2026-08-02) - a SEPARATE cash
+        # ledger and position table from paper_account/positions, not a new
+        # trade_mode inside the shared ones. Two real reasons, not just
+        # caution for its own sake:
+        #   1. uq_open_position_per_ticker_book (§14, above) is UNIQUE on
+        #      (ticker, COALESCE(simulated,0)) - it does NOT include
+        #      trade_mode. If this sleeve wrote SPY rows into the shared
+        #      `positions` table, a hypothetical future swing-engine SPY
+        #      position (screener.py currently only fetches SPY as a
+        #      relative-strength benchmark, never scores/buys it - but
+        #      nothing stops that from changing) would collide with this
+        #      sleeve's own open position at the DB constraint level. A
+        #      dedicated table makes that collision structurally impossible
+        #      instead of merely unlikely today.
+        #   2. This sleeve is single-ticker (SPY only), single-position
+        #      (never overlapping, by its own validated design - see
+        #      engine/rsi2_mean_reversion_backtest.py), and runs once a day
+        #      from its own scheduled entry point, not from the 6-worker
+        #      ThreadPoolExecutor swing's cycle uses. It has none of the
+        #      concurrent-write pressure the advisory-lock/race-condition
+        #      machinery around try_open_position() exists to solve, so this
+        #      table intentionally does NOT replicate that machinery - doing
+        #      so would be solving a problem this sleeve doesn't have at the
+        #      cost of a lot of surface area in a shared file.
+        conn.execute("""CREATE TABLE IF NOT EXISTS rsi2_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            starting_cash REAL NOT NULL,
+            cash REAL NOT NULL,
+            realized_pnl REAL DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS rsi2_positions (
+            id SERIAL PRIMARY KEY,
+            ticker TEXT NOT NULL DEFAULT 'SPY',
+            status TEXT NOT NULL DEFAULT 'open',
+            entry_date TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            shares REAL NOT NULL,
+            dollar_amount REAL NOT NULL,
+            exit_date TEXT,
+            exit_price REAL,
+            exit_reason TEXT,
+            realized_pnl REAL,
+            created_at TEXT,
+            updated_at TEXT
+        )""")
 
     def _ensure_open_position_uniqueness(self):
         """The §14 invariant, as a structural guarantee: at most one OPEN
@@ -3238,6 +3285,77 @@ class Database:
             conn.execute("DELETE FROM paper_trades")
             conn.execute("DELETE FROM paper_equity_history")
             conn.execute("DELETE FROM positions WHERE COALESCE(simulated, 0) = 1")
+
+    # ---------- RSI(2) SPY mean-reversion sleeve (2026-08-02) ----------
+    # A dedicated cash ledger + position table, deliberately separate from
+    # paper_account/positions - see the CREATE TABLE comment in
+    # _init_schema() (or wherever this landed) for why. No concurrency
+    # protection (advisory locks, conditional debits) by design: this sleeve
+    # is single-ticker, single-position, and driven by one daily scheduled
+    # script, not swing's multi-worker ticker scan - see engine/rsi2_paper_
+    # trader.py, the only intended caller of the write methods below.
+    def get_rsi2_account(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM rsi2_account WHERE id = 1").fetchone()
+            return dict(row) if row else None
+
+    def init_rsi2_account(self, starting_cash: float):
+        """Idempotent - keeps the existing sleeve purse if already seeded."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO rsi2_account (id, starting_cash, cash, realized_pnl, created_at, updated_at)
+                   VALUES (1, ?, ?, 0, ?, ?) ON CONFLICT(id) DO NOTHING""",
+                (starting_cash, starting_cash, now, now),
+            )
+        return self.get_rsi2_account()
+
+    def adjust_rsi2_cash(self, delta: float, realized_pnl_delta: float = 0.0):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE rsi2_account SET cash = cash + ?, realized_pnl = realized_pnl + ?, updated_at = ? "
+                "WHERE id = 1",
+                (delta, realized_pnl_delta, datetime.utcnow().isoformat()),
+            )
+
+    def get_open_rsi2_position(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM rsi2_positions WHERE status = 'open' ORDER BY id DESC LIMIT 1").fetchone()
+            return dict(row) if row else None
+
+    def open_rsi2_position(self, entry_date: str, entry_price: float, shares: float,
+                            dollar_amount: float, ticker: str = "SPY") -> int:
+        """No duplicate-open guard beyond the caller checking get_open_rsi2_
+        position() first (see module docstring above - this sleeve has no
+        concurrent-write pressure to guard against). Returns the new row id."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                """INSERT INTO rsi2_positions
+                   (ticker, status, entry_date, entry_price, shares, dollar_amount, created_at, updated_at)
+                   VALUES (?, 'open', ?, ?, ?, ?, ?, ?)
+                   RETURNING id""",
+                (ticker, entry_date, entry_price, shares, dollar_amount, now, now)).fetchone()
+        return row[0] if not isinstance(row, dict) else row.get("id")
+
+    def close_rsi2_position(self, position_id: int, exit_date: str, exit_price: float,
+                             exit_reason: str, realized_pnl: float):
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE rsi2_positions SET status = 'closed', exit_date = ?, exit_price = ?,
+                   exit_reason = ?, realized_pnl = ?, updated_at = ? WHERE id = ?""",
+                (exit_date, exit_price, exit_reason, realized_pnl, datetime.utcnow().isoformat(), position_id),
+            )
+
+    def reset_rsi2_account(self):
+        """Mirrors reset_paper_account()'s shape, scoped to this sleeve only -
+        does not touch paper_account/positions or vice versa."""
+        with self._conn() as conn:
+            conn.execute("DELETE FROM rsi2_account")
+            conn.execute("DELETE FROM rsi2_positions")
 
     def remove_seed_positions(self) -> dict:
         """Undoes robinhood_sync.py's seed-paper command: deletes every
