@@ -245,7 +245,7 @@ def main() -> int:
     if args.suggest and deletes:
         print("=" * 74)
         print("SUGGESTED SQL - read it, then run it yourself. Nothing here has\n"
-              "been executed. Take a backup first: ./scripts/tp backup\n")
+              "been executed. Take a backup first: pg_dump trading_platform > backup_$(date +%Y%m%d).sql\n")
         print("BEGIN;")
         for ticker, r in deletes:
             # ticker + status in the WHERE, not id alone. An id copied from
@@ -299,7 +299,7 @@ def main() -> int:
             "--",
             "-- rollback_safe: false - a deleted position row is not",
             "-- recoverable from this file. Take a backup first:",
-            "--     ./scripts/tp backup",
+            "--     pg_dump trading_platform > backup_$(date +%Y%m%d).sql",
             "",
         ]
         for ticker, r in deletes:
@@ -317,7 +317,7 @@ def main() -> int:
         print(f"wrote {len(deletes)} DELETE statement(s) to {path}\n")
         print("Read it, then apply it through the runner that resolves the")
         print("database the same way the code does:\n")
-        print(f"    ./scripts/tp backup")
+        print(f"    pg_dump trading_platform > backup_$(date +%Y%m%d).sql")
         print(f"    less {path}")
         print(f"    ./scripts/apply_migration.sh {path}\n")
 

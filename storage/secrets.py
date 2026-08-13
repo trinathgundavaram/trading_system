@@ -74,8 +74,6 @@ SECRET_KEYS = (
     "ROBINHOOD_PASSWORD",
     "ROBINHOOD_TOTP_SECRET",
     "RH_ACCOUNT_NUMBER",
-    # --- web UI ---
-    "UI_AUTH_TOKEN",
     # --- database ---
     "POSTGRES_USER",
     "POSTGRES_PASSWORD",
@@ -428,8 +426,8 @@ def get(name: str, required: bool = True, default: str | None = None) -> str:
             f"the environment, {ENV_PATH.name}, or the OS keyring"
         raise RuntimeError(
             f"Secret {name!r} not found in {sources}.\n"
-            f"  Store it encrypted:  ./scripts/tp secrets set {name}\n"
-            f"  Or inject it:        export {name}=...   (containers, CI, systemd)\n"
+            f"  Add it to .env:      {name}=...\n"
+            f"  Or export it:        export {name}=...\n"
             f"  Keyring backend here: {keyring_backend_name()}")
     return val
 

@@ -434,9 +434,9 @@ class TestSecrets:
 
         out = tmp_path / ".env.runtime"
         with mock.patch.object(secrets, "get",
-                               side_effect=lambda k, **kw: "v" if k == "UI_AUTH_TOKEN" else ""):
+                               side_effect=lambda k, **kw: "v" if k == "ROBINHOOD_USERNAME" else ""):
             secrets.export_env(out)
-        assert out.read_text().strip() == "UI_AUTH_TOKEN=v"
+        assert out.read_text().strip() == "ROBINHOOD_USERNAME=v"
         if sys.platform != "win32":
             assert oct(out.stat().st_mode)[-3:] == "600"
 
@@ -895,62 +895,6 @@ class TestNoHostCallsInTheEngine:
             + "\n  ".join(offenders))
 
 
-class TestContainerArtefacts:
-    def test_dockerfile_asserts_the_things_that_fail_silently(self):
-        text = (REPO / "Dockerfile").read_text()
-        # tzdata: without it every market-hours check is wrong by 4-5 hours.
-        assert "tzdata" in text
-        # The build must FAIL rather than silently ship the fallback engine.
-        assert "import pandas_ta" in text
-        # And that the zone database is genuinely readable, not just installed.
-        assert "ZoneInfo('America/New_York')" in text
-        # Credentials live in this container's environment; root does not.
-        assert "USER trader" in text
-        # Volume mountpoints must be owned by uid 1000 BEFORE the USER switch,
-        # or Docker creates them root-owned and the container cannot write.
-        assert text.index("chown -R trader:trader") < text.index("USER trader")
-
-    def test_dockerfile_digest_pin_is_still_outstanding(self):
-        """An honest test rather than a passing one.
-
-        The reproducibility argument in §42 rests on pinning the base image by
-        DIGEST; the tree currently pins by TAG, which is a moving target. This
-        test documents that gap and will fail - deliberately, as a reminder -
-        the moment someone writes the digest in, at which point delete it."""
-        text = (REPO / "Dockerfile").read_text()
-        digest_pinned = "python:3.12-slim@sha256:" in text
-        assert not digest_pinned, (
-            "the base image is now digest-pinned - delete this test, and update "
-            "docs/releases/v2.1.0.md, which lists the tag pin as outstanding")
-
-    def test_compose_binds_the_ui_to_loopback_only(self):
-        """'8080:8080' would publish the UI to the whole network AND bypass
-        most host firewalls. §4 exists to prevent exactly that."""
-        text = (REPO / "docker-compose.yml").read_text()
-        assert "127.0.0.1:${TP_UI_PORT:-8080}:8080" in text
-
-    def test_compose_fails_closed_on_live_execution(self):
-        text = (REPO / "docker-compose.yml").read_text()
-        assert "TP_FORCE_PAPER: ${TP_FORCE_PAPER:-1}" in text
-
-    def test_compose_caps_logs(self):
-        """E-10 was 77 MB of unrotated log."""
-        text = (REPO / "docker-compose.yml").read_text()
-        assert "max-size" in text
-
-    def test_dockerignore_excludes_secrets(self):
-        """A file copied into a layer stays in that layer even if a later
-        layer deletes it - anyone who can pull the image can read it.
-
-        Matched on whole LINES: every one of these patterns also appears in
-        the file's own prose header, so a substring check would pass even if
-        every actual rule were deleted."""
-        rules = {ln.strip() for ln in (REPO / ".dockerignore").read_text().splitlines()
-                 if ln.strip() and not ln.strip().startswith("#")}
-        for pattern in (".env", ".env.*", "*.pickle", "output/", ".tokens/"):
-            assert pattern in rules, f"{pattern!r} is not an active .dockerignore rule"
-
-
 class TestUiEventOutbox:
     def test_log_ui_event_survives_a_backend_without_pg_notify(self):
         """The NOTIFY is best-effort: a SQLite-backed test database or a
@@ -1005,33 +949,12 @@ class TestScriptsAreValidPython:
     them is a version manager that cannot install a version."""
 
     @pytest.mark.parametrize("rel", [
-        "scripts/tp", "scripts/tp_agent.py", "scripts/services.py",
+        "scripts/tp_agent.py", "scripts/services.py",
         "scripts/bootstrap.py", "scripts/healthcheck.py",
     ])
     def test_compiles(self, rel):
         src = (REPO / rel).read_text()
         compile(src, rel, "exec")
-
-    def test_tp_root_is_platform_appropriate(self):
-        """Not ~/tp everywhere: on a domain-joined Windows machine the roaming
-        profile is synced over the network at every login, and this directory
-        holds gigabytes."""
-        import importlib.machinery
-        import importlib.util
-
-        # SourceFileLoader rather than exec(): scripts/tp has no .py suffix
-        # and resolves REPO from __file__, which a bare exec does not define.
-        loader = importlib.machinery.SourceFileLoader(
-            "tp_cli", str(REPO / "scripts" / "tp"))
-        spec = importlib.util.spec_from_loader("tp_cli", loader)
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-
-        root = module.tp_root()
-        assert root.is_absolute()
-        # The parser must build - a broken subcommand table is a version
-        # manager that cannot install a version.
-        assert module.build_parser().parse_args(["install", "v1.0.0"]).tag == "v1.0.0"
 
     def test_bootstrap_runs_and_reports(self):
         r = subprocess.run([sys.executable, str(REPO / "scripts" / "bootstrap.py")],

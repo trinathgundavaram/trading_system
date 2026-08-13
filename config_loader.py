@@ -42,7 +42,7 @@ def _expand_str(s: str, required: bool = True) -> str:
             return ""
         raise RuntimeError(
             f"config.yaml references ${{{name}}} but it is not set.\n"
-            f"  Add {name}= to .env (gitignored), or run: ./scripts/tp secrets set {name}")
+            f"  Add {name}=... to .env (gitignored).")
     return _ENV_REF.sub(sub, s)
 
 

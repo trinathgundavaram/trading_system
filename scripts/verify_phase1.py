@@ -104,43 +104,15 @@ def main() -> int:
         check("§2 checks ran", False, str(e))
 
     # ── §4 UI auth ──────────────────────────────────────────────────────────
-    section("§4 - UI auth surface")
+    # The UI_AUTH_TOKEN gate was removed: this server is for local single-user
+    # use, so the only remaining protection is that it binds to loopback only.
+    section("§4 - UI network exposure")
     server_src = src("server.py")
-    check("no inline token comparisons remain",
-          "!= _auth_token()" not in server_src)
-    check("constant-time comparison in use", "hmac.compare_digest" in server_src)
-    check("lockout implemented", "_throttle" in server_src and "429" in server_src)
-    check("token resolves via storage/secrets.py, not config.yaml",
-          "secrets.get(\"UI_AUTH_TOKEN\")" in server_src)
     check("UI binds loopback by default",
           'os.getenv("TP_UI_HOST", "127.0.0.1")' in src("main.py"))
     if os.getenv("TP_UI_HOST") not in (None, "", "127.0.0.1", "localhost"):
         check("TP_UI_HOST override is not set", None,
               f"TP_UI_HOST={os.getenv('TP_UI_HOST')!r} - UI is exposed beyond this machine")
-
-    try:
-        import platform as _plat
-        from storage import secrets
-        tok = secrets.get("UI_AUTH_TOKEN", required=False)
-        # storage/secrets.py resolves environment -> .env -> Keychain. The
-        # Keychain leg only exists on macOS, so a run from a container or a
-        # non-Darwin host sees "unset" even when the token is correctly stored.
-        # Report that as a WARN, not a FAIL - a false alarm here trains you to
-        # ignore the one finding on this page that actually matters.
-        if not tok and _plat.system() != "Darwin":
-            check("UI_AUTH_TOKEN is set", None,
-                  "not resolvable on this host (no macOS Keychain) - re-run on "
-                  "the Mac to check it properly")
-        else:
-            check("UI_AUTH_TOKEN is set", bool(tok))
-        if tok or _plat.system() == "Darwin":
-            check("UI_AUTH_TOKEN is a real token (>= 24 chars)",
-                  len(tok) >= 24 if tok else False,
-                  f"length {len(tok)}" if tok else "unset")
-            check("UI_AUTH_TOKEN is not the retired 5-char value",
-                  tok != "3nath" if tok else False)
-    except Exception as e:
-        check("token check ran", None, str(e))
 
     try:
         import server as _srv

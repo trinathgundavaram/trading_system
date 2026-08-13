@@ -24,14 +24,12 @@ Auth: every write route uses the require_token dependency (§4). The token is
 resolved by storage/secrets.py, never from config.yaml.
 """
 import asyncio
-import hmac
 import json
 import logging
 import re
 import subprocess
 import threading
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -143,76 +141,17 @@ def _save_config(cfg: dict):
         yaml.dump(cfg, f, sort_keys=False)
 
 
-# ═══ Auth (§4, Phase 1, 2026-07-24) ═════════════════════════════════════════
-# Four compounding weaknesses were found in the evaluation: a 5-character
-# token; stored in cleartext in a versioned file; served over plain HTTP bound
-# to 0.0.0.0 so every device on the LAN could reach it; and compared with a
-# plain `!=`, with no rate limiting, in nine separate endpoints. That token
-# gates the kill switch, config mutation, arming live execution, and manual
-# real-money sells.
-#
-# The token now comes from storage/secrets.py (environment -> .env -> macOS
-# Keychain), NEVER from config.yaml. This also closes a latent hole opened by
-# Phase 0 step 0.2: config.yaml's ui.auth_token became the literal string
-# "${UI_AUTH_TOKEN}" (server.py loads the YAML raw, without config_loader's
-# ${VAR} expansion), so the old _auth_token() was comparing every request
-# against that placeholder - anyone sending the header "${UI_AUTH_TOKEN}"
-# would have authenticated.
-_fail_counts: dict[str, list] = defaultdict(list)
-_fail_lock = threading.Lock()
-_MAX_FAILS, _WINDOW_S, _LOCKOUT_S = 5, 300, 900
-
-
-def _auth_token() -> str:
-    """The expected token. Raises if it is not configured anywhere - an empty
-    expected token would compare equal to a blank header and silently
-    unauthenticate every write endpoint in this process."""
-    return secrets.get("UI_AUTH_TOKEN")
-
-
-def _throttle(key: str):
-    """Refuse further attempts from a client that has failed _MAX_FAILS times
-    inside _WINDOW_S. Without this, a 5-character token is enumerable in
-    seconds."""
-    now = time.time()
-    with _fail_lock:
-        recent = [t for t in _fail_counts[key] if now - t < _WINDOW_S]
-        _fail_counts[key] = recent
-        if len(recent) >= _MAX_FAILS:
-            raise HTTPException(
-                429, f"Too many failed attempts - locked {_LOCKOUT_S // 60} min")
-
-
-def _record_fail(key: str):
-    with _fail_lock:
-        _fail_counts[key].append(time.time())
+# ═══ Auth ═════════════════════════════════════════════════════════════════
+# The UI_AUTH_TOKEN gate (§4, Phase 1) was removed for local single-user use:
+# this server is expected to run on 127.0.0.1 for one person, not be exposed
+# to a network. require_token is kept as a no-op dependency so every route
+# that declared `Depends(require_token)` still works unchanged; it simply no
+# longer checks anything. If this server is ever bound beyond localhost
+# (TP_UI_HOST), reintroduce a real credential check here first.
 
 
 def require_token(request: Request, x_auth_token: str = Header(None)) -> bool:
-    """FastAPI dependency guarding every write endpoint.
-
-    hmac.compare_digest, not `!=`: a plain string compare short-circuits on
-    the first differing byte, which leaks the token one character at a time to
-    anyone who can measure response latency.
-
-    A dependency rather than an inline `if` in each handler, because a
-    dependency cannot be forgotten on a NEW endpoint the way an inline check
-    can - and "the tenth write route shipped without the check" is the exact
-    mistake this shape exists to prevent.
-    """
-    client = request.client.host if request.client else "unknown"
-    _throttle(client)
-    try:
-        expected = _auth_token()
-    except Exception as e:
-        # Misconfiguration must fail CLOSED, and must say so plainly rather
-        # than looking like a wrong token.
-        logging.getLogger("trading").error(f"UI auth token is not configured: {e}")
-        raise HTTPException(503, "UI auth token is not configured on the server - "
-                                 "set UI_AUTH_TOKEN (see .env.template)")
-    if not x_auth_token or not hmac.compare_digest(str(x_auth_token), expected):
-        _record_fail(client)
-        raise HTTPException(403, "Invalid auth token")
+    """No-op auth dependency. See module note above."""
     return True
 
 

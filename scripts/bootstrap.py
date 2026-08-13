@@ -150,11 +150,11 @@ def check_secrets() -> None:
     try:
         from storage import secrets
 
-        missing = [k for k in ("UI_AUTH_TOKEN", "RH_ACCOUNT_NUMBER")
+        missing = [k for k in ("RH_ACCOUNT_NUMBER",)
                    if not secrets.present(k)]
         if missing:
             warnings.append(f"required secrets not set: {', '.join(missing)} -> "
-                            f"./scripts/tp secrets set <KEY>")
+                            f"add to .env")
         else:
             ok.append("required secrets resolve")
     except Exception as e:

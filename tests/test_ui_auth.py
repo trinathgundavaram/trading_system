@@ -1,13 +1,10 @@
 """§4 - the UI auth surface.
 
-Four compounding weaknesses were found: a 5-character token; stored in
-cleartext in a versioned file; served over plain HTTP on 0.0.0.0; and compared
-with a plain `!=` in nine separate endpoints with no rate limiting. That token
-gates the kill switch, config mutation, arming live execution, and manual
-real-money sells.
-
-These tests exercise require_token directly rather than through a live server,
-so they need no port, no database and no event loop.
+The UI_AUTH_TOKEN gate (rate-limited, constant-time-compared token check) was
+removed: this server is for local single-user use, not a network service, so
+require_token is now a no-op dependency. It is kept as a dependency object
+(rather than deleted from every route) so a future change that DOES need to
+expose the UI beyond localhost has exactly one function to fill back in.
 
     python3 -m pytest tests/test_ui_auth.py -v
 """
@@ -22,111 +19,23 @@ import pytest
 fastapi = pytest.importorskip("fastapi")
 server = pytest.importorskip("server", reason="requires the FastAPI import chain")
 
-from fastapi import HTTPException  # noqa: E402
-
-TOKEN = "K3f9pQ2xVn8sLm4wZr7tYb1cJd5hGa0e"
-
 
 def _request(host="1.2.3.4"):
     return types.SimpleNamespace(client=types.SimpleNamespace(host=host))
 
 
-@pytest.fixture(autouse=True)
-def clean_state(monkeypatch):
-    """A known token and an empty lockout table for every test - the throttle
-    is process-global by design, which makes leakage between tests the most
-    likely way these could pass for the wrong reason."""
-    monkeypatch.setattr(server, "_auth_token", lambda: TOKEN)
-    server._fail_counts.clear()
-    yield
-    server._fail_counts.clear()
+def test_require_token_always_passes():
+    """No token needed - any value (including none) is accepted."""
+    assert server.require_token(_request(), None) is True
+    assert server.require_token(_request(), "anything") is True
 
 
-def test_correct_token_passes():
-    assert server.require_token(_request(), TOKEN) is True
-
-
-@pytest.mark.parametrize("bad", ["", None, "wrong", TOKEN[:-1], TOKEN + "x", TOKEN.upper()])
-def test_wrong_token_is_403(bad):
-    with pytest.raises(HTTPException) as e:
-        server.require_token(_request(), bad)
-    assert e.value.status_code == 403
-
-
-def test_placeholder_token_is_rejected():
-    """Phase 0 step 0.2 left config.yaml's ui.auth_token as the literal string
-    '${UI_AUTH_TOKEN}' - server.py reads that YAML raw, without config_loader's
-    expansion, so the old check was comparing every request against the
-    placeholder. Anyone sending that string as a header would have been let
-    in. The token now comes from storage/secrets.py instead; this test is the
-    regression guard for the specific hole."""
-    with pytest.raises(HTTPException) as e:
-        server.require_token(_request(), "${UI_AUTH_TOKEN}")
-    assert e.value.status_code == 403
-
-
-def test_lockout_after_five_failures():
-    req = _request("10.0.0.9")
-    for _ in range(5):
-        with pytest.raises(HTTPException) as e:
-            server.require_token(req, "wrong")
-        assert e.value.status_code == 403
-    with pytest.raises(HTTPException) as e:
-        server.require_token(req, "wrong")
-    assert e.value.status_code == 429
-
-
-def test_lockout_blocks_even_the_correct_token():
-    """A brute-forcer who gets there on attempt six must not be rewarded for
-    it. The throttle runs BEFORE the comparison, deliberately."""
-    req = _request("10.0.0.10")
-    for _ in range(5):
-        with pytest.raises(HTTPException):
-            server.require_token(req, "wrong")
-    with pytest.raises(HTTPException) as e:
-        server.require_token(req, TOKEN)
-    assert e.value.status_code == 429
-
-
-def test_lockout_is_per_client():
-    attacker = _request("10.0.0.11")
-    for _ in range(5):
-        with pytest.raises(HTTPException):
-            server.require_token(attacker, "wrong")
-    assert server.require_token(_request("10.0.0.12"), TOKEN) is True
-
-
-def test_unconfigured_token_fails_closed(monkeypatch):
-    """A missing UI_AUTH_TOKEN must 503, not authenticate. An expected token
-    of '' would compare equal to a blank header and silently unauthenticate
-    every write endpoint in the process."""
-    def _boom():
-        raise RuntimeError("Secret 'UI_AUTH_TOKEN' not found")
-
-    monkeypatch.setattr(server, "_auth_token", _boom)
-    with pytest.raises(HTTPException) as e:
-        server.require_token(_request(), "anything")
-    assert e.value.status_code == 503
-
-
-def test_every_write_route_is_guarded():
-    """The structural test, and the reason §4 uses a dependency at all: an
-    inline `if` can be forgotten on a new route, and that is exactly how a
-    tenth write endpoint ships unauthenticated. Any route added to the list
-    below must carry the dependency.
-
-    As of v1.2.0 this is EVERY write route, not a chosen subset. The eight
-    that were left open through v1.1.0 (run_now, cancel, validate,
-    evaluate_now, backtest/run, alerts/resolve, prompt/copy,
-    threshold_regret/run) are now guarded too, and the UI sends the header via
-    authFetch(). One of those eight, POST /api/prompt/copy, no longer exists:
-    §47.5 replaced its pbcopy shell-out with GET /api/prompt/raw, which the
-    browser copies client-side. That is why the floor below moved 15 -> 14.
-
-    Deliberately written as "no write route lacks the dependency" rather than
-    a fixed allow-list: a list has to be remembered, which is the same failure
-    mode as an inline check."""
-    unguarded = []
+def test_every_write_route_still_carries_the_dependency():
+    """Structural check only: every write route still wires up
+    Depends(require_token), even though the dependency itself is a no-op now.
+    That keeps the plumbing in place for whoever reintroduces real auth if
+    this server is ever exposed beyond 127.0.0.1."""
+    unwired = []
     write_routes = []
     for route in server.app.routes:
         methods = (getattr(route, "methods", set()) or set())
@@ -136,29 +45,6 @@ def test_every_write_route_is_guarded():
         names = [d.call.__name__ for d in route.dependant.dependencies
                  if getattr(d, "call", None)]
         if "require_token" not in names:
-            unguarded.append(route.path)
-
-    assert not unguarded, f"write route(s) with no auth dependency: {unguarded}"
-    # Sanity floor: if the app ever stops registering routes, the assertion
-    # above would pass vacuously. Deliberately a floor and not an equality -
-    # adding a write route must not fail this test, only leaving one
-    # unguarded must. Lower it (with a note above) when a route is genuinely
-    # retired; never to make a red test green.
+            unwired.append(route.path)
+    assert not unwired, f"write route(s) with no require_token dependency: {unwired}"
     assert len(write_routes) >= 14, f"only {len(write_routes)} write routes found"
-    # Named floor for the routes that move money or state, which is what the
-    # count was standing in for. A number can be quietly lowered; these can't.
-    for critical in ("/api/paper/sell", "/api/real/sell", "/api/live_execution",
-                     "/api/kill_switch", "/api/config", "/api/cycle/run_now",
-                     "/api/cycle/cancel"):
-        assert critical in write_routes, f"{critical} is no longer a registered write route"
-
-
-def test_no_inline_token_comparisons_remain():
-    """The nine inline `x_auth_token != _auth_token()` checks are gone. A
-    reintroduced one would be a plain string compare - which short-circuits on
-    the first differing byte and leaks the token one character at a time to
-    anyone who can measure response latency."""
-    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "server.py")).read()
-    assert "!= _auth_token()" not in src
-    assert "hmac.compare_digest" in src

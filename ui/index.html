@@ -1037,11 +1037,10 @@ function closeModal(value) {
   if (_modalResolve) { _modalResolve(value); _modalResolve = null; }
 }
 async function getToken() {
-  let t = localStorage.getItem(AUTH_TOKEN_KEY);
-  if (t) return t;
-  t = await askToken();
-  if (t) localStorage.setItem(AUTH_TOKEN_KEY, t);
-  return t;
+  // The server no longer requires a token (UI_AUTH_TOKEN gate removed for
+  // local single-user use). getToken() still returns a value so authFetch's
+  // header-attaching logic below is unchanged, but it no longer prompts.
+  return "local";
 }
 
 /* Every write endpoint on the server requires the token (§4). This is the
