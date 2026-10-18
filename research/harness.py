@@ -19,7 +19,9 @@ STRESS_WINDOWS = {"2008": ("2008-01-01", "2009-03-31"), "2022": ("2022-01-01", "
 class Config:
     cost_bps: float = 5.0           # per unit of one-way turnover
     rebalance: str = "M"            # pandas offset alias; "M" = month-end
-    dd_cap: float = 0.25            # max acceptable drawdown (fraction)
+    dd_cap: float = 0.35            # max acceptable drawdown (fraction)
+    max_leverage: float = 1.0       # gross exposure cap; >1 borrows at financing_bps
+    financing_bps: float = 400.0    # annual cost on the borrowed part (gross - 1)
     warmup_days: int = 260          # history a strategy gets before first trade
 
 
@@ -27,7 +29,8 @@ def backtest(strategy, prices: pd.DataFrame, cfg: Config = Config()) -> pd.Serie
     """Net daily return series."""
     rets = prices.pct_change().fillna(0.0)
     idx = prices.index
-    reb = set(prices.groupby(prices.index.to_period(cfg.rebalance)).tail(1).index)
+    freq = getattr(strategy, "rebalance", cfg.rebalance)   # a strategy may rebalance daily ("B")
+    reb = set(prices.groupby(prices.index.to_period(freq)).tail(1).index)
     w = pd.Series(0.0, index=prices.columns)
     out = np.zeros(len(idx))
     for i, d in enumerate(idx):
@@ -40,11 +43,12 @@ def backtest(strategy, prices: pd.DataFrame, cfg: Config = Config()) -> pd.Serie
             raw = strategy(prices.iloc[: i + 1]) or {}
             tgt = pd.Series(raw, dtype=float).reindex(prices.columns).fillna(0.0)
             tgt = tgt.clip(lower=0.0)
-            if tgt.sum() > 1.0 + 1e-9:
-                tgt = tgt / tgt.sum()      # long-only, unlevered; leverage is a separate decision
+            if tgt.sum() > cfg.max_leverage + 1e-9:
+                tgt = tgt / tgt.sum() * cfg.max_leverage   # long-only; leverage only up to max_leverage
             cost = float((tgt - w).abs().sum()) * cfg.cost_bps / 1e4
             w = tgt
-        out[i] = gross - cost
+        borrowed = max(float(w.sum()) - 1.0, 0.0)
+        out[i] = gross - cost - borrowed * cfg.financing_bps / 1e4 / TRADING_DAYS
     return pd.Series(out, index=idx)
 
 

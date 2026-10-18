@@ -16,10 +16,11 @@ def pct(x):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cost-bps", type=float, default=5.0)
-    ap.add_argument("--dd-cap", type=float, default=0.25)
+    ap.add_argument("--dd-cap", type=float, default=0.35)
+    ap.add_argument("--max-lev", type=float, default=1.5)
     ap.add_argument("--refresh", action="store_true")
     a = ap.parse_args()
-    cfg = Config(cost_bps=a.cost_bps, dd_cap=a.dd_cap)
+    cfg = Config(cost_bps=a.cost_bps, dd_cap=a.dd_cap, max_leverage=a.max_lev)
     prices = load_prices(refresh=a.refresh)
     print(f"data {prices.index[0].date()} .. {prices.index[-1].date()}  cost={cfg.cost_bps}bps  dd_cap={cfg.dd_cap:.0%}\n")
     hdr = f"{'strategy':18}{'TRAIN cagr':>11}{'TEST cagr':>10}{'TEST shp':>9}{'TEST dd':>9}{'2008 dd':>9}{'2022 dd':>9}  verdict"
