@@ -1126,6 +1126,18 @@ class Database:
             updated_at TEXT
         )""")
 
+        # TradingAgents advisory log (2026-10-18): decisions only, never orders.
+        conn.execute("""CREATE TABLE IF NOT EXISTS ta_decisions (
+            id SERIAL PRIMARY KEY,
+            as_of_date TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            rating TEXT,
+            raw TEXT,
+            price REAL,
+            created_at TEXT,
+            UNIQUE (as_of_date, ticker)
+        )""")
+
     def _ensure_open_position_uniqueness(self):
         """The §14 invariant, as a structural guarantee: at most one OPEN
         position per (ticker, book). Mirrors migrations/006.
@@ -3428,6 +3440,19 @@ class Database:
         with self._conn() as conn:
             conn.execute("DELETE FROM sm_account")
             conn.execute("DELETE FROM sm_positions")
+
+    def log_ta_decision(self, as_of_date: str, ticker: str, rating: str, raw: str, price: float):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO ta_decisions (as_of_date, ticker, rating, raw, price, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (as_of_date, ticker) DO NOTHING""",
+                (as_of_date, ticker, rating, raw, price, datetime.utcnow().isoformat()))
+
+    def get_ta_decisions(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                "SELECT as_of_date, ticker, rating, price FROM ta_decisions ORDER BY as_of_date, ticker").fetchall()]
 
     def reset_rsi2_account(self):
         """Mirrors reset_paper_account()'s shape, scoped to this sleeve only -

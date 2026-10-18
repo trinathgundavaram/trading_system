@@ -84,6 +84,17 @@ sector_momentum_sleeve:
   top_n: 3
   leverage: 1.0
   cost_bps: 5.0
+tradingagents_advisor:
+  # TauricResearch/TradingAgents as an ADVISORY rating logger (never trades).
+  # Needs a local install of the repo and ANTHROPIC_API_KEY in the environment.
+  # Judge it with scripts/tradingagents_report.py before letting it influence
+  # anything. Each ticker-day is a multi-agent LLM run - keep the cap low.
+  enabled: false
+  max_tickers_per_day: 5
+  extra_tickers: []
+  deep_model: claude-opus-5-5
+  quick_model: claude-sonnet-5-5
+  max_debate_rounds: 1
 screener:
   enabled: true
   refresh_minutes: 15
