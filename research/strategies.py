@@ -102,6 +102,70 @@ def blend(parts):
     return f
 
 
+# ── Theory-driven candidates (canonical published parameters, fixed in advance) ──
+
+def lev_trend(mult):
+    """SPY at `mult`x above its 200-day SMA, else intermediate bonds (Faber-style
+    timing applied to a levered core)."""
+    def f(prices):
+        p = prices["SPY"]
+        return {"SPY": mult} if p.iloc[-1] > p.iloc[-200:].mean() else {"IEF": 1.0}
+    f.rebalance = "B"
+    return f
+
+
+def dual_momentum(mult=1.0):
+    """Antonacci Global Equities Momentum: 12-month return; hold the better of
+    SPY/EFA if it beats bills (IEF proxy), else bonds."""
+    def f(prices):
+        r = prices[["SPY", "EFA", "IEF"]].iloc[-1] / prices[["SPY", "EFA", "IEF"]].iloc[-253] - 1
+        best = "SPY" if r["SPY"] >= r["EFA"] else "EFA"
+        return {best: mult} if r[best] > r["IEF"] else {"IEF": 1.0}
+    return f
+
+
+def vaa(prices):
+    """Keller's Vigilant Asset Allocation (aggressive): 13612W momentum on
+    SPY/EFA/EEM/IEF(as agg). Any risk asset <=0 -> all to defensive IEF/TLT
+    best; else all to the top risk asset."""
+    def mom(t):
+        p = prices[t]
+        return sum(w * (p.iloc[-1] / p.iloc[-1 - 21 * m] - 1) for w, m in ((12, 1), (4, 3), (2, 6), (1, 12)))
+    risk = {t: mom(t) for t in ("SPY", "EFA", "EEM", "IEF")}
+    if min(risk.values()) <= 0:
+        return {max(("IEF", "TLT"), key=mom): 1.0}
+    return {max(("SPY", "EFA", "EEM"), key=lambda t: risk[t]): 1.0}
+
+
+def vol_managed_spy(target=0.12, window=21, max_lev=1.5):
+    """Moreira-Muir volatility-managed equity: scale SPY by target/realized vol."""
+    def f(prices):
+        v = prices["SPY"].pct_change().iloc[-window:].std() * np.sqrt(252)
+        k = min(max_lev, target / v) if v > 0 else 1.0
+        w = {"SPY": min(k, 1.0 * max_lev)}
+        if k < 1.0:
+            w["IEF"] = 1.0 - k
+        return w
+    return f
+
+
+def risk_parity(target=0.10, window=126, max_lev=2.0):
+    """Levered risk parity over SPY/TLT/GLD/DBC (inverse-vol, scaled to target vol)."""
+    names = ["SPY", "TLT", "GLD", "DBC"]
+    def f(prices):
+        r = prices[names].pct_change().iloc[-window:]
+        w = (1 / r.std()); w = w / w.sum()
+        pv = (r * w).sum(axis=1).std() * np.sqrt(252)
+        k = min(max_lev, target / pv) if pv > 0 else 1.0
+        return (w * k).to_dict()
+    return f
+
+
+def halloween(prices):
+    """Sell-in-May seasonal: SPY Nov-Apr, bonds May-Oct."""
+    return {"SPY": 1.0} if prices.index[-1].month in (11, 12, 1, 2, 3, 4) else {"IEF": 1.0}
+
+
 STRATEGIES = {
     "spy_buy_hold": spy_buy_hold,
     "sixty_forty": sixty_forty,
@@ -111,5 +175,13 @@ STRATEGIES = {
     "trend_rp_voltarget": vol_target(trend_riskparity, target=0.15, max_lev=1.5),
     "rsi2_basket": Rsi2Basket(),
     "core70_rsi2_30": blend([(0.7, spy_buy_hold), (0.3, Rsi2Basket())]),
+    "lev_trend_1.5x": lev_trend(1.5),
+    "lev_trend_2x": lev_trend(2.0),
+    "dual_momentum": dual_momentum(),
+    "dual_momentum_1.5x": dual_momentum(1.5),
+    "vaa": vaa,
+    "vol_managed_spy": vol_managed_spy(),
+    "risk_parity_10vol": risk_parity(),
+    "halloween": halloween,
     "trendvt70_rsi2_30": blend([(0.7, vol_target(trend_riskparity, target=0.15, max_lev=1.5)), (0.3, Rsi2Basket())]),
 }

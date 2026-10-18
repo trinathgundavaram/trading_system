@@ -22,33 +22,49 @@ class Config:
     dd_cap: float = 0.35            # max acceptable drawdown (fraction)
     max_leverage: float = 1.0       # gross exposure cap; >1 borrows at financing_bps
     financing_bps: float = 400.0    # annual cost on the borrowed part (gross - 1)
+    brake_start: float | None = None  # shadow drawdown where de-risking begins
+    brake_full: float = 0.20          # shadow drawdown where exposure reaches 0
     warmup_days: int = 260          # history a strategy gets before first trade
 
 
 def backtest(strategy, prices: pd.DataFrame, cfg: Config = Config()) -> pd.Series:
-    """Net daily return series."""
+    """Net daily return series.
+
+    Optional drawdown brake (cfg.brake_start/brake_full): exposure is scaled
+    down in 25% steps as the UNBRAKED shadow equity of the strategy draws down
+    from its peak (so the brake can release when the strategy recovers on
+    paper), and fully restored at a new shadow high-water mark."""
     rets = prices.pct_change().fillna(0.0)
     idx = prices.index
     freq = getattr(strategy, "rebalance", cfg.rebalance)   # a strategy may rebalance daily ("B")
     reb = set(prices.groupby(prices.index.to_period(freq)).tail(1).index)
-    w = pd.Series(0.0, index=prices.columns)
+    wb = pd.Series(0.0, index=prices.columns)    # unbraked drifting weights
+    scale, shadow, peak = 1.0, 1.0, 1.0
     out = np.zeros(len(idx))
     for i, d in enumerate(idx):
-        gross = float((w * rets.loc[d]).sum())
-        # drift weights with the day's returns
-        if w.sum() > 0:
-            w = w * (1 + rets.loc[d]) / (1 + gross)
+        gross_b = float((wb * rets.loc[d]).sum())
+        borrowed = max(float(wb.sum()) * scale - 1.0, 0.0)
+        ret = scale * gross_b - borrowed * cfg.financing_bps / 1e4 / TRADING_DAYS
+        if wb.sum() > 0:
+            wb = wb * (1 + rets.loc[d]) / (1 + gross_b)
+        shadow *= 1 + gross_b
+        peak = max(peak, shadow)
         cost = 0.0
         if d in reb and i >= cfg.warmup_days:
             raw = strategy(prices.iloc[: i + 1]) or {}
-            tgt = pd.Series(raw, dtype=float).reindex(prices.columns).fillna(0.0)
-            tgt = tgt.clip(lower=0.0)
+            tgt = pd.Series(raw, dtype=float).reindex(prices.columns).fillna(0.0).clip(lower=0.0)
             if tgt.sum() > cfg.max_leverage + 1e-9:
                 tgt = tgt / tgt.sum() * cfg.max_leverage   # long-only; leverage only up to max_leverage
-            cost = float((tgt - w).abs().sum()) * cfg.cost_bps / 1e4
-            w = tgt
-        borrowed = max(float(w.sum()) - 1.0, 0.0)
-        out[i] = gross - cost - borrowed * cfg.financing_bps / 1e4 / TRADING_DAYS
+            cost += float((tgt - wb).abs().sum()) * scale * cfg.cost_bps / 1e4
+            wb = tgt
+        if cfg.brake_start is not None:
+            dd = 1 - shadow / peak
+            raw_s = float(np.clip(1 - (dd - cfg.brake_start) / (cfg.brake_full - cfg.brake_start), 0.0, 1.0))
+            new_s = round(raw_s * 4) / 4
+            if new_s != scale:
+                cost += abs(new_s - scale) * float(wb.sum()) * cfg.cost_bps / 1e4
+                scale = new_s
+        out[i] = ret - cost
     return pd.Series(out, index=idx)
 
 
