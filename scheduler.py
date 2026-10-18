@@ -2068,6 +2068,26 @@ def _log_sleep_prevention_check():
         logger.warning(f"Startup check: could not determine sleep-prevention status: {e}")
 
 
+def run_rsi2_sleeve_cycle():
+    """Daily RSI(2) SPY paper-sleeve cycle (scripts/rsi2_paper_cycle.py).
+
+    Runs once a day just after the 16:00 ET close so the daily bar is final.
+    Gated by config.yaml's rsi2_sleeve.paper_enabled (default false): when off
+    this returns without spawning anything. Run as a child process so a data
+    or DB failure in the sleeve can never take down the swing scheduler."""
+    import subprocess
+    try:
+        if not load_config().get("rsi2_sleeve", {}).get("paper_enabled", False):
+            logger.info("RSI2 sleeve: rsi2_sleeve.paper_enabled is false - skipping")
+            return
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "rsi2_paper_cycle.py")
+        r = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=300)
+        log = logger.info if r.returncode == 0 else logger.error
+        log(f"RSI2 sleeve cycle exit={r.returncode}: {(r.stdout or '').strip()[-500:]} {(r.stderr or '').strip()[-500:]}")
+    except Exception as e:
+        logger.error(f"RSI2 sleeve cycle failed: {e}")
+
+
 def start():
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_SCHEDULER_STARTED
@@ -2092,6 +2112,11 @@ def start():
     scheduler.add_job(
         run_cycle, "cron", day_of_week="mon-fri", hour="9-16", minute=f"*/{interval}",
         id="trading_cycle", max_instances=1, coalesce=False,
+    )
+
+    scheduler.add_job(
+        run_rsi2_sleeve_cycle, "cron", day_of_week="mon-fri", hour=16, minute=10,
+        id="rsi2_sleeve_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
 
     def _record_next_run(event=None):
