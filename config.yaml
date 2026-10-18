@@ -76,6 +76,15 @@ rsi2_sleeve:
   # illustrative range) and (b) a dedicated RSI2 validation-receipt gate
   # exists, mirroring run_backtest.py's existing one for swing rather than
   # riding on it. See the live-trading task in this session's plan.
+sector_momentum_sleeve:
+  # Top-3 sector ETFs by 12-1m momentum above their 200d SMA, rest in IEF,
+  # month-end rebalance (rules/sector_momentum.py). Research 2007-2026:
+  # ~11% CAGR / ~-20% max drawdown vs SPY 12.3% / -47%. PAPER only.
+  paper_enabled: false
+  paper_starting_cash: 10000
+  top_n: 3
+  leverage: 1.0
+  cost_bps: 5.0
 screener:
   enabled: true
   refresh_minutes: 15
