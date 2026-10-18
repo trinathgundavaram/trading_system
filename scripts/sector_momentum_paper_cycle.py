@@ -34,6 +34,11 @@ def fetch_closes() -> pd.DataFrame:
     return pd.DataFrame(cols).sort_index().ffill().dropna()
 
 
+def _spy_close() -> float:
+    bars, _ = MarketDataRouter().get_daily_bars("SPY")
+    return float(pd.DataFrame(bars).sort_values("date")["close"].iloc[-1])
+
+
 def is_month_end(closes: pd.DataFrame) -> bool:
     """True if the latest bar is the final trading day of its month (the next
     business day falls in a different month)."""
@@ -67,6 +72,14 @@ def main():
     else:
         print("not a rebalance day - mark to market only")
     s = smp.snapshot(db, prices)
+    db.log_sm_equity(date, s["total_value"], prices["SPY"] if "SPY" in prices else _spy_close())
+    if is_month_end(closes):                          # refresh the monthly report on month-end
+        from scripts.sleeve_vs_spy_report import render, summarize
+        rows = db.get_sm_equity_log()
+        if len(rows) >= 2:
+            out = Path(__file__).resolve().parent.parent / "output" / "sleeve_vs_spy.md"
+            out.write_text(render(summarize(rows)) + "\n")
+            print(f"report written: {out}")
     print(f"Sleeve: value ${s['total_value']:.2f} ({s['total_return_pct']}%) positions={s['positions']}")
 
 

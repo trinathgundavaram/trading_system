@@ -1126,6 +1126,11 @@ class Database:
             updated_at TEXT
         )""")
 
+        conn.execute("""CREATE TABLE IF NOT EXISTS sm_equity_log (
+            as_of_date TEXT PRIMARY KEY,
+            total_value REAL NOT NULL,
+            spy_close REAL NOT NULL
+        )""")
         # TradingAgents advisory log (2026-10-18): decisions only, never orders.
         conn.execute("""CREATE TABLE IF NOT EXISTS ta_decisions (
             id SERIAL PRIMARY KEY,
@@ -3440,6 +3445,20 @@ class Database:
         with self._conn() as conn:
             conn.execute("DELETE FROM sm_account")
             conn.execute("DELETE FROM sm_positions")
+
+    def log_sm_equity(self, as_of_date: str, total_value: float, spy_close: float):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO sm_equity_log (as_of_date, total_value, spy_close) VALUES (?, ?, ?)
+                   ON CONFLICT (as_of_date) DO UPDATE SET total_value = excluded.total_value,
+                   spy_close = excluded.spy_close""",
+                (as_of_date, total_value, spy_close))
+
+    def get_sm_equity_log(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                "SELECT as_of_date, total_value, spy_close FROM sm_equity_log ORDER BY as_of_date").fetchall()]
 
     def log_ta_decision(self, as_of_date: str, ticker: str, rating: str, raw: str, price: float):
         with self._conn() as conn:
