@@ -473,7 +473,15 @@ class TestLaunchdRestartRace:
         spec = importlib.util.spec_from_loader("services", loader)
         mod = importlib.util.module_from_spec(spec)
         loader.exec_module(mod)
-        return mod, mod.LaunchdManager()
+        mgr = mod.LaunchdManager()
+        # `start` refuses when the service's plist is missing; make these tests
+        # independent of whether this machine has ever run `service.sh install`.
+        import tempfile
+        from pathlib import Path
+        plist = Path(tempfile.mkdtemp()) / "svc.plist"
+        plist.write_text("<plist/>")
+        mgr.plist_path = lambda name: plist
+        return mod, mgr
 
     def test_start_waits_for_the_label_to_leave_the_domain(self):
         mod, mgr = self._mgr()
