@@ -1103,6 +1103,29 @@ class Database:
             updated_at TEXT
         )""")
 
+        # Sector-momentum paper sleeve (2026-10-18): own ledger, multi-ticker.
+        conn.execute("""CREATE TABLE IF NOT EXISTS sm_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            starting_cash REAL NOT NULL,
+            cash REAL NOT NULL,
+            realized_pnl REAL DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS sm_positions (
+            id SERIAL PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            entry_date TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            shares REAL NOT NULL,
+            exit_date TEXT,
+            exit_price REAL,
+            realized_pnl REAL,
+            created_at TEXT,
+            updated_at TEXT
+        )""")
+
     def _ensure_open_position_uniqueness(self):
         """The §14 invariant, as a structural guarantee: at most one OPEN
         position per (ticker, book). Mirrors migrations/006.
@@ -3349,6 +3372,62 @@ class Database:
                    exit_reason = ?, realized_pnl = ?, updated_at = ? WHERE id = ?""",
                 (exit_date, exit_price, exit_reason, realized_pnl, datetime.utcnow().isoformat(), position_id),
             )
+
+    # Sector-momentum sleeve ledger (engine/sector_momentum_paper.py is the
+    # only intended caller). One open row per ticker; same no-concurrency
+    # stance as the RSI2 ledger above - one daily script drives it.
+    def get_sm_account(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM sm_account WHERE id = 1").fetchone()
+            return dict(row) if row else None
+
+    def init_sm_account(self, starting_cash: float):
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO sm_account (id, starting_cash, cash, realized_pnl, created_at, updated_at)
+                   VALUES (1, ?, ?, 0, ?, ?) ON CONFLICT(id) DO NOTHING""",
+                (starting_cash, starting_cash, now, now))
+        return self.get_sm_account()
+
+    def adjust_sm_cash(self, delta: float, realized_pnl_delta: float = 0.0):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sm_account SET cash = cash + ?, realized_pnl = realized_pnl + ?, updated_at = ? WHERE id = 1",
+                (delta, realized_pnl_delta, datetime.utcnow().isoformat()))
+
+    def get_open_sm_positions(self):
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM sm_positions WHERE status = 'open' ORDER BY ticker").fetchall()]
+
+    def open_sm_position(self, ticker: str, entry_date: str, entry_price: float, shares: float) -> int:
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                """INSERT INTO sm_positions (ticker, status, entry_date, entry_price, shares, created_at, updated_at)
+                   VALUES (?, 'open', ?, ?, ?, ?, ?) RETURNING id""",
+                (ticker, entry_date, entry_price, shares, now, now)).fetchone()
+        return row[0] if not isinstance(row, dict) else row.get("id")
+
+    def update_sm_position_shares(self, position_id: int, shares: float):
+        with self._conn() as conn:
+            conn.execute("UPDATE sm_positions SET shares = ?, updated_at = ? WHERE id = ?",
+                         (shares, datetime.utcnow().isoformat(), position_id))
+
+    def close_sm_position(self, position_id: int, exit_date: str, exit_price: float, realized_pnl: float):
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE sm_positions SET status = 'closed', exit_date = ?, exit_price = ?,
+                   realized_pnl = ?, updated_at = ? WHERE id = ?""",
+                (exit_date, exit_price, realized_pnl, datetime.utcnow().isoformat(), position_id))
+
+    def reset_sm_account(self):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM sm_account")
+            conn.execute("DELETE FROM sm_positions")
 
     def reset_rsi2_account(self):
         """Mirrors reset_paper_account()'s shape, scoped to this sleeve only -

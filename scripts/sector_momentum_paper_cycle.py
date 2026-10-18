@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Sector-momentum sleeve - daily PAPER cycle. Gated by config.yaml's
+sector_momentum_sleeve.paper_enabled (default false). Rebalances on the last
+trading day of each month (and once at first run to establish positions);
+every other day it only marks to market. Simulated fills only.
+
+    python3 scripts/sector_momentum_paper_cycle.py [--dry-run] [--force-rebalance]
+"""
+import argparse
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from config_loader import load_config_dict
+from engine import sector_momentum_paper as smp
+from mcp_clients.market_data import MarketDataRouter
+from rules import sector_momentum as rule
+from storage.database import Database
+
+
+def fetch_closes() -> pd.DataFrame:
+    router = MarketDataRouter()
+    cols = {}
+    for t in rule.UNIVERSE:
+        res = router.get_daily_bars(t)
+        if not res:
+            raise RuntimeError(f"no daily bars for {t} - check provider keys; not trading on partial data")
+        bars, _ = res
+        df = pd.DataFrame(bars)
+        cols[t] = df.set_index("date")["close"].astype(float)
+    return pd.DataFrame(cols).sort_index().ffill().dropna()
+
+
+def is_month_end(closes: pd.DataFrame) -> bool:
+    """True if the latest bar is the final trading day of its month (the next
+    business day falls in a different month)."""
+    last = pd.Timestamp(closes.index[-1])
+    return (last + pd.offsets.BDay(1)).month != last.month
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force-rebalance", action="store_true")
+    a = ap.parse_args()
+    cfg = load_config_dict()
+    sc = cfg.get("sector_momentum_sleeve", {})
+    if not sc.get("paper_enabled", False):
+        print("sector_momentum_sleeve.paper_enabled is false in config.yaml - not running.")
+        return
+    closes = fetch_closes()
+    targets = rule.target_weights(closes, n=int(sc.get("top_n", 3)), leverage=float(sc.get("leverage", 1.0)))
+    prices = {t: float(closes[t].iloc[-1]) for t in closes}
+    date = str(closes.index[-1])[:10]
+    print(f"[{date}] target weights: " + ", ".join(f"{t} {w:.0%}" for t, w in targets.items()))
+    if a.dry_run:
+        print("(--dry-run: no trades)")
+        return
+    db = Database()
+    smp.ensure_seeded(db, cfg)
+    if a.force_rebalance or is_month_end(closes) or not db.get_open_sm_positions():
+        for t in smp.rebalance(db, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0))):
+            print(f"  {t['side'].upper()} {t['shares']:.4f} {t['ticker']} @ {t['price']:.2f}")
+    else:
+        print("not a rebalance day - mark to market only")
+    s = smp.snapshot(db, prices)
+    print(f"Sleeve: value ${s['total_value']:.2f} ({s['total_return_pct']}%) positions={s['positions']}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

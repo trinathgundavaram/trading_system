@@ -2088,6 +2088,24 @@ def run_rsi2_sleeve_cycle():
         logger.error(f"RSI2 sleeve cycle failed: {e}")
 
 
+def run_sector_momentum_cycle():
+    """Daily sector-momentum PAPER sleeve (scripts/sector_momentum_paper_cycle.py).
+    Gated by sector_momentum_sleeve.paper_enabled; child process so a failure
+    cannot affect the swing scheduler. The script itself decides whether today
+    is a month-end rebalance day or a mark-to-market-only day."""
+    import subprocess
+    try:
+        if not load_config().get("sector_momentum_sleeve", {}).get("paper_enabled", False):
+            logger.info("Sector momentum sleeve: paper_enabled is false - skipping")
+            return
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "sector_momentum_paper_cycle.py")
+        r = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=300)
+        log = logger.info if r.returncode == 0 else logger.error
+        log(f"Sector momentum cycle exit={r.returncode}: {(r.stdout or '').strip()[-500:]} {(r.stderr or '').strip()[-500:]}")
+    except Exception as e:
+        logger.error(f"Sector momentum cycle failed: {e}")
+
+
 def start():
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_SCHEDULER_STARTED
@@ -2117,6 +2135,11 @@ def start():
     scheduler.add_job(
         run_rsi2_sleeve_cycle, "cron", day_of_week="mon-fri", hour=16, minute=10,
         id="rsi2_sleeve_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        run_sector_momentum_cycle, "cron", day_of_week="mon-fri", hour=16, minute=15,
+        id="sector_momentum_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
 
     def _record_next_run(event=None):
