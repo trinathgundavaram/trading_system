@@ -121,3 +121,4 @@ wf_run.log
 # fetch), same "reproducible market data, not code" reasoning as *_1min.csv
 # above. tests/test_rsi2_spy_swing.py already skips gracefully when absent.
 spy_daily_ohlc.csv
+research/cache/
