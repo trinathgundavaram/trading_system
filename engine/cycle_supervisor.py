@@ -52,6 +52,7 @@ import logging
 import os
 import signal
 import subprocess
+from datetime import datetime
 import sys
 import time
 
@@ -213,6 +214,56 @@ def kill_current_cycle(reason: str = "user_cancel") -> bool:
     # waiting on the supervisor thread's own wait() to notice.
     db.mark_cycle_killed(expected_pid=pid, reason=reason)
     _kill_process_tree(pid, reason=reason)
+    return True
+
+
+def _pid_is_cycle(pid) -> bool:
+    """True only if `pid` is alive AND is one of our scheduler.py processes
+    (guards against a recycled pid belonging to something unrelated)."""
+    if not pid:
+        return False
+    try:
+        import psutil
+        return psutil.pid_exists(pid) and "scheduler.py" in " ".join(psutil.Process(pid).cmdline())
+    except Exception:
+        return False
+
+
+def reap_if_stale(db, hard_limit_seconds: float, orphan_grace_seconds: float = 120.0) -> bool:
+    """Called from the scheduled-cycle interlock BEFORE it decides to skip.
+
+    2026-10-20: a cycle child died with its scheduler still marked running, and
+    the interlock ('skip if is_running') never reached clear_stale_cycle(), so
+    every scheduled cycle was skipped for two days. This closes that hole:
+
+      * running row, child pid dead/foreign (or never recorded and the row is
+        older than orphan_grace_seconds) -> orphaned: mark finished, reap.
+      * running row, child alive but older than the hard limit -> kill the
+        whole process tree and mark killed (the supervisor normally does this
+        itself; this covers a supervisor that died first).
+
+    Returns True if it cleared the row, i.e. the caller may start a new cycle."""
+    status = db.get_cycle_status() or {}
+    if not status.get("is_running"):
+        return False
+    try:
+        age = (datetime.utcnow() - datetime.fromisoformat(status["started_at"])).total_seconds()
+    except Exception:
+        age = float("inf")
+    pid = status.get("pid")
+    if _pid_is_cycle(pid):
+        if age <= hard_limit_seconds:
+            return False
+        logger.error(f"cycle_supervisor: pid={pid} has run {age / 60:.1f} min (> {hard_limit_seconds / 60:.1f} "
+                     f"min limit) and no supervisor reaped it - force-killing")
+        _kill_process_tree(pid, reason="exceeded hard limit (reaped from interlock)")
+        db.mark_cycle_killed(expected_pid=pid, reason="timeout_reaped")
+        return True
+    if pid is None and age < orphan_grace_seconds:
+        return False                      # a cycle that is only just starting
+    logger.warning(f"cycle_supervisor: cycle row says running for {age / 60:.1f} min but pid={pid} is not a "
+                   f"live cycle process - orphaned, clearing so scheduled cycles can resume")
+    db.set_cycle_finished()
     return True
 
 

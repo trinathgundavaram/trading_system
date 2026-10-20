@@ -254,6 +254,9 @@ def run_cycle(force: bool = False):
     if not force:
         try:
             status = db.get_cycle_status()
+            from engine.cycle_supervisor import reap_if_stale
+            if status.get("is_running") and reap_if_stale(db, max(60.0, timeout_minutes * 60)):
+                status = db.get_cycle_status()           # orphaned/overlong row cleared - proceed
             if status.get("is_running"):
                 logger.info("Scheduled cycle skipped - another cycle is already in progress "
                            f"(started {status.get('started_at', '?')})")
@@ -2136,6 +2139,11 @@ def start():
     from storage import banner
     banner.log_banner(cfg, logger)
 
+    try:    # a previous process may have died mid-cycle; don't inherit its 'running' row
+        from engine.cycle_supervisor import reap_if_stale
+        reap_if_stale(db, max(60.0, float(cfg.get("trading", {}).get("hard_kill_minutes", 15)) * 60), orphan_grace_seconds=0)
+    except Exception as e:
+        logger.warning(f"startup stale-cycle check failed: {e}")
     interval = _effective_scan_interval(cfg)
     scheduler = BlockingScheduler(timezone=ET)
     # 2026-07-27 (§49 Phase 4): Disable coalesce so missed scheduled slots queue
@@ -2171,9 +2179,10 @@ def start():
                 # 2026-07-27 (§49 Phase 4): Scheduler heartbeat monitoring.
                 # Detect if the scheduler is falling behind (cycles taking longer
                 # than expected, causing the next scheduled slot to slip).
-                if job.last_execution_time:
+                last = getattr(job, "last_execution_time", None)   # absent in APScheduler 3.11
+                if last:
                     now = datetime.now(ET)
-                    elapsed = (now - job.last_execution_time).total_seconds()
+                    elapsed = (now - last).total_seconds()
                     expected_interval = interval * 60
                     if elapsed > expected_interval * 1.5:
                         logger.warning(
