@@ -1175,7 +1175,7 @@ async function paintOverview(el, quiet) {
 
     <div class="ov-row">
       <div class="panel"><div class="panel-head">${svg("positions", 15)}<span class="panel-title">Holdings</span></div>
-        <div class="table-wrap"><table><thead><tr><th>Ticker</th><th class="num">Weight</th><th></th><th class="num">Value</th><th class="num">P&amp;L</th></tr></thead><tbody>
+        <div class="table-wrap"><table data-no-enhance><thead><tr><th>Ticker</th><th class="num">Weight</th><th></th><th class="num">Value</th><th class="num">P&amp;L</th></tr></thead><tbody>
         ${d.positions.map(p => `<tr><td><b>${p.ticker}</b></td><td class="num">${(p.weight * 100).toFixed(1)}%</td>
           <td><div class="ov-bar"><span style="width:${Math.min(100, p.weight * 100 / 0.5 * 1)}%"></span></div></td>
           <td class="num">${ovUSD(p.value)}</td><td class="num ${ovCls(p.pnl)}">${ovUSD(p.pnl)} <span class="subtle">${ovPct(p.pnl_pct)}</span></td></tr>`).join("")}
@@ -1187,14 +1187,14 @@ async function paintOverview(el, quiet) {
     </div>
 
     <div class="panel"><div class="panel-head">${svg("monitor", 15)}<span class="panel-title">Schedule</span></div>
-      <div class="table-wrap"><table class="ov-cmp"><thead><tr><th>Job</th><th>When</th><th>Status</th><th>What it does</th></tr></thead><tbody>
+      <div class="table-wrap"><table class="ov-cmp" data-no-enhance><thead><tr><th>Job</th><th>When</th><th>Status</th><th>What it does</th></tr></thead><tbody>
         ${(d.jobs || []).map(j => `<tr><td><b>${j.name}</b></td><td>${j.when}</td>
           <td>${j.enabled ? `<span class="pill pill-green">on</span>` : `<span class="pill pill-neutral">off</span>`}${j.last ? ` <span class="subtle">last ${j.last}</span>` : ""}</td>
           <td>${j.detail}</td></tr>`).join("")}
       </tbody></table></div></div>
 
     <div class="panel"><div class="panel-head">${svg("strategy", 15)}<span class="panel-title">Strategies side by side</span></div>
-      <div class="table-wrap"><table class="ov-cmp"><thead><tr><th>Strategy</th><th class="num">Return</th><th class="num">Max drawdown</th><th>How it works</th></tr></thead><tbody>
+      <div class="table-wrap"><table class="ov-cmp" data-no-enhance><thead><tr><th>Strategy</th><th class="num">Return</th><th class="num">Max drawdown</th><th>How it works</th></tr></thead><tbody>
         ${cmpRow("Sector momentum", `<span class="pill pill-green">paper</span>`, st.sleeve_total, st.sleeve_dd,
           `${d.strategy === "blend" ? "Sector + broad 3/6/12m momentum" : "Top-3 sectors"} · ${d.leverage}× · monthly · T-bills when SPY &lt; 200d`)}
         ${sw ? cmpRow("Swing engine", `<span class="pill pill-yellow">${sw.mode || "paper"}</span>`, swingRet, st.swing_dd,
