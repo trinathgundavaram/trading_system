@@ -46,17 +46,15 @@ logger = logging.getLogger(__name__)
 # Postgres connection settings - override via .env (see .env.template).
 # Defaults match a fresh local `brew install postgresql` with default
 # trust-auth (no password) and a `trading_platform` database created once
-# via migrate_to_postgres.py (or `createdb trading_platform`).
+# with `createdb trading_platform`.
 PG_HOST = os.getenv("POSTGRES_HOST", "localhost")
 PG_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 PG_DB = os.getenv("POSTGRES_DB", "trading_platform")
 PG_USER = os.getenv("POSTGRES_USER") or os.getenv("USER") or "postgres"
 PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 
-# Legacy SQLite path - no longer opened by anything in this file. Kept as a
-# constant only because migrate_to_postgres.py uses it as the default
-# migration SOURCE, and nothing else in the app referenced db.path directly
-# (verified via repo-wide grep before this migration).
+# Default for Database(path=...), which is stored but no longer opened (all
+# data lives in Postgres). Kept only so existing callers passing a path still work.
 DB_PATH = Path(__file__).resolve().parent.parent / "output" / "trading.db"
 
 # ── Unmanaged position modes (§5, Phase 1, 2026-07-24 audit) ────────────────
