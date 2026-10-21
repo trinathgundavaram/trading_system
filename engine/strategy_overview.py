@@ -113,7 +113,12 @@ def build(db, cfg: dict, today: date = None) -> dict:
          "enabled": bool(cfg.get("tradingagents_advisor", {}).get("enabled")),
          "detail": "logs LLM ratings only; never trades", "last": None},
     ]
-    return {"jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
+    try:
+        from engine import sleeve_drift
+        drift = sleeve_drift.evaluate(sleeve_rows, account, cfg, today=today)
+    except Exception as e:                          # a monitor must never break the page
+        drift = {"status": "watch", "checks": [{"name": "Monitor", "status": "watch", "message": f"drift check failed: {e}"}]}
+    return {"drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
             "leverage": sc.get("leverage", 1.0), "band_pct": sc.get("band_pct", 0.0),
             "account": account, "positions": positions, "market": market, "targets": targets,
             "curves": curves, "stats": stats, "swing": swing, "rsi2": rsi2,

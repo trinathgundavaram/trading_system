@@ -1125,6 +1125,22 @@ function ovGauge(m) {
       <div class="spy" style="left:${pos(m.spy)}"><b>SPY ${m.spy.toFixed(0)}</b></div></div>`;
 }
 
+function ovDriftPanel(dr) {
+  if (!dr) return "";
+  const L = { ok: ["pill-green", "On track"], watch: ["pill-yellow", "Watch"], alert: ["pill-red", "Alert"], collecting: ["pill-blue", "Collecting data"] };
+  const [cls, label] = L[dr.status] || L.collecting;
+  const border = dr.status === "alert" ? "var(--red-bright)" : dr.status === "watch" ? "var(--yellow)" : dr.status === "ok" ? "var(--green-bright)" : "var(--indigo)";
+  const sub = dr.status === "collecting"
+    ? `Needs ${dr.min_days || 20}+ daily marks before the live sleeve can be compared with its backtest (${dr.n_days || 0} so far).`
+    : dr.status === "ok" ? "Live results are inside the range the backtest says is normal."
+    : dr.status === "watch" ? "Something is outside the usual range — worth a look, not a reason to act on its own."
+    : "Live behaviour is outside everything the backtest saw. Check the sleeve before trusting it.";
+  return `<div class="panel" style="border-left:3px solid ${border}"><div class="panel-head">${svg("risk", 15)}<span class="panel-title">Health vs backtest</span><span class="fill"></span><span class="pill ${cls}">${label}</span></div>
+    <div class="ov-note" style="margin-bottom:8px">${sub}</div>
+    <div class="table-wrap"><table class="ov-cmp" data-no-enhance><tbody>${(dr.checks || []).map(c => `<tr><td style="width:110px"><b>${c.name}</b></td>
+      <td style="width:110px"><span class="pill ${(L[c.status] || L.collecting)[0]}">${(L[c.status] || L.collecting)[1]}</span></td><td style="white-space:normal">${c.message}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
+
 async function paintOverview(el, quiet) {
   let d;
   try {
@@ -1162,6 +1178,8 @@ async function paintOverview(el, quiet) {
         <div class="ov-value" style="font-size:22px;padding-top:5px">${riskOn == null ? "—" : riskOn ? `<span class="ov-pulse"></span>Risk-on` : "Risk-off (T-bills)"}</div>
         <div class="ov-sub">next rebalance ${d.next_rebalance} · ${days} day${days === 1 ? "" : "s"}</div></div>
     </div>
+
+    ${ovDriftPanel(d.drift)}
 
     <div class="ov-row">
       <div class="panel"><div class="panel-head">${svg("performance", 15)}<span class="panel-title">Growth of 100 — strategies vs SPY</span></div>${ovLineChart(d.curves)}</div>
