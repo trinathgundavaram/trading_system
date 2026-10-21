@@ -79,7 +79,13 @@ def rolling_report():
     from research.leverage_study import blend2, levered, momentum, sector_mom, with_market_rule
     from research.strategies2 import UNIVERSE2
     P = load_prices(UNIVERSE2 + ["SHY"], start="2007-06-01").ffill()
-    fn = levered(blend2(with_market_rule(sector_mom), with_market_rule(momentum(8))), 1.25)
+    from config_loader import load_config_dict
+    from research.target_return_study import buffered_rule
+    sc = load_config_dict()["sector_momentum_sleeve"]
+    lev, band = float(sc.get("leverage", 1.0)), float(sc.get("band_pct", 0.0)) / 100.0
+    rule_fn = (lambda b: buffered_rule(b, band)) if band else with_market_rule
+    fn = levered(blend2(rule_fn(sector_mom), rule_fn(momentum(8))), lev)
+    print(f"rolling windows for blend @ {lev}x, band {band:.0%}")
     c = Config(max_leverage=3.0, dd_cap=1.0)
     r = backtest(fn, P, c)[P.index[c.warmup_days]:]
     spy = P["SPY"].pct_change().fillna(0.0)[r.index]
@@ -89,7 +95,7 @@ def rolling_report():
     dd = eq.rolling(w).apply(lambda x: (x / np.maximum.accumulate(x)).min() - 1, raw=True)
     sdd = seq.rolling(w).apply(lambda x: (x / np.maximum.accumulate(x)).min() - 1, raw=True)
     ok = ret.dropna().index
-    print(f"{len(ok)} overlapping 12-month windows, {ok[0].date()}..{ok[-1].date()} (strategy 1.25x blend vs SPY)\n")
+    print(f"{len(ok)} overlapping 12-month windows, {ok[0].date()}..{ok[-1].date()} (configured strategy vs SPY)\n")
     q = lambda s, p: s.loc[ok].quantile(p)
     print(f"{'':22}{'strategy':>10}{'SPY':>9}")
     for lab, a, b in (("median 12m return", q(ret, .5), q(sret, .5)), ("worst 5% of windows", q(ret, .05), q(sret, .05)),
