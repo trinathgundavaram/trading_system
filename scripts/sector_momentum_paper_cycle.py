@@ -81,6 +81,15 @@ def main():
             print(f"  {t['side'].upper()} {t['shares']:.4f} {t['ticker']} @ {t['price']:.2f}")
     else:
         print("not a rebalance day - mark to market only")
+    import json
+    spy_c = closes["SPY"]
+    sma = float(spy_c.iloc[-200:].mean())
+    db.set_sm_state("market", json.dumps({
+        "as_of": date, "spy": float(spy_c.iloc[-1]), "sma200": sma,
+        "band_hi": sma * (1 + band), "band_lo": sma * (1 - band),
+        "risk_on": bool(new_on) if new_on is not None else bool(spy_c.iloc[-1] >= sma)}))
+    db.set_sm_state("last_prices", json.dumps(prices))
+    db.set_sm_state("last_targets", json.dumps({"as_of": date, "weights": targets}))
     if date not in {r["as_of_date"] for r in db.get_sm_equity_log()}:     # once per trading day
         smp.accrue_financing(db, cfg)
     s = smp.snapshot(db, prices)

@@ -514,6 +514,71 @@
     #topbar { padding: 10px 14px; }
     #content { padding: 14px 14px 48px 14px; }
   }
+
+  /* ==========================================================================
+     OVERVIEW + grouped navigation (2026-10-20). Everything here is built from
+     the tokens above; nothing re-themes the rest of the app.
+     ========================================================================= */
+  .navsection { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-2);
+                font-weight: 650; padding: 14px 10px 5px; display: flex; align-items: center; gap: 6px;
+                cursor: default; user-select: none; }
+  .navsection.toggle { cursor: pointer; }
+  .navsection.toggle:hover { color: var(--text-0); }
+  .navsection .chev { margin-left: auto; transition: transform .18s ease; width: 12px; height: 12px; }
+  .navsection.collapsed .chev { transform: rotate(-90deg); }
+  .navitems.collapsed { display: none; }
+  .navitems { display: flex; flex-direction: column; gap: 2px; }
+  body[data-scope="strategies"] #regime-badge, body[data-scope="strategies"] #health-badge,
+  body[data-scope="strategies"] #mode-badge, body[data-scope="strategies"] #watch-badge,
+  body[data-scope="strategies"] #book-toggle, body[data-scope="strategies"] #copy-btn,
+  body[data-scope="strategies"] #open-btn { display: none !important; }
+
+  .ov { display: flex; flex-direction: column; gap: 16px; animation: ovfade .35s ease both; }
+  @keyframes ovfade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .ov-hero { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .ov-tile { background: var(--bg-1); border: 1px solid var(--border-soft); border-radius: var(--radius);
+             padding: 16px 18px; box-shadow: var(--shadow-sm); position: relative; overflow: hidden;
+             transition: transform .15s ease, box-shadow .15s ease; }
+  .ov-tile:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+  .ov-tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--border); }
+  .ov-tile.up::before { background: var(--green-bright); } .ov-tile.down::before { background: var(--red-bright); }
+  .ov-tile.accent::before { background: var(--indigo); } .ov-tile.warn::before { background: var(--yellow); }
+  .ov-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .7px; color: var(--text-2); font-weight: 650; }
+  .ov-value { font-size: 28px; font-weight: 700; letter-spacing: -.6px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .ov-sub { font-size: 12px; color: var(--text-1); margin-top: 3px; }
+  .ov-gain { color: var(--green); } .ov-loss { color: var(--red); }
+  .ov-row { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr); }
+  @media (max-width: 1050px) { .ov-row { grid-template-columns: 1fr; } }
+  .ov-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--text-1); margin-bottom: 8px; }
+  .ov-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .ov-chart { width: 100%; height: auto; display: block; touch-action: none; }
+  .ov-chart text { fill: var(--text-2); font-size: 10px; font-family: inherit; }
+  .ov-tip { position: absolute; pointer-events: none; background: var(--text-0); color: var(--bg-1); font-size: 11.5px;
+            padding: 7px 10px; border-radius: 8px; box-shadow: var(--shadow); white-space: nowrap; opacity: 0;
+            transition: opacity .1s; z-index: 5; }
+  .ov-wrap { position: relative; }
+  .ov-donut-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  .ov-donut-legend { display: flex; flex-direction: column; gap: 5px; font-size: 12px; flex: 1; min-width: 130px; }
+  .ov-donut-legend div { display: flex; align-items: center; gap: 8px; }
+  .ov-donut-legend b { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .ov-donut-legend i { width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0; }
+  .ov-bar { height: 6px; background: var(--bg-3); border-radius: 3px; overflow: hidden; min-width: 70px; }
+  .ov-bar span { display: block; height: 100%; background: var(--indigo); border-radius: 3px; transition: width .5s ease; }
+  .ov-gauge { position: relative; height: 54px; margin: 8px 6px 2px; }
+  .ov-gauge .track { position: absolute; left: 0; right: 0; top: 24px; height: 8px; border-radius: 4px;
+                     background: linear-gradient(90deg, var(--red-bright) 0 33%, var(--yellow) 33% 66%, var(--green-bright) 66% 100%); opacity: .85; }
+  .ov-gauge .mk { position: absolute; top: 14px; transform: translateX(-50%); font-size: 10px; color: var(--text-2); text-align: center; }
+  .ov-gauge .mk::after { content: ""; display: block; width: 1px; height: 28px; background: var(--text-2); margin: 2px auto 0; opacity: .5; }
+  .ov-gauge .spy { position: absolute; top: 18px; transform: translateX(-50%); }
+  .ov-gauge .spy b { display: block; background: var(--indigo); color: var(--on-accent); font-size: 10.5px; padding: 2px 7px;
+                     border-radius: 10px; white-space: nowrap; transition: left .5s ease; }
+  .ov-cmp td, .ov-cmp th { white-space: nowrap; }
+  .ov-note { font-size: 12px; color: var(--text-1); line-height: 1.55; }
+  .ov-note b { color: var(--text-0); }
+  .ov-empty { text-align: center; padding: 38px 20px; color: var(--text-1); }
+  .ov-pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green-bright);
+              margin-right: 6px; animation: ovpulse 2s infinite; }
+  @keyframes ovpulse { 0% { box-shadow: 0 0 0 0 rgba(18,167,94,.5); } 70% { box-shadow: 0 0 0 7px rgba(18,167,94,0); } 100% { box-shadow: 0 0 0 0 rgba(18,167,94,0); } }
 </style>
 </head>
 <body>
@@ -546,7 +611,7 @@
 
   <div id="main">
     <div id="topbar">
-      <h1 id="page-title">Dashboard</h1>
+      <h1 id="page-title">Overview</h1>
       <span id="regime-badge" class="pill pill-neutral">Regime —</span>
       <span id="health-badge" class="pill pill-neutral">Health —</span>
       <span id="mode-badge" class="pill pill-blue">SWING</span>
@@ -618,7 +683,7 @@ let state = {};
 let status = {};
 let tickerNames = {};
 let tickerHealth = {};  // {ticker: {consecutive_stale_cycles, last_stale_at}} - only unhealthy tickers
-let currentTab = "dashboard";
+let currentTab = "overview";
 const AUTH_TOKEN_KEY = "trading_platform_auth_token";
 
 // Paper vs Real book toggle (2026-07-24, Trinath: "separate display for
@@ -705,34 +770,36 @@ function tickerLabelText(t) {
 }
 
 const TABS = [
-  { id: "dashboard",   label: "Dashboard",   icon: "dashboard",
+  { id: "overview",    label: "Overview",    icon: "dashboard", group: "Strategies",
+    desc: "Both paper strategies side by side: the sector-momentum sleeve (value, exposure, market signal, holdings, next rebalance) against the swing engine and SPY." },
+  { id: "dashboard",   label: "Swing dashboard", icon: "dashboard", group: "Swing engine",
     desc: "At-a-glance snapshot: market pulse, strategy health, today's stats, recent BUY signals, and open positions." },
-  { id: "signals",     label: "Signals",     icon: "signals",
+  { id: "signals",     label: "Signals",     icon: "signals", group: "Swing engine",
     desc: "Every signal the scanner has logged - BUY/HOLD/SELL calls with the full bucket/rule breakdown behind each score. Click a row to expand it." },
-  { id: "positions",   label: "Positions",   icon: "positions",
+  { id: "positions",   label: "Positions",   icon: "positions", group: "Swing engine",
     desc: "Currently open positions with live stop price and health score - filtered to the Paper or Real book by the header toggle (WATCH-mode paper positions, or real fills logged via confirm_fill.py)." },
-  { id: "portfolio",   label: "Portfolio",   icon: "performance",
+  { id: "portfolio",   label: "Portfolio",   icon: "performance", group: "Swing engine",
     desc: "The book selected by the header toggle. Paper: WATCH-mode purse (cash/invested/total value), equity curve, every simulated trade with its P&L, and win/loss stats. Real: your live Robinhood account value/buying power, open real positions, and confirmed real trades - dissect performance at the trade and portfolio level." },
-  { id: "control",     label: "Control",     icon: "control",
+  { id: "control",     label: "Control",     icon: "control", group: "System",
     // Was "...No order is ever placed from here." - false since
     // engine/live_trader.py, and this tab is where the switch that makes it
     // false actually lives. Corrected 2026-07-26 (UI audit).
     desc: "Watchlist, risk level, trading mode, rotation, and the arming controls - including the Live Execution master switch, Auto-Trade, and the kill switch. This is the only tab that can arm real-money execution." },
-  { id: "performance", label: "Performance", icon: "performance",
+  { id: "performance", label: "Performance", icon: "performance", group: "Swing engine",
     desc: "Win rate and average outcome broken down by market regime, plus overall profit factor and Sharpe ratio, from closed pattern_database rows." },
-  { id: "learning",    label: "Learning",    icon: "learning",
+  { id: "learning",    label: "Learning",    icon: "learning", group: "Swing engine",
     desc: "The automated learning loop's rule-attribution analysis (edge, stability). Every result is a proposal for human review - nothing is auto-applied to live scoring." },
-  { id: "strategy",    label: "Strategy",    icon: "strategy",
+  { id: "strategy",    label: "Swing rules",    icon: "strategy", group: "Swing engine",
     desc: "The actual current rule set: every buy bucket/rule, the dynamic threshold formula, hard vetoes, sell rules, and how the strategy has evolved over time." },
-  { id: "risk",        label: "Risk",        icon: "risk",
+  { id: "risk",        label: "Risk",        icon: "risk", group: "Swing engine",
     desc: "Portfolio heat - how much of your risk budget is currently deployed across open positions." },
-  { id: "journal",     label: "Journal",     icon: "journal",
+  { id: "journal",     label: "Journal",     icon: "journal", group: "Swing engine",
     desc: "Every confirmed real trade (via confirm_fill.py), with the indicators and rules that were in play at that moment. Click a row to expand it." },
-  { id: "monitor",     label: "Monitor",     icon: "monitor",
+  { id: "monitor",     label: "Monitor",     icon: "monitor", group: "System",
     desc: "Scheduler status, market hours, and the last scan cycle - includes the manual \"Run cycle now\" override." },
-  { id: "logs",        label: "Logs",        icon: "logs",
+  { id: "logs",        label: "Logs",        icon: "logs", group: "System",
     desc: "Live tail of scheduler.py and server.py's logs (output/logs/), merged and shown in CT - trace exactly what a cycle did, or dig into an error." },
-  { id: "news",        label: "News",        icon: "news",
+  { id: "news",        label: "News",        icon: "news", group: "Swing engine",
     desc: "Market mood (Fear & Greed, VIX, macro blackout) plus per-ticker headlines and sentiment, gathered every scan cycle. The same data already feeds the SENTIMENT_MACRO bucket and the dynamic threshold - this just makes it visible." },
 ];
 
@@ -848,7 +915,7 @@ function sellRuleExplainer(ruleName) {
 
    parseHash() is deliberately total: an unknown/garbage tab id falls back
    to the dashboard rather than rendering nothing. */
-const DEFAULT_TAB = "dashboard";
+const DEFAULT_TAB = "overview";
 const _VALID_TABS = new Set(TABS.map(t => t.id));
 
 function parseHash() {
@@ -895,17 +962,36 @@ function onHashChange() {
 }
 
 /* ============================== NAV / SHELL ============================== */
+const NAV_GROUP_ORDER = ["Strategies", "Swing engine", "System"];
+function _groupOf(tabId) { return (TABS.find(t => t.id === tabId) || {}).group || "Strategies"; }
+function _navCollapsed(g) {
+  if (g !== "Swing engine") return false;
+  if (_groupOf(currentTab) === g) return false;
+  try { return localStorage.getItem("nav_collapsed_" + g) !== "0"; } catch (e) { return true; }
+}
+function toggleNavGroup(g) {
+  try { localStorage.setItem("nav_collapsed_" + g, _navCollapsed(g) ? "0" : "1"); } catch (e) {}
+  renderNav();
+}
 function renderNav() {
-  document.getElementById("nav").innerHTML = TABS.map(t => `
-    <a class="navitem ${t.id===currentTab?'active':''}" href="#${t.id}"
-       onclick="showTab('${t.id}'); return false;" title="${(t.desc||'').replace(/"/g,'&quot;')}">
-      ${svg(t.icon)}<span>${t.label}</span>
-    </a>`).join("");
+  document.getElementById("nav").innerHTML = NAV_GROUP_ORDER.map(g => {
+    const items = TABS.filter(t => (t.group || "Strategies") === g);
+    if (!items.length) return "";
+    const collapsible = g === "Swing engine", closed = _navCollapsed(g);
+    return `<div class="navsection ${collapsible ? "toggle" : ""} ${closed ? "collapsed" : ""}"
+                 ${collapsible ? `onclick="toggleNavGroup('${g}')"` : ""}>${g}${collapsible ? svg("chevron", 12).replace("<svg ", "<svg class=\"chev\" ") : ""}</div>
+      <div class="navitems ${closed ? "collapsed" : ""}">` + items.map(t => `
+      <a class="navitem ${t.id===currentTab?'active':''}" href="#${t.id}"
+         onclick="showTab('${t.id}'); return false;" title="${(t.desc||'').replace(/"/g,'&quot;')}">
+        ${svg(t.icon)}<span>${t.label}</span>
+      </a>`).join("") + `</div>`;
+  }).join("");
 }
 
 function showTab(name, opts) {
   if (!_VALID_TABS.has(name)) name = DEFAULT_TAB;
   currentTab = name;
+  document.body.dataset.scope = _groupOf(name) === "Strategies" ? "strategies" : "swing";
   if (!(opts && opts.fromHash)) syncHash();
   renderNav();
   document.getElementById("page-title").textContent = pageTitle(name);
@@ -938,13 +1024,189 @@ async function refreshCurrentView(evt) {
 function loadTab(name) {
   const el = document.getElementById("content");
   const renderers = {
-    dashboard: renderDashboard, signals: renderSignalsTab, positions: renderPositionsTab,
+    overview: renderOverview, dashboard: renderDashboard, signals: renderSignalsTab, positions: renderPositionsTab,
     portfolio: (el) => (viewMode === "real" ? renderRealPortfolioTab(el) : renderPortfolioTab(el)),
     control: renderControlTab, performance: renderPerformanceTab, learning: renderLearningTab,
     strategy: renderStrategyTab, risk: renderRiskTab, journal: renderJournalTab, monitor: renderMonitorTab,
     logs: renderLogsTab, news: renderNewsTab,
   };
-  (renderers[name] || renderDashboard)(el);
+  (renderers[name] || renderOverview)(el);
+}
+
+
+/* ============================== OVERVIEW (strategies side by side) ==============================
+   Reads /api/strategies/overview (engine/strategy_overview.py): read-only, one
+   call, refreshed every 30s while the tab is open. Charts are hand-rolled SVG
+   like the rest of this UI - no chart library. */
+let _ovTimer = null;
+const OV_COLORS = ["#4338ca", "#12a75e", "#e0a21b", "#c8341b", "#1f5fb0", "#6d40cc", "#0e9fa8", "#8c877e", "#d6609a"];
+const ovPct = (v, d = 1) => (v == null || !isFinite(v)) ? "—" : (v >= 0 ? "+" : "") + (v * 100).toFixed(d) + "%";
+const ovUSD = v => (v == null || !isFinite(v)) ? "—" : (v < 0 ? "-$" : "$") + Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const ovCls = v => (v == null ? "" : v >= 0 ? "ov-gain" : "ov-loss");
+
+async function renderOverview(el) {
+  el.innerHTML = `<div class="ov"><div class="ov-hero">${'<div class="ov-tile"><div class="ov-label">Loading…</div><div class="ov-value">&nbsp;</div></div>'.repeat(4)}</div></div>`;
+  await paintOverview(el, false);
+  clearInterval(_ovTimer);
+  _ovTimer = setInterval(() => {
+    if (currentTab === "overview") paintOverview(document.getElementById("content"), true);
+    else { clearInterval(_ovTimer); _ovTimer = null; }
+  }, 30000);
+}
+
+function ovCountUp(node, to, fmt) {
+  const from = parseFloat(node.dataset.v || "0") || 0;
+  node.dataset.v = to;
+  if (!isFinite(to) || Math.abs(to - from) < 1e-9) { node.textContent = fmt(to); return; }
+  const t0 = performance.now();
+  (function step(now) {
+    const k = Math.min(1, (now - t0) / 600), e = 1 - Math.pow(1 - k, 3);
+    node.textContent = fmt(from + (to - from) * e);
+    if (k < 1) requestAnimationFrame(step);
+  })(t0);
+}
+
+function ovLineChart(c) {
+  const W = 760, H = 270, L = 44, R = 14, T = 12, B = 26;
+  const series = [["sleeve", "Sector momentum", OV_COLORS[0]], ["spy", "SPY", OV_COLORS[7]], ["swing", "Swing engine", OV_COLORS[2]]]
+    .filter(([k]) => (c[k] || []).length > 1);
+  if (!c.dates || c.dates.length < 2 || !series.length)
+    return `<div class="ov-empty">Collecting data — the first daily mark is logged after today's close (16:15 ET).<br>
+            <span class="subtle">The chart appears once there are two or more days.</span></div>`;
+  const all = series.flatMap(([k]) => c[k]);
+  let lo = Math.min(...all), hi = Math.max(...all);
+  const pad = Math.max((hi - lo) * 0.12, 0.4); lo -= pad; hi += pad;
+  const n = c.dates.length, x = i => L + (W - L - R) * (n === 1 ? 0 : i / (n - 1)), y = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4;
+    grid += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border-soft)"/><text x="${L - 6}" y="${y(v) + 3}" text-anchor="end">${v.toFixed(1)}</text>`;
+  }
+  const lbl = [0, Math.floor((n - 1) / 2), n - 1].filter((v, i, a) => a.indexOf(v) === i)
+    .map(i => `<text x="${x(i)}" y="${H - 8}" text-anchor="${i === 0 ? "start" : i === n - 1 ? "end" : "middle"}">${c.dates[i].slice(5)}</text>`).join("");
+  const lines = series.map(([k, , col]) => `<polyline fill="none" stroke="${col}" stroke-width="${k === "sleeve" ? 2.6 : 1.8}" stroke-linejoin="round" stroke-linecap="round"
+      points="${c[k].map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ")}"/>`).join("");
+  const id = "ovc" + Math.random().toString(36).slice(2, 7);
+  setTimeout(() => {
+    const svgEl = document.getElementById(id); if (!svgEl) return;
+    const tip = svgEl.parentElement.querySelector(".ov-tip"), cur = svgEl.querySelector(".cur");
+    svgEl.addEventListener("mousemove", ev => {
+      const r = svgEl.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+      const i = Math.max(0, Math.min(n - 1, Math.round((px - L) / (W - L - R) * (n - 1))));
+      cur.setAttribute("x1", x(i)); cur.setAttribute("x2", x(i)); cur.style.opacity = 1;
+      tip.innerHTML = `<b>${c.dates[i]}</b><br>` + series.map(([k, name, col]) => `<span style="color:${col}">●</span> ${name}: ${c[k][i].toFixed(2)}`).join("<br>");
+      tip.style.opacity = 1; tip.style.left = Math.min(r.width - 150, Math.max(0, (x(i) / W) * r.width + 12)) + "px"; tip.style.top = "6px";
+    });
+    svgEl.addEventListener("mouseleave", () => { tip.style.opacity = 0; cur.style.opacity = 0; });
+  }, 0);
+  return `<div class="ov-legend">${series.map(([, name, col]) => `<span><i style="background:${col}"></i>${name}</span>`).join("")}<span class="subtle">indexed to 100 at the first mark</span></div>
+    <div class="ov-wrap"><svg id="${id}" class="ov-chart" viewBox="0 0 ${W} ${H}">${grid}${lbl}
+      <line x1="${L}" x2="${W - R}" y1="${y(100)}" y2="${y(100)}" stroke="var(--text-2)" stroke-dasharray="3 4" opacity=".5"/>
+      ${lines}<line class="cur" y1="${T}" y2="${H - B}" stroke="var(--text-2)" style="opacity:0"/></svg><div class="ov-tip"></div></div>`;
+}
+
+function ovDonut(positions, equity) {
+  const R = 54, C = 2 * Math.PI * R;
+  const rows = positions.filter(p => p.value > 0).map((p, i) => ({ ...p, col: OV_COLORS[i % OV_COLORS.length] }));
+  const total = rows.reduce((a, b) => a + b.value, 0) || 1;
+  let off = 0;
+  const arcs = rows.map(p => { const len = C * p.value / total, a = `<circle r="${R}" cx="70" cy="70" fill="none" stroke="${p.col}" stroke-width="22"
+      stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}" stroke-dashoffset="${(-off).toFixed(2)}" transform="rotate(-90 70 70)"/>`; off += len; return a; }).join("");
+  return `<div class="ov-donut-row"><svg width="140" height="140" viewBox="0 0 140 140">${arcs || `<circle r="${R}" cx="70" cy="70" fill="none" stroke="var(--bg-3)" stroke-width="22"/>`}
+      <text x="70" y="66" text-anchor="middle" style="font-size:11px;fill:var(--text-2)">holdings</text>
+      <text x="70" y="84" text-anchor="middle" style="font-size:15px;font-weight:700;fill:var(--text-0)">${rows.length}</text></svg>
+    <div class="ov-donut-legend">${rows.map(p => `<div><i style="background:${p.col}"></i>${p.ticker}<b>${(p.weight * 100).toFixed(0)}%</b></div>`).join("")}</div></div>`;
+}
+
+function ovGauge(m) {
+  if (!m) return `<div class="subtle">Waiting for the first daily run.</div>`;
+  const lo = Math.min(m.band_lo, m.spy) * 0.92, hi = Math.max(m.band_hi, m.spy) * 1.06, pos = v => ((v - lo) / (hi - lo) * 100).toFixed(1) + "%";
+  const g = `linear-gradient(90deg, var(--red-bright) 0 ${pos(m.band_lo)}, var(--yellow) ${pos(m.band_lo)} ${pos(m.band_hi)}, var(--green-bright) ${pos(m.band_hi)} 100%)`;
+  return `<div class="ov-gauge"><div class="track" style="background:${g}"></div>
+      <div class="mk" style="left:${pos(m.band_lo)}">exit<br>${m.band_lo.toFixed(0)}</div>
+      <div class="mk" style="left:${pos(m.sma200)}">200d<br>${m.sma200.toFixed(0)}</div>
+      <div class="mk" style="left:${pos(m.band_hi)}">enter<br>${m.band_hi.toFixed(0)}</div>
+      <div class="spy" style="left:${pos(m.spy)}"><b>SPY ${m.spy.toFixed(0)}</b></div></div>`;
+}
+
+async function paintOverview(el, quiet) {
+  let d;
+  try {
+    const r = await fetch("/api/strategies/overview");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    d = await r.json();
+  } catch (e) {
+    if (!quiet) el.innerHTML = `<div class="panel">${emptyBlock("alert", "Couldn't load the overview", e.message)}</div>`;
+    return;
+  }
+  if (currentTab !== "overview") return;
+  const a = d.account, st = d.stats || {}, m = d.market, sw = d.swing;
+  if (!d.enabled || !a) {
+    el.innerHTML = `<div class="ov"><div class="panel"><div class="ov-empty"><b>The sector-momentum paper sleeve is switched off.</b><br>
+      Set <code>sector_momentum_sleeve.paper_enabled: true</code> in config.yaml and restart the scheduler.</div></div></div>`;
+    return;
+  }
+  const riskOn = m ? m.risk_on : null;
+  const vsSpy = (st.sleeve_total != null && st.spy_total != null) ? st.sleeve_total - st.spy_total : null;
+  const nb = new Date(d.next_rebalance + "T12:00:00"), days = Math.max(0, Math.ceil((nb - new Date()) / 86400000));
+  const cmpRow = (name, tag, ret, dd, note) => `<tr><td><b>${name}</b> ${tag}</td><td class="num ${ovCls(ret)}">${ovPct(ret)}</td><td class="num">${dd == null ? "—" : (dd * 100).toFixed(1) + "%"}</td><td>${note}</td></tr>`;
+  const swingRet = sw ? (sw.total_value / sw.starting_cash - 1) : null;
+  el.innerHTML = `<div class="ov" ${quiet ? 'style="animation:none"' : ""}>
+    <div class="ov-hero">
+      <div class="ov-tile ${a.return_pct >= 0 ? "up" : "down"}"><div class="ov-label">Sector momentum · paper</div>
+        <div class="ov-value" id="ov-eq" data-v="0">${ovUSD(a.equity)}</div>
+        <div class="ov-sub"><span class="${ovCls(a.return_pct)}">${ovPct(a.return_pct, 2)}</span> since start · started ${ovUSD(a.starting_cash)}</div></div>
+      <div class="ov-tile ${vsSpy == null ? "" : vsSpy >= 0 ? "up" : "down"}"><div class="ov-label">vs SPY</div>
+        <div class="ov-value ${ovCls(vsSpy)}">${vsSpy == null ? "—" : ovPct(vsSpy, 2)}</div>
+        <div class="ov-sub">${st.days > 1 ? `${st.days} daily marks` : "needs 2+ daily marks (first full day tomorrow)"}</div></div>
+      <div class="ov-tile accent"><div class="ov-label">Exposure</div>
+        <div class="ov-value">${a.gross.toFixed(2)}×</div>
+        <div class="ov-sub">target ${d.leverage}× · borrowed ${ovUSD(a.borrowed)} @ 4%</div></div>
+      <div class="ov-tile ${riskOn == null ? "" : riskOn ? "up" : "warn"}"><div class="ov-label">Market signal</div>
+        <div class="ov-value" style="font-size:22px;padding-top:5px">${riskOn == null ? "—" : riskOn ? `<span class="ov-pulse"></span>Risk-on` : "Risk-off (T-bills)"}</div>
+        <div class="ov-sub">next rebalance ${d.next_rebalance} · ${days} day${days === 1 ? "" : "s"}</div></div>
+    </div>
+
+    <div class="ov-row">
+      <div class="panel"><div class="panel-head">${svg("performance", 15)}<span class="panel-title">Growth of 100 — strategies vs SPY</span></div>${ovLineChart(d.curves)}</div>
+      <div class="panel"><div class="panel-head">${svg("positions", 15)}<span class="panel-title">Allocation</span><span class="fill"></span><span class="pill pill-neutral">${d.positions.length}</span></div>
+        ${ovDonut(d.positions, a.equity)}</div>
+    </div>
+
+    <div class="ov-row">
+      <div class="panel"><div class="panel-head">${svg("positions", 15)}<span class="panel-title">Holdings</span></div>
+        <div class="table-wrap"><table><thead><tr><th>Ticker</th><th class="num">Weight</th><th></th><th class="num">Value</th><th class="num">P&amp;L</th></tr></thead><tbody>
+        ${d.positions.map(p => `<tr><td><b>${p.ticker}</b></td><td class="num">${(p.weight * 100).toFixed(1)}%</td>
+          <td><div class="ov-bar"><span style="width:${Math.min(100, p.weight * 100 / 0.5 * 1)}%"></span></div></td>
+          <td class="num">${ovUSD(p.value)}</td><td class="num ${ovCls(p.pnl)}">${ovUSD(p.pnl)} <span class="subtle">${ovPct(p.pnl_pct)}</span></td></tr>`).join("")}
+        </tbody></table></div></div>
+      <div class="panel"><div class="panel-head">${svg("risk", 15)}<span class="panel-title">SPY vs its 200-day average</span></div>
+        ${ovGauge(m)}
+        <div class="ov-note" style="margin-top:6px">The sleeve holds risk assets while SPY is above the <b>enter</b> level and moves to T-bills below <b>exit</b>.
+        Between them it keeps its last decision, which avoids flip-flopping around the average.</div></div>
+    </div>
+
+    <div class="panel"><div class="panel-head">${svg("monitor", 15)}<span class="panel-title">Schedule</span></div>
+      <div class="table-wrap"><table class="ov-cmp"><thead><tr><th>Job</th><th>When</th><th>Status</th><th>What it does</th></tr></thead><tbody>
+        ${(d.jobs || []).map(j => `<tr><td><b>${j.name}</b></td><td>${j.when}</td>
+          <td>${j.enabled ? `<span class="pill pill-green">on</span>` : `<span class="pill pill-neutral">off</span>`}${j.last ? ` <span class="subtle">last ${j.last}</span>` : ""}</td>
+          <td>${j.detail}</td></tr>`).join("")}
+      </tbody></table></div></div>
+
+    <div class="panel"><div class="panel-head">${svg("strategy", 15)}<span class="panel-title">Strategies side by side</span></div>
+      <div class="table-wrap"><table class="ov-cmp"><thead><tr><th>Strategy</th><th class="num">Return</th><th class="num">Max drawdown</th><th>How it works</th></tr></thead><tbody>
+        ${cmpRow("Sector momentum", `<span class="pill pill-green">paper</span>`, st.sleeve_total, st.sleeve_dd,
+          `${d.strategy === "blend" ? "Sector + broad 3/6/12m momentum" : "Top-3 sectors"} · ${d.leverage}× · monthly · T-bills when SPY &lt; 200d`)}
+        ${sw ? cmpRow("Swing engine", `<span class="pill pill-yellow">${sw.mode || "paper"}</span>`, swingRet, st.swing_dd,
+          `Scans every ${sw.scan_minutes || "?"} min · ${sw.open || 0} open · realized ${ovUSD(sw.realized_pnl)}`) : ""}
+        ${cmpRow("SPY (benchmark)", `<span class="pill pill-neutral">buy &amp; hold</span>`, st.spy_total, st.spy_dd, "The bar to beat")}
+      </tbody></table></div>
+      <div class="ov-note" style="margin-top:10px">Returns for the sleeve and SPY are measured from the sleeve's first daily mark; the swing engine uses its own purse.
+      Backtests (2007–2026) put the sleeve at roughly <b>17–18% a year with up to a −36% drawdown</b>; typical years vary from about −11% to +58%. One year proves little — judge it over 12+ months.</div>
+    </div>
+  </div>`;
+  const eqNode = document.getElementById("ov-eq");
+  if (eqNode) ovCountUp(eqNode, a.equity, v => ovUSD(v));
 }
 
 /* ============================== COPY PROMPT ==============================

@@ -1871,6 +1871,14 @@ async def get_version():
     }
 
 
+@app.get("/api/strategies/overview")
+async def strategies_overview():
+    """Side-by-side paper strategies for the Overview tab (read-only)."""
+    from engine import strategy_overview
+    from config_loader import load_config_dict
+    return strategy_overview.build(Database(), load_config_dict())
+
+
 @app.get("/api/status")
 async def get_status():
     """Market-hours + last-cycle info so the UI can show a helpful empty state
