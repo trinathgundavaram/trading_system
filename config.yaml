@@ -960,19 +960,3 @@ notifications:
   # unset ${VAR} with no fallback, and a webhook is genuinely optional.
   webhook_url: ${NOTIFY_WEBHOOK_URL:-}
   high_conviction_buy_pct: 80
-
-# Intraday momentum backtest (2026-07-30) - engine/intraday_momentum_backtest.py,
-# phase 1 of docs/intraday_momentum_scoping_2026-07-30.md (the Zarattini/Aziz/
-# Barbon "Beat the Market" SPY noise-boundary strategy). BACKTEST-ONLY, same as
-# every key under `backtest:` used elsewhere in this file - engine/live_trader.py,
-# engine/paper_trader.py, and engine/order_execution.py never read this section.
-#
-# Unlike backtest.execution_cost_bps (default 0.0 = off), this section's cost
-# defaults are NOT zero - see engine/intraday_execution_costs.py's module
-# docstring for why: they default to the paper's OWN disclosed $/share cost
-# assumption, because the entire point of this backtest is testing whether the
-# paper's reported numbers survive the paper's own stated friction. Set both to
-# 0.0 explicitly for a frictionless comparison run.
-intraday_backtest:
-  commission_per_share: 0.0035
-  slippage_per_share: 0.001
