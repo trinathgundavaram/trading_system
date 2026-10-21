@@ -51,3 +51,17 @@ def test_unlevered_cap_never_goes_negative():
     db, cfg = FakeDb(), {"sector_momentum_sleeve": {"paper_starting_cash": 10000}}
     smp.rebalance(db, cfg, {"XLK": 1.5}, {"XLK": 100.0}, max_gross=1.0)
     assert db.acct["cash"] >= -1e-6
+
+
+def test_small_adds_skipped_by_default_but_trade_with_a_lower_floor():
+    from tests.test_sector_momentum_sleeve import FakeDb
+    cfg = {"stock_momentum_sleeve": {"paper_starting_cash": 10000}}
+    px = {f"S{i}": 100.0 for i in range(40)}
+    even = {t: 1.0 / 40 for t in px}
+    db = FakeDb()
+    smp.rebalance(db, cfg, even, px, section="stock_momentum_sleeve", min_trade_frac=0.002)
+    bigger = {t: 1.25 / 40 for t in px}                                   # +0.625% of equity per name
+    smp.rebalance(db, cfg, bigger, px, max_gross=1.25, section="stock_momentum_sleeve")        # default 1% floor: no trades
+    assert abs(sum(p["shares"] * 100 for p in db.get_open_sm_positions()) - 10000 * 0.9995) < 30
+    smp.rebalance(db, cfg, bigger, px, max_gross=1.25, section="stock_momentum_sleeve", min_trade_frac=0.002)
+    assert sum(p["shares"] * 100 for p in db.get_open_sm_positions()) > 12000

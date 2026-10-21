@@ -88,7 +88,8 @@ def main():
     if rebalance:
         led.set_sm_state("risk_on", "1" if risk_on else "0")
         trades = paper.rebalance(led, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0)),
-                                 max_gross=max(lev, 1.0), section=SECTION)
+                                 max_gross=max(lev, 1.0), section=SECTION,
+                                 min_trade_frac=float(sc.get("min_trade_frac", 0.002)))
         print(f"  {sum(t['side'] == 'buy' for t in trades)} buys, {sum(t['side'] == 'sell' for t in trades)} sells")
         led.set_sm_state("last_targets", json.dumps({"as_of": date, "weights": targets}))
     else:

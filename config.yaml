@@ -94,15 +94,16 @@ stock_momentum_sleeve:
   # monthly; T-bills (SHY) when SPY is risk-off (same 200d rule + band as the
   # ETF sleeve). rules/stock_momentum.py. Research (point-in-time membership,
   # only ~63% price coverage so optimistic): ~11.7% CAGR / ~-21% drawdown at
-  # 1.0x; ~8% at 50 bps costs. Universe: data/sp500_membership.csv (refresh it
+  # 1.0x, ~13.5% / ~-27% at 1.25x (now); ~8% at 50 bps costs. Universe: data/sp500_membership.csv (refresh it
   # quarterly - see data/README.md).
   paper_enabled: true
   paper_starting_cash: 10000
   top_n: 40
-  leverage: 1.0
+  leverage: 1.25
   band_pct: 2.0
   cost_bps: 5.0
   financing_bps: 400.0
+  min_trade_frac: 0.002   # ignore rebalance trims/adds smaller than 0.2% of equity (a 40-name book needs a small floor)
 tradingagents_advisor:
   # TauricResearch/TradingAgents as an ADVISORY rating logger (never trades).
   # Needs a local install of the repo and ANTHROPIC_API_KEY in the environment.

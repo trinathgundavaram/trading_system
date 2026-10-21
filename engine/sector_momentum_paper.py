@@ -40,10 +40,12 @@ def accrue_financing(db, cfg: dict, section: str = "sector_momentum_sleeve") -> 
 
 
 def rebalance(db, cfg: dict, targets: dict, prices: dict, date: str = None, cost_bps: float = 5.0,
-              max_gross: float = 1.0, section: str = "sector_momentum_sleeve") -> list:
+              max_gross: float = 1.0, section: str = "sector_momentum_sleeve",
+              min_trade_frac: float = None) -> list:
     """Move the ledger to `targets` ({ticker: weight of equity}). Sells first so
     the cash exists for the buys. Returns a list of trade dicts."""
     ensure_seeded(db, cfg, section)
+    min_frac = MIN_TRADE_FRAC if min_trade_frac is None else min_trade_frac
     date = date or datetime.now(timezone.utc).date().isoformat()
     open_pos = {p["ticker"]: p for p in db.get_open_sm_positions()}
     missing = [t for t in set(targets) | set(open_pos) if not prices.get(t)]
@@ -55,7 +57,7 @@ def rebalance(db, cfg: dict, targets: dict, prices: dict, date: str = None, cost
     for t, pos in sorted(open_pos.items()):          # sells / trims
         want = targets.get(t, 0.0) * eq / prices[t]
         sell = pos["shares"] - want
-        if sell * prices[t] < MIN_TRADE_FRAC * eq and t in targets:
+        if sell * prices[t] < min_frac * eq and t in targets:
             continue
         sell = min(sell, pos["shares"])
         px = prices[t] * (1 - slip)
@@ -74,7 +76,7 @@ def rebalance(db, cfg: dict, targets: dict, prices: dict, date: str = None, cost
         cash = db.get_sm_account()["cash"]
         borrow_room = max(max_gross - 1.0, 0.0) * eq            # margin allowed beyond own cash
         buy = min(buy, (cash + borrow_room) / px)
-        if buy * px < MIN_TRADE_FRAC * eq:
+        if buy * px < min_frac * eq:
             continue
         if t in open_pos:
             p = open_pos[t]
