@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Monthly sector-momentum sleeve vs SPY report, from the daily sm_equity_log.
-Prints month-by-month returns, cumulative return, max drawdown and the gap to
-SPY, and says plainly when the sample is too short to conclude anything.
+"""Monthly side-by-side report: sector-momentum sleeve vs the original swing
+engine (paper) vs SPY. Sleeve and SPY come from the daily sm_equity_log; the
+swing engine from its own paper_equity_history (a separate ledger - the two
+strategies share no cash or positions). Prints month-by-month returns,
+cumulative return and max drawdown for each, over the sleeve's window, and says
+plainly when the sample is too short to conclude anything.
     python3 scripts/sleeve_vs_spy_report.py [--out output/sleeve_vs_spy.md]
 """
 import argparse
@@ -17,36 +20,41 @@ from storage.database import Database
 MIN_MONTHS = 12
 
 
-def summarize(rows: list) -> dict:
+def summarize(rows: list, swing_rows: list = None) -> dict:
+    """rows: sm_equity_log rows. swing_rows: paper_equity_history rows
+    ({timestamp, total_value}); its last value on/before each sleeve date is used."""
     df = pd.DataFrame(rows)
     df.index = pd.to_datetime(df.pop("as_of_date"))
-    df = df.sort_index()
-    m = df.resample("ME").last()
-    first = df.iloc[[0]]
-    m = pd.concat([first, m]).drop_duplicates()
+    df = df.sort_index().rename(columns={"total_value": "sleeve", "spy_close": "spy"})
+    if swing_rows:
+        sw = pd.DataFrame(swing_rows)
+        sw.index = pd.to_datetime(sw["timestamp"]).dt.normalize()
+        sw = sw["total_value"].groupby(level=0).last().sort_index()
+        df["swing"] = sw.reindex(sw.index.union(df.index)).ffill().reindex(df.index)
+    m = pd.concat([df.iloc[[0]], df.resample("ME").last()]).drop_duplicates()
     ret = m.pct_change().dropna()
     dd = lambda s: float((s / s.cummax() - 1).min())
-    return {
-        "months": ret,
-        "sleeve_total": float(df["total_value"].iloc[-1] / df["total_value"].iloc[0] - 1),
-        "spy_total": float(df["spy_close"].iloc[-1] / df["spy_close"].iloc[0] - 1),
-        "sleeve_dd": dd(df["total_value"]), "spy_dd": dd(df["spy_close"]),
-        "days": len(df), "start": str(df.index[0].date()), "end": str(df.index[-1].date()),
-    }
+    out = {"months": ret, "days": len(df), "start": str(df.index[0].date()), "end": str(df.index[-1].date()),
+           "cols": list(df.columns)}
+    for c in df.columns:
+        out[f"{c}_total"] = float(df[c].iloc[-1] / df[c].iloc[0] - 1)
+        out[f"{c}_dd"] = dd(df[c])
+    return out
 
 
 def render(r: dict) -> str:
-    out = [f"# Sector momentum sleeve vs SPY ({r['start']} .. {r['end']}, {r['days']} daily marks)\n",
-           "| Month | Sleeve | SPY | Gap |", "|---|---|---|---|"]
+    names = {"sleeve": "Sector momentum", "swing": "Swing engine", "spy": "SPY"}
+    cols = [c for c in ("sleeve", "swing", "spy") if c in r["cols"]]
+    out = [f"# Strategies side by side ({r['start']} .. {r['end']}, {r['days']} daily marks)\n",
+           "| Month | " + " | ".join(names[c] for c in cols) + " |", "|---|" + "---|" * len(cols)]
     for d, row in r["months"].iterrows():
-        g = row["total_value"] - row["spy_close"]
-        out.append(f"| {d:%Y-%m} | {row['total_value']:+.2%} | {row['spy_close']:+.2%} | {g:+.2%} |")
-    out += ["", f"- Cumulative: sleeve **{r['sleeve_total']:+.2%}**, SPY **{r['spy_total']:+.2%}** "
-                f"(gap {r['sleeve_total'] - r['spy_total']:+.2%})",
-            f"- Max drawdown: sleeve **{r['sleeve_dd']:.1%}**, SPY **{r['spy_dd']:.1%}**"]
+        out.append(f"| {d:%Y-%m} | " + " | ".join(f"{row[c]:+.2%}" for c in cols) + " |")
+    out += ["", "| | " + " | ".join(names[c] for c in cols) + " |", "|---|" + "---|" * len(cols),
+            "| Cumulative | " + " | ".join(f"{r[c + '_total']:+.2%}" for c in cols) + " |",
+            "| Max drawdown | " + " | ".join(f"{r[c + '_dd']:.1%}" for c in cols) + " |"]
     n = len(r["months"])
     if n < MIN_MONTHS:
-        out.append(f"\n> Only {n} month(s) of data. Research expects the sleeve to trail SPY in most "
+        out.append(f"\n> Only {n} month(s) of data. Research expects the sector sleeve to trail SPY in most "
                    f"bull months and win mainly in selloffs, so judge it over {MIN_MONTHS}+ months and "
                    f"include at least one drawdown in SPY before concluding anything.")
     return "\n".join(out)
@@ -60,7 +68,8 @@ def main():
     if len(rows) < 2:
         print("Not enough data yet: enable sector_momentum_sleeve.paper_enabled and let the daily cycle log marks.")
         return
-    text = render(summarize(rows))
+    db = Database()
+    text = render(summarize(rows, db.get_paper_equity_history(limit=100000)))
     print(text)
     if a.out:
         Path(a.out).write_text(text + "\n")

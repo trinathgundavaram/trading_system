@@ -90,7 +90,7 @@ def main():
         rows = db.get_sm_equity_log()
         if len(rows) >= 2:
             out = Path(__file__).resolve().parent.parent / "output" / "sleeve_vs_spy.md"
-            out.write_text(render(summarize(rows)) + "\n")
+            out.write_text(render(summarize(rows, db.get_paper_equity_history(limit=100000))) + "\n")
             print(f"report written: {out}")
     print(f"Sleeve: value ${s['total_value']:.2f} ({s['total_return_pct']}%) positions={s['positions']}")
 
