@@ -168,3 +168,4 @@ pytest-cov==6.0.0
 # EDGAR (mcp_clients/edgar_data.py) needs no new package - stdlib xml.etree plus
 # `requests` above. It needs EDGAR_USER_AGENT set in .env: the SEC requires a
 # descriptive contact string, not a key.
+ruamel.yaml>=0.17

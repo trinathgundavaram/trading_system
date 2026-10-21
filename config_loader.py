@@ -122,3 +122,47 @@ def load_config_dict_raw() -> dict:
 
 def load_config() -> SimpleNamespace:
     return _to_namespace(load_config_dict())
+
+
+def save_config_preserving_comments(path, cfg: dict) -> None:
+    """Write `cfg` (the RAW, unexpanded dict from yaml.safe_load) back to `path`
+    without destroying the file's comments or layout.
+
+    config.yaml is where the reasoning behind every threshold is recorded, and
+    several code paths (UI saves, the Bayesian weight updater) used to rewrite
+    it with yaml.dump, which silently deleted every comment (340 of them) the
+    first time anything was saved. This round-trips through ruamel.yaml, copies
+    over only the values that actually changed, and replaces the file
+    atomically so a crash mid-write cannot leave a half-written config."""
+    import os
+    import tempfile
+    from pathlib import Path
+    from ruamel.yaml import YAML
+
+    path = Path(path)
+    rt = YAML()
+    rt.preserve_quotes = True
+    rt.width = 4096
+    with open(path) as f:
+        doc = rt.load(f)
+
+    def merge(dst, src):
+        for k in list(dst.keys()):
+            if k not in src:
+                del dst[k]
+        for k, v in src.items():
+            if isinstance(v, dict) and k in dst and hasattr(dst[k], "keys"):
+                merge(dst[k], v)
+            elif k not in dst or dst[k] != v:
+                dst[k] = v
+
+    merge(doc, cfg)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            rt.dump(doc, f)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise

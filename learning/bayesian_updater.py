@@ -389,8 +389,8 @@ def apply_bucket_weight_to_config(bucket: str, new_weight_0_100: float, mode: st
     with open(CONFIG_PATH, "r") as f:
         raw = yaml.safe_load(f)
     raw.setdefault("weights", {}).setdefault(weights_key, {}).setdefault("bucket_weights", {})[bucket] = new_weight_0_100 / 100.0
-    with open(CONFIG_PATH, "w") as f:
-        yaml.safe_dump(raw, f, sort_keys=False)
+    from config_loader import save_config_preserving_comments
+    save_config_preserving_comments(CONFIG_PATH, raw)
 
     decision = "forced" if force and not (
         challenge_result is not None and challenge_result.get("ready")

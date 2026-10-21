@@ -1,6 +1,4 @@
-watchlist:
-- NBIS
-- HCA
+watchlist: []
 trading:
   # Phase 0 step 0.1 (2026-07-24): all three live-execution gates closed.
   # Do not reopen these until the §32 re-arm gate passes - see CHANGELOG.md.
@@ -827,7 +825,7 @@ backtest:
   # default to "off" here so that result has to be deliberately re-enabled,
   # not silently baked into every future run.
   entry_filter:
-    min_tier: null          # null (off) | weak | standard | strong
+    min_tier:               # null (off) | weak | standard | strong
     exclude_regimes: []     # e.g. [BULL] - values are engine/regime_engine.py's regime labels
     # max_vix (2026-07-28, from docs/beating_the_market_analysis_2026-07-28.md
     # §2.4): the 5-year lookback found 2022 - a real bear market - was this
@@ -835,7 +833,7 @@ backtest:
     # nothing to protect against it. VIX is only one of five weighted votes
     # into dominant_regime, so a direct threshold here catches elevated
     # volatility even when the regime vote still lands BULL/CHOPPY. null=off.
-    max_vix: null            # e.g. 25 - candidate-days with vix_close above this are rejected
+    max_vix:                 # e.g. 25 - candidate-days with vix_close above this are rejected
     # max_realized_vol_pct (2026-07-28, same-day follow-up to max_vix above):
     # exclude_regimes: [BEAR] + max_vix: 25 STILL failed to protect 2022 -
     # every one of that year's surviving trades in that test was labeled
@@ -849,7 +847,7 @@ backtest:
     # so it cannot inherit that bias. Roughly VIX-scale but NOT the same
     # thing - realized (already-happened) vol, not implied (forward-looking)
     # vol. null=off.
-    max_realized_vol_pct: null   # e.g. 25 - candidate-days above this trailing realized vol are rejected
+    max_realized_vol_pct:        # e.g. 25 - candidate-days above this trailing realized vol are rejected
     # min_spy_trend_pct (2026-07-28, same-day follow-up #2): max_realized_vol_pct
     # ALSO failed to protect 2022 - it removed some 2022 candidates but the
     # REMAINING ones got worse (PF 0.24, not better), because 2022's losses
@@ -862,7 +860,7 @@ backtest:
     # 0 means "only trade with SPY at/above its 200-day SMA" (a classic
     # systematic trend filter); negative values (e.g. -5) allow some cushion
     # below the SMA before rejecting.
-    min_spy_trend_pct: null
+    min_spy_trend_pct:
   # ticker_source (2026-07-24, "pick tickers automatically instead of a
   # hand-curated list, will that help or create noise"): "screener_discovered"
   # means the tickers list below is IGNORED and engine/backtest_loop.py's

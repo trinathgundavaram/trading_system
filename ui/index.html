@@ -785,14 +785,10 @@ const TABS = [
     // engine/live_trader.py, and this tab is where the switch that makes it
     // false actually lives. Corrected 2026-07-26 (UI audit).
     desc: "Watchlist, risk level, trading mode, rotation, and the arming controls - including the Live Execution master switch, Auto-Trade, and the kill switch. This is the only tab that can arm real-money execution." },
-  { id: "performance", label: "Performance", icon: "performance", group: "Swing engine",
-    desc: "Win rate and average outcome broken down by market regime, plus overall profit factor and Sharpe ratio, from closed pattern_database rows." },
   { id: "learning",    label: "Learning",    icon: "learning", group: "Swing engine",
     desc: "The automated learning loop's rule-attribution analysis (edge, stability). Every result is a proposal for human review - nothing is auto-applied to live scoring." },
   { id: "strategy",    label: "Swing rules",    icon: "strategy", group: "Swing engine",
     desc: "The actual current rule set: every buy bucket/rule, the dynamic threshold formula, hard vetoes, sell rules, and how the strategy has evolved over time." },
-  { id: "risk",        label: "Risk",        icon: "risk", group: "Swing engine",
-    desc: "Portfolio heat - how much of your risk budget is currently deployed across open positions." },
   { id: "journal",     label: "Journal",     icon: "journal", group: "Swing engine",
     desc: "Every confirmed real trade (via confirm_fill.py), with the indicators and rules that were in play at that moment. Click a row to expand it." },
   { id: "monitor",     label: "Monitor",     icon: "monitor", group: "System",
@@ -1026,8 +1022,8 @@ function loadTab(name) {
   const renderers = {
     overview: renderOverview, dashboard: renderDashboard, signals: renderSignalsTab, positions: renderPositionsTab,
     portfolio: (el) => (viewMode === "real" ? renderRealPortfolioTab(el) : renderPortfolioTab(el)),
-    control: renderControlTab, performance: renderPerformanceTab, learning: renderLearningTab,
-    strategy: renderStrategyTab, risk: renderRiskTab, journal: renderJournalTab, monitor: renderMonitorTab,
+    control: renderControlTab, learning: renderLearningTab,
+    strategy: renderStrategyTab, journal: renderJournalTab, monitor: renderMonitorTab,
     logs: renderLogsTab, news: renderNewsTab,
   };
   (renderers[name] || renderOverview)(el);
@@ -1899,25 +1895,16 @@ async function runCycleNow(evt) {
   btn.innerHTML = original;
 }
 
-function renderDashboard(el) {
+async function renderDashboard(el) {
   const pulse = state.market_context || {};
   const stats = state.daily_stats || {};
   const isPaper = viewMode === "paper";
   const positions = (state.positions || []).filter(p => !!p.simulated === isPaper);
   const signals = (state.recent_signals || []);
-  const buys = signals.filter(s => s.signal === "BUY").slice(0, 8);
-  // Realized P&L card: lead with whichever book is selected, keep the other
-  // as the "sub" line so both are still one click away from surfacing, but
-  // the mixed-together default that used to always lead with the real
-  // number is gone (2026-07-24, book toggle).
+  const buys = signals.filter(s => s.signal === "BUY").slice(0, 6);
   const mainPnl = isPaper ? (state.paper_realized_today || 0) : (stats.realized_pnl || 0);
-  const subPnl = isPaper ? (stats.realized_pnl || 0) : (state.paper_realized_today || 0);
-  const subLabel = isPaper ? "real" : "paper";
-
-  // Market Pulse now renders the SAME component the News tab uses (see
-  // marketMoodPanel) instead of its own reduced copy - the Dashboard used to
-  // be the one place that showed Fear & Greed and VIX but not the regime,
-  // while the regime pill sat directly above it in the topbar.
+  const heat = state.portfolio_heat || { current_heat_pct: 0, max_heat_pct: 7 };
+  const heatPct = heat.max_heat_pct ? Math.min(100, heat.current_heat_pct / heat.max_heat_pct * 100) : 0;
   const mood = {
     fear_greed_score: pulse.fg_score, fear_greed_rating: pulse.fg_rating,
     vix_level: pulse.vix, regime: (state.regime || {}).dominant_regime,
@@ -1925,62 +1912,63 @@ function renderDashboard(el) {
     hours_to_next_macro: pulse.hours_to_next_macro,
     as_of: pulse.as_of || (state.regime || {}).updated_at,
   };
-
+  if (!el.querySelector(".ov")) el.innerHTML = `<div class="ov"><div class="panel"><span class="subtle">Loading dashboard…</span></div></div>`;
+  // Purse + track record come from read-only endpoints; the page renders first
+  // and fills these in, so a slow call never blanks the dashboard.
+  const [ov, perf] = await Promise.all([
+    fetch("/api/strategies/overview").then(r => r.json()).catch(() => null),
+    fetch("/api/analytics/performance").then(r => r.json()).catch(() => null),
+  ]);
+  if (currentTab !== "dashboard") return;
+  const sw = ov && ov.swing;
+  const swRet = sw ? sw.total_value / sw.starting_cash - 1 : null;
+  const scanMin = sw && sw.scan_minutes;
   el.innerHTML = `
     ${marketBanner()}
     ${vetoSummaryBanner(signals)}
-    <div class="panel">
-      <div class="panel-head">${svg('performance',15)}<span class="panel-title">Market Pulse</span></div>
-      ${pulse.fg_score == null && pulse.vix == null
-        ? emptyBlock('inbox','No cycle data yet','Runs once scheduler.py completes a cycle during market hours.')
-        : marketMoodPanel(mood, { footerExtra: " A/D ratio &amp; McClellan come from the sector-ETF breadth proxy - see the Strategy tab's Market Breadth bucket." })}
-    </div>
-    <div class="grid grid-2">
-      <div class="panel">
-        <div class="panel-head">${svg('risk',15)}<span class="panel-title">${withTip('Strategy Health', 'strategy_health')}</span></div>
-        ${state.health_score != null ? `
-          <div class="stat"><div class="value" style="font-size:28px;">${state.health_score.toFixed(0)}<span style="font-size:14px;color:var(--text-2);">/100</span></div><div class="sub">avg. across open ${isPaper ? 'paper' : 'real'} positions</div></div>
-          <div class="health-bar" style="margin-top:10px;"><div class="health-fill" style="width:${state.health_score}%;background:${state.health_score>=70?'var(--green)':state.health_score>=40?'var(--yellow)':'var(--red)'}"></div></div>
-        ` : emptyBlock('inbox','No scored positions',
-            // Was book-blind: it described the WATCH-mode paper path even when
-            // the Real book was selected, telling you to wait for something
-            // that has nothing to do with the book you are looking at.
-            isPaper
-              ? 'Appears once WATCH-mode paper trading opens a position and Loop B scores it.'
-              : 'Appears once a real fill is logged (confirm_fill.py buy, or an auto-synced Robinhood holding) and Loop B scores it.')}
+    <div class="ov" style="animation:none">
+      <div class="ov-hero">
+        <div class="ov-tile ${swRet == null ? "" : swRet >= 0 ? "up" : "down"}"><div class="ov-label">Paper purse</div>
+          <div class="ov-value">${sw ? ovUSD(sw.total_value) : "—"}</div>
+          <div class="ov-sub">${swRet == null ? "not started" : `<span class="${ovCls(swRet)}">${ovPct(swRet, 2)}</span> since start`}${sw ? ` · cash ${ovUSD(sw.cash)}` : ""}</div></div>
+        <div class="ov-tile ${mainPnl > 0 ? "up" : mainPnl < 0 ? "down" : ""}"><div class="ov-label">Realized today (${isPaper ? "paper" : "real"})</div>
+          <div class="ov-value ${ovCls(mainPnl)}">${fmtUSD(mainPnl)}</div>
+          <div class="ov-sub">${stats.cycles_run || 0} cycles · ${stats.signals_generated || 0} signals · ${stats.trades_placed || 0} trades</div></div>
+        <div class="ov-tile ${heatPct > 90 ? "down" : heatPct > 60 ? "warn" : "accent"}"><div class="ov-label">${withTip("Portfolio heat", "portfolio_heat")}</div>
+          <div class="ov-value">${heat.current_heat_pct}<span style="font-size:15px;color:var(--text-2)"> / ${heat.max_heat_pct}%</span></div>
+          <div class="ov-bar" style="margin-top:8px"><span style="width:${heatPct}%;background:${heatPct > 90 ? "var(--red)" : heatPct > 60 ? "var(--yellow)" : "var(--indigo)"}"></span></div>
+          <div class="ov-sub">${positions.length} open of ${state.config?.trading?.max_positions ?? "—"} max</div></div>
+        <div class="ov-tile"><div class="ov-label">Track record (closed patterns)</div>
+          <div class="ov-value">${perf && perf.n_closed_patterns != null ? perf.n_closed_patterns : "—"}</div>
+          <div class="ov-sub">profit factor ${fmtRatio(perf && perf.profit_factor)} · Sharpe ${fmtRatio(perf && perf.sharpe_ratio)}</div></div>
       </div>
-      <div class="panel">
-        <div class="panel-head">${svg('journal',15)}<span class="panel-title">Today</span></div>
-        <div class="grid grid-2" style="gap:10px;">
-          <div class="stat"><div class="label">${withTip('Cycles', 'cycles_today')}</div><div class="value">${stats.cycles_run||0}</div></div>
-          <div class="stat"><div class="label">${withTip('Signals', 'signals_today')}</div><div class="value">${stats.signals_generated||0}</div></div>
-          <div class="stat"><div class="label">${withTip('Trades', 'trades_today')}</div><div class="value">${stats.trades_placed||0}</div></div>
-          <div class="stat"><div class="label">${withTip('Realized P&amp;L', 'realized_pnl')}</div><div class="value ${mainPnl>=0?'positive':'negative'}">$${mainPnl.toFixed(2)}</div><div class="sub ${subPnl>=0?'positive':'negative'}">${subLabel}: $${subPnl.toFixed(2)}</div></div>
-        </div>
+
+      <div class="ov-row">
+        <div class="panel"><div class="panel-head">${svg("performance", 15)}<span class="panel-title">Market pulse</span></div>
+          ${pulse.fg_score == null && pulse.vix == null
+            ? emptyBlock("inbox", "No cycle data yet", "Appears once the scheduler completes a cycle during market hours.")
+            : marketMoodPanel(mood, { footerExtra: "" })}</div>
+        <div class="panel"><div class="panel-head">${svg("risk", 15)}<span class="panel-title">${withTip("Position health", "strategy_health")}</span></div>
+          ${state.health_score != null ? `
+            <div class="ov-value">${state.health_score.toFixed(0)}<span style="font-size:15px;color:var(--text-2)">/100</span></div>
+            <div class="ov-bar" style="margin-top:8px"><span style="width:${state.health_score}%;background:${state.health_score >= 70 ? "var(--green)" : state.health_score >= 40 ? "var(--yellow)" : "var(--red)"}"></span></div>
+            <div class="ov-sub">average across open ${isPaper ? "paper" : "real"} positions</div>`
+            : emptyBlock("inbox", "No scored positions", isPaper ? "Appears once the paper book opens a position." : "Appears once a real fill is logged.")}
+          <div class="ov-note" style="margin-top:12px">Scans run every ${scanMin || "?"} min during market hours in ${sw && sw.mode || "WATCH"} mode.
+            The swing engine is a paper benchmark next to the sector-momentum sleeve — see the Overview.</div></div>
       </div>
-    </div>
 
-    <div class="panel">
-      <div class="panel-head">${svg('signals',15)}<span class="panel-title">Recent BUY Signals</span><span class="fill"></span><span class="pill pill-blue">${buys.length}</span></div>
-      ${buys.length ? buys.map(s => `
-        <div class="card-row buy">
-          <div class="top">
-            <span class="ticker">${tickerLabel(s.ticker)}</span>
-            <span class="subtle">${fmtCST(s.timestamp)}</span>
-          </div>
-          <div class="metrics-row">
-            <div class="metric"><div class="metric-label">${withTip('Score', 'buy_score')}</div><div class="metric-value" style="color:${(s.buy_pct||0)>=70?'var(--green)':'var(--yellow)'}">${s.buy_pct?.toFixed(0)||"—"}%</div></div>
-            <div class="metric"><div class="metric-label">Price</div><div class="metric-value">$${s.price?.toFixed(2)||"—"}</div></div>
-            <div class="metric"><div class="metric-label">${withTip('Data', 'data_quality')}</div><div class="metric-value" style="font-size:11px;">${s.data_quality||"—"}</div></div>
-          </div>
-        </div>`).join("") : emptyBlock('inbox','No BUY signals yet','They will appear here as the scheduler scans your watchlist.')}
-    </div>
+      <div class="panel"><div class="panel-head">${svg("signals", 15)}<span class="panel-title">Recent BUY signals</span><span class="fill"></span><span class="pill pill-blue">${buys.length}</span></div>
+        ${buys.length ? `<div class="table-wrap"><table data-no-enhance><thead><tr><th>Ticker</th><th>When</th><th>Score</th><th class="num">Price</th><th>Data</th></tr></thead><tbody>
+          ${buys.map(s => { const pc = s.buy_pct || 0; return `<tr><td><b>${tickerLabel(s.ticker)}</b></td><td class="subtle">${fmtCST(s.timestamp)}</td>
+            <td><div style="display:flex;align-items:center;gap:8px"><div class="ov-bar" style="width:90px"><span style="width:${Math.min(100, pc)}%;background:${pc >= 70 ? "var(--green)" : "var(--yellow)"}"></span></div><b>${pc.toFixed(0)}%</b></div></td>
+            <td class="num">$${s.price?.toFixed(2) || "—"}</td><td class="subtle">${s.data_quality || "—"}</td></tr>`; }).join("")}
+          </tbody></table></div>`
+          : emptyBlock("inbox", "No BUY signals yet", "They appear here as the scheduler scans the watchlist.")}</div>
 
-    <div class="panel">
-      <div class="panel-head">${svg('positions',15)}<span class="panel-title">Open Positions (${isPaper ? 'Paper' : 'Real'})</span><span class="fill"></span><span class="pill pill-neutral">${positions.length}</span></div>
-      ${renderPositionsTable(positions, isPaper)}
-    </div>
-  `;
+      <div class="panel"><div class="panel-head">${svg("positions", 15)}<span class="panel-title">Open positions (${isPaper ? "Paper" : "Real"})</span><span class="fill"></span><span class="pill pill-neutral">${positions.length}</span></div>
+        ${renderPositionsTable(positions, isPaper)}</div>
+    </div>`;
 }
 
 function emptyBlock(icon, title, desc) {
@@ -3952,37 +3940,6 @@ async function toggleKillSwitch() {
 // whenever the book had no losing trade (profit_factor was float('inf'), which
 // Starlette refuses to serialise), and summary.profit_factor.toFixed(2) would
 // have thrown on the null that endpoint now legitimately returns.
-async function renderPerformanceTab(el) {
-  el.innerHTML = `<div class="panel"><div class="panel-head">${svg('performance',15)}<span class="panel-title">Performance by Regime</span></div><div id="perf-body">Loading…</div></div>`;
-  let regimeData, summary;
-  try {
-    [regimeData, summary] = await Promise.all([
-      fetchJSON("/api/analytics/regime_performance"),
-      fetchJSON("/api/analytics/performance"),
-    ]);
-  } catch (e) {
-    document.getElementById("perf-body").innerHTML = tabErrorHTML(e);
-    return;
-  }
-  const entries = Object.entries(regimeData || {});
-  const body = document.getElementById("perf-body");
-  body.innerHTML = `
-    <div class="metrics-row" style="margin-bottom:16px;">
-      <div class="metric"><div class="metric-label">Closed patterns</div><div class="metric-value">${summary.n_closed_patterns ?? 0}</div></div>
-      <div class="metric"><div class="metric-label">Profit factor</div><div class="metric-value">${fmtRatio(summary.profit_factor)}</div></div>
-      <div class="metric"><div class="metric-label">Sharpe</div><div class="metric-value">${fmtRatio(summary.sharpe_ratio)}</div></div>
-    </div>
-    ${entries.length ? `<div class="table-wrap"><table><thead><tr><th>Regime</th><th class="num">Trades</th><th class="num">Win Rate</th><th class="num">Avg Outcome</th></tr></thead><tbody>
-      ${entries.map(([regime, s]) => `<tr>
-        <td><b>${regime}</b></td>
-        <td class="num">${s.n||0}</td>
-        <td class="num ${(s.win_rate||0)>0.5?'positive':'negative'}">${((s.win_rate||0)*100).toFixed(0)}%</td>
-        <td class="num ${(s.avg_outcome_pct||0)>0?'positive':'negative'}">${(s.avg_outcome_pct||0).toFixed(2)}%</td>
-      </tr>`).join("")}
-    </tbody></table></div>` : emptyBlock('inbox','No closed patterns yet','Needs at least one BUY signal to run its full pattern_hold_days before this fills in.')}
-  `;
-}
-
 /* ============================== LEARNING TAB ============================== */
 async function renderLearningTab(el) {
   el.innerHTML = `
@@ -4014,7 +3971,7 @@ async function renderLearningTab(el) {
      Replaced with a one-line pointer. The metrics have exactly one home. */
   document.getElementById("learning-body").innerHTML = `
     <p class="field-desc" style="margin-bottom:0;">Pattern database, EV engine, Bayesian weight updater, walk-forward, and champion/challenger all run against closed <code>pattern_database</code> rows — see README for what's real vs. simulated.
-    Headline numbers for this book (closed patterns, profit factor, Sharpe) live on the <a href="#performance" onclick="showTab('performance');return false;">Performance tab</a>, broken down by market regime.</p>
+    Headline numbers for this book (closed patterns, profit factor, Sharpe) are on the <a href="#dashboard" onclick="showTab('dashboard');return false;">Swing dashboard</a>.</p>
   `;
 
   loadBacktestPanel(); // fire-and-forget - independent of the learning_runs early-return below
@@ -4810,32 +4767,6 @@ function renderEvolutionSection(evo) {
 }
 
 /* ============================== RISK TAB ============================== */
-function renderRiskTab(el) {
-  const heat = state.portfolio_heat || { current_heat_pct: 0, max_heat_pct: 7 };
-  const pct = heat.max_heat_pct ? Math.min(100, (heat.current_heat_pct / heat.max_heat_pct) * 100) : 0;
-  el.innerHTML = `
-    <div class="panel">
-      <div class="panel-head">${svg('risk',15)}<span class="panel-title">${withTip('Portfolio Heat', 'portfolio_heat')}</span></div>
-      <div class="stat"><div class="value">${heat.current_heat_pct}%<span style="font-size:13px;color:var(--text-2);"> / ${heat.max_heat_pct}% max</span></div></div>
-      <div class="heat-track" style="margin-top:10px;"><div class="heat-fill" style="width:${pct}%;background:${pct>90?'var(--red)':pct>60?'var(--yellow)':'var(--green)'}"></div></div>
-      ${/* The caption and the hover tooltip described DIFFERENT denominators:
-            the tooltip said "vs. your max_portfolio_risk_pct budget", the
-            caption said "vs. dollars deployed". Both were on screen at once,
-            and only one can be right. The figure is
-            current_heat_pct / max_heat_pct, i.e. against the configured risk
-            budget - the tooltip was correct and the caption was not.
-            Reconciled 2026-07-26 (UI audit); both now come from one string. */''}
-      <p class="field-desc" style="margin-top:12px;">${_HEAT_CAPTION}</p>
-      <div class="grid grid-2" style="gap:10px;margin-top:14px;">
-        <div class="metric"><div class="metric-label">Risk budget used</div><div class="metric-value">${pct.toFixed(0)}%</div></div>
-        <div class="metric"><div class="metric-label">Headroom left</div><div class="metric-value">${Math.max(0, (heat.max_heat_pct || 0) - (heat.current_heat_pct || 0)).toFixed(2)}%</div></div>
-        <div class="metric"><div class="metric-label">Open positions</div><div class="metric-value">${(state.positions || []).length}</div></div>
-        <div class="metric"><div class="metric-label">Position cap</div><div class="metric-value">${state.config?.trading?.max_positions ?? '—'}</div></div>
-      </div>
-    </div>
-  `;
-}
-
 // Single source for the portfolio-heat explanation, referenced by both the
 // Risk tab caption and TIPS.portfolio_heat so they cannot drift apart again.
 const _HEAT_CAPTION = "Approximate dollar risk across open positions, measured against your configured <code>max_portfolio_risk_pct</code> budget (not against real account equity — the balance data is available, but heat feeds position sizing, so re-basing it is a deliberate change rather than a fix). Stay under 100% of max: the bar turns yellow above 60% and red above 90%.";

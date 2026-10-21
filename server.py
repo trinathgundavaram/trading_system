@@ -137,8 +137,10 @@ def _load_config() -> dict:
 
 
 def _save_config(cfg: dict):
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(cfg, f, sort_keys=False)
+    # Comment-preserving: a plain yaml.dump here used to delete every comment in
+    # config.yaml the first time anything was saved from the UI.
+    from config_loader import save_config_preserving_comments
+    save_config_preserving_comments(CONFIG_PATH, cfg)
 
 
 # ═══ Auth ═════════════════════════════════════════════════════════════════
