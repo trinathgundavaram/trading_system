@@ -8,7 +8,7 @@ trading:
   trade_size_usd: 100
   max_positions: 25
   scan_interval_minutes: 15
-  day_trade_scan_interval_minutes: 5
+  day_trade_scan_interval_minutes: 15
   market_open_buffer_minutes: 30
   market_close_buffer_minutes: 30
   mode: HYBRID
