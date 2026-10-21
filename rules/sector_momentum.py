@@ -27,3 +27,41 @@ def target_weights(closes: pd.DataFrame, n: int = 3, leverage: float = 1.0) -> d
     out = {t: leverage / n for t in mom.head(n).index if closes[t].iloc[-1] > closes[t].iloc[-200:].mean()}
     out[DEFENSIVE] = leverage - sum(out.values())
     return {t: w for t, w in out.items() if w > 1e-9}
+
+
+# ── Blended, levered variant (2026-10-20) ───────────────────────────────────
+# research/leverage_study.py "C_blend": 50% sector momentum + 50% broad 3/6/12m
+# composite (top 8 of 22 ETFs), both flat to T-bills (SHY) when SPY < its 200d
+# SMA, risk positions multiplied by `leverage` (T-bills/bonds stay 1x).
+# Measured 2007-2026, 4% financing, 5bps costs: 1.25x -> 11.4% CAGR / -23.4% max
+# drawdown (1.0x 10.0% / -18.8%; SPY 12.3% / -47.2%). Bootstrap 10y: median
+# 11.1%, 5th pct 4.8%, P(drawdown worse than -35%) ~0.4%. The SPY rule was
+# chosen after the 2008 result was seen, so treat the out-of-sample figures as
+# optimistic. Fixed parameters - do not tune against the same history.
+BROAD = ["SPY", "QQQ", "IWM", "EFA", "EEM", "VNQ", "TLT", "LQD", "HYG", "GLD", "SLV", "DBC", "USO",
+         "XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY", "IEF"]
+CASH = "SHY"
+UNIVERSE_BLEND = sorted(set(BROAD) | {CASH})
+_DEFENSIVE = {"IEF", CASH}
+
+
+def _broad_composite(closes: pd.DataFrame, top_n: int = 8) -> dict:
+    px = closes[BROAD]
+    r = pd.concat([px.iloc[-1] / px.iloc[-1 - 21 * m] - 1 for m in (3, 6, 12)], axis=1).mean(axis=1)
+    picks = r.dropna().sort_values(ascending=False).head(top_n)
+    return {t: 1.0 / top_n for t in picks.index}
+
+
+def target_weights_blend(closes: pd.DataFrame, leverage: float = 1.25) -> dict:
+    """Weights as fractions of equity (gross can exceed 1 by up to `leverage`)."""
+    if len(closes) < MIN_BARS or any(t not in closes for t in UNIVERSE_BLEND):
+        raise ValueError(f"need >= {MIN_BARS} bars for {UNIVERSE_BLEND}; got {len(closes)}")
+    spy = closes["SPY"]
+    if spy.iloc[-1] < spy.iloc[-200:].mean():
+        return {CASH: 1.0}
+    a, b = target_weights(closes, leverage=1.0), _broad_composite(closes)
+    out = {}
+    for src in (a, b):
+        for t, w in src.items():
+            out[t] = out.get(t, 0.0) + w / 2
+    return {t: (w if t in _DEFENSIVE else w * leverage) for t, w in out.items() if w > 1e-9}

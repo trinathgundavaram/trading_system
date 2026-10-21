@@ -76,13 +76,18 @@ rsi2_sleeve:
   # exists, mirroring run_backtest.py's existing one for swing rather than
   # riding on it. See the live-trading task in this session's plan.
 sector_momentum_sleeve:
-  # Top-3 sector ETFs by 12-1m momentum above their 200d SMA, rest in IEF,
-  # month-end rebalance (rules/sector_momentum.py). Research 2007-2026:
-  # ~11% CAGR / ~-20% max drawdown vs SPY 12.3% / -47%. PAPER only.
+  # PAPER only. strategy "blend" = 50% sector momentum + 50% broad 3/6/12m
+  # composite (top 8 of 22 ETFs), all T-bills (SHY) when SPY < its 200d SMA,
+  # risk positions x `leverage` (rules/sector_momentum.py::target_weights_blend).
+  # Research 2007-2026 at 1.25x: ~11.4% CAGR / ~-23% max drawdown vs SPY
+  # 12.3% / -47%; borrowed cash is charged financing_bps. "sector" = the
+  # unlevered top-3 sector version.
   paper_enabled: false
+  strategy: blend
+  leverage: 1.25
+  financing_bps: 400.0
   paper_starting_cash: 10000
   top_n: 3
-  leverage: 1.0
   cost_bps: 5.0
 tradingagents_advisor:
   # TauricResearch/TradingAgents as an ADVISORY rating logger (never trades).

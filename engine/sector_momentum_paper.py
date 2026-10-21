@@ -27,7 +27,20 @@ def equity(db, prices: dict) -> float:
                               if p["ticker"] in prices)
 
 
-def rebalance(db, cfg: dict, targets: dict, prices: dict, date: str = None, cost_bps: float = 5.0) -> list:
+def accrue_financing(db, cfg: dict) -> float:
+    """Charge interest on borrowed cash (negative cash balance) for one trading
+    day. Call at most once per trading day. Returns the amount charged."""
+    acct = db.get_sm_account()
+    if not acct or acct["cash"] >= 0:
+        return 0.0
+    bps = float(cfg.get("sector_momentum_sleeve", {}).get("financing_bps", 400.0))
+    cost = -acct["cash"] * bps / 1e4 / 252
+    db.adjust_sm_cash(-cost, realized_pnl_delta=-cost)
+    return cost
+
+
+def rebalance(db, cfg: dict, targets: dict, prices: dict, date: str = None, cost_bps: float = 5.0,
+              max_gross: float = 1.0) -> list:
     """Move the ledger to `targets` ({ticker: weight of equity}). Sells first so
     the cash exists for the buys. Returns a list of trade dicts."""
     ensure_seeded(db, cfg)
@@ -59,7 +72,8 @@ def rebalance(db, cfg: dict, targets: dict, prices: dict, date: str = None, cost
         buy = w * eq / prices[t] - cur
         px = prices[t] * (1 + slip)
         cash = db.get_sm_account()["cash"]
-        buy = min(buy, cash / px)
+        borrow_room = max(max_gross - 1.0, 0.0) * eq            # margin allowed beyond own cash
+        buy = min(buy, (cash + borrow_room) / px)
         if buy * px < MIN_TRADE_FRAC * eq:
             continue
         if t in open_pos:

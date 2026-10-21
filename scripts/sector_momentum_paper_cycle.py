@@ -21,10 +21,10 @@ from rules import sector_momentum as rule
 from storage.database import Database
 
 
-def fetch_closes() -> pd.DataFrame:
+def fetch_closes(universe) -> pd.DataFrame:
     router = MarketDataRouter()
     cols = {}
-    for t in rule.UNIVERSE:
+    for t in universe:
         res = router.get_daily_bars(t)
         if not res:
             raise RuntimeError(f"no daily bars for {t} - check provider keys; not trading on partial data")
@@ -56,8 +56,11 @@ def main():
     if not sc.get("paper_enabled", False):
         print("sector_momentum_sleeve.paper_enabled is false in config.yaml - not running.")
         return
-    closes = fetch_closes()
-    targets = rule.target_weights(closes, n=int(sc.get("top_n", 3)), leverage=float(sc.get("leverage", 1.0)))
+    lev = float(sc.get("leverage", 1.0))
+    blend = sc.get("strategy", "sector") == "blend"
+    closes = fetch_closes(rule.UNIVERSE_BLEND if blend else rule.UNIVERSE)
+    targets = (rule.target_weights_blend(closes, leverage=lev) if blend
+               else rule.target_weights(closes, n=int(sc.get("top_n", 3)), leverage=lev))
     prices = {t: float(closes[t].iloc[-1]) for t in closes}
     date = str(closes.index[-1])[:10]
     print(f"[{date}] target weights: " + ", ".join(f"{t} {w:.0%}" for t, w in targets.items()))
@@ -67,10 +70,13 @@ def main():
     db = Database()
     smp.ensure_seeded(db, cfg)
     if a.force_rebalance or is_month_end(closes) or not db.get_open_sm_positions():
-        for t in smp.rebalance(db, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0))):
+        for t in smp.rebalance(db, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0)),
+                             max_gross=max(lev, 1.0)):
             print(f"  {t['side'].upper()} {t['shares']:.4f} {t['ticker']} @ {t['price']:.2f}")
     else:
         print("not a rebalance day - mark to market only")
+    if date not in {r["as_of_date"] for r in db.get_sm_equity_log()}:     # once per trading day
+        smp.accrue_financing(db, cfg)
     s = smp.snapshot(db, prices)
     db.log_sm_equity(date, s["total_value"], prices["SPY"] if "SPY" in prices else _spy_close())
     if is_month_end(closes):                          # refresh the monthly report on month-end
