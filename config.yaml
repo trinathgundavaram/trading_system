@@ -79,13 +79,15 @@ sector_momentum_sleeve:
   # PAPER only. strategy "blend" = 50% sector momentum + 50% broad 3/6/12m
   # composite (top 8 of 22 ETFs), all T-bills (SHY) when SPY < its 200d SMA,
   # risk positions x `leverage` (rules/sector_momentum.py::target_weights_blend).
-  # Research 2007-2026 at 1.25x: ~11.4% CAGR / ~-23% max drawdown vs SPY
+  # Research 2007-2026 at 2.0x with the 2% band: ~17.8% CAGR / ~-36% max
+  # drawdown (worst year ~-10%) vs SPY
   # 12.3% / -47%; borrowed cash is charged financing_bps. "sector" = the
   # unlevered top-3 sector version.
   paper_enabled: true
   strategy: blend
-  leverage: 1.25
+  leverage: 2.0
   financing_bps: 400.0
+  band_pct: 2.0        # SPY 200d rule hysteresis: on above SMA*1.02, off below SMA*0.98
   paper_starting_cash: 10000
   top_n: 3
   cost_bps: 5.0

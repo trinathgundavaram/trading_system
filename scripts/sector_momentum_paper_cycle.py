@@ -59,7 +59,12 @@ def main():
     lev = float(sc.get("leverage", 1.0))
     blend = sc.get("strategy", "sector") == "blend"
     closes = fetch_closes(rule.UNIVERSE_BLEND if blend else rule.UNIVERSE)
-    targets = (rule.target_weights_blend(closes, leverage=lev) if blend
+    band = float(sc.get("band_pct", 0.0)) / 100.0
+    db = Database()
+    prev = db.get_sm_state("risk_on")
+    prev_on = None if prev is None else prev == "1"
+    new_on = rule.market_state(closes, prev_on, band) if blend else None   # persisted only on a rebalance
+    targets = (rule.target_weights_blend(closes, leverage=lev, risk_on=new_on) if blend
                else rule.target_weights(closes, n=int(sc.get("top_n", 3)), leverage=lev))
     prices = {t: float(closes[t].iloc[-1]) for t in closes}
     date = str(closes.index[-1])[:10]
@@ -67,9 +72,10 @@ def main():
     if a.dry_run:
         print("(--dry-run: no trades)")
         return
-    db = Database()
     smp.ensure_seeded(db, cfg)
     if a.force_rebalance or is_month_end(closes) or not db.get_open_sm_positions():
+        if new_on is not None:
+            db.set_sm_state("risk_on", "1" if new_on else "0")
         for t in smp.rebalance(db, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0)),
                              max_gross=max(lev, 1.0)):
             print(f"  {t['side'].upper()} {t['shares']:.4f} {t['ticker']} @ {t['price']:.2f}")

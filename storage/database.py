@@ -1126,6 +1126,10 @@ class Database:
             updated_at TEXT
         )""")
 
+        conn.execute("""CREATE TABLE IF NOT EXISTS sm_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS sm_equity_log (
             as_of_date TEXT PRIMARY KEY,
             total_value REAL NOT NULL,
@@ -3448,8 +3452,19 @@ class Database:
 
     def reset_sm_account(self):
         with self._conn() as conn:
+            conn.execute("DELETE FROM sm_state")
             conn.execute("DELETE FROM sm_account")
             conn.execute("DELETE FROM sm_positions")
+
+    def get_sm_state(self, key: str, default=None):
+        with self._conn() as conn:
+            row = conn.execute("SELECT value FROM sm_state WHERE key = ?", (key,)).fetchone()
+            return row[0] if row else default
+
+    def set_sm_state(self, key: str, value: str):
+        with self._conn() as conn:
+            conn.execute("""INSERT INTO sm_state (key, value) VALUES (?, ?)
+                            ON CONFLICT (key) DO UPDATE SET value = excluded.value""", (key, value))
 
     def log_sm_equity(self, as_of_date: str, total_value: float, spy_close: float):
         with self._conn() as conn:

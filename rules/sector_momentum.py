@@ -52,12 +52,31 @@ def _broad_composite(closes: pd.DataFrame, top_n: int = 8) -> dict:
     return {t: 1.0 / top_n for t in picks.index}
 
 
-def target_weights_blend(closes: pd.DataFrame, leverage: float = 1.25) -> dict:
-    """Weights as fractions of equity (gross can exceed 1 by up to `leverage`)."""
+def market_state(closes: pd.DataFrame, prev_on, band: float = 0.0) -> bool:
+    """Risk-on/off with hysteresis (research/target_return_study.py buffered_rule).
+    With band=0.02: turn ON only above SMA200*1.02, OFF only below SMA200*0.98,
+    otherwise keep the previous state - cuts whipsaw around the average. The
+    state must be carried from the previous MONTH-END decision (persisted by
+    the caller); with no previous state it is plain price vs SMA200."""
+    spy, sma = float(closes["SPY"].iloc[-1]), float(closes["SPY"].iloc[-200:].mean())
+    if prev_on is None:
+        return spy >= sma
+    if spy > sma * (1 + band):
+        return True
+    if spy < sma * (1 - band):
+        return False
+    return bool(prev_on)
+
+
+def target_weights_blend(closes: pd.DataFrame, leverage: float = 1.25, risk_on=None, band: float = 0.0) -> dict:
+    """Weights as fractions of equity (gross can exceed 1 by up to `leverage`).
+    `risk_on` is the already-decided market state (see market_state()); when
+    omitted it is computed from price vs SMA200 with no memory."""
     if len(closes) < MIN_BARS or any(t not in closes for t in UNIVERSE_BLEND):
         raise ValueError(f"need >= {MIN_BARS} bars for {UNIVERSE_BLEND}; got {len(closes)}")
-    spy = closes["SPY"]
-    if spy.iloc[-1] < spy.iloc[-200:].mean():
+    if risk_on is None:
+        risk_on = market_state(closes, None, band)
+    if not risk_on:
         return {CASH: 1.0}
     a, b = target_weights(closes, leverage=1.0), _broad_composite(closes)
     out = {}

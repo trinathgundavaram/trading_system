@@ -49,13 +49,16 @@ def replay(closes: pd.DataFrame, start, end, cfg: dict):
     days = [d for d in closes.index if pd.Timestamp(start) <= d <= pd.Timestamp(end)]
     month_end = {d for d in days if (d + pd.offsets.BDay(1)).month != d.month}
     curve, log = {}, []
+    band, risk_on = float(sc.get("band_pct", 0.0)) / 100.0, None
     for k, d in enumerate(days):
         prices = {t: float(closes.loc[d, t]) for t in closes.columns}
         if k > 0:
             smp.accrue_financing(db, cfg)
         if k == 0 or d in month_end:
             hist = closes.loc[:d]
-            tw = rule.target_weights_blend(hist, leverage=lev) if blend else rule.target_weights(hist, n=int(sc.get("top_n", 3)), leverage=lev)
+            if blend:
+                risk_on = rule.market_state(hist, risk_on, band)
+            tw = rule.target_weights_blend(hist, leverage=lev, risk_on=risk_on) if blend else rule.target_weights(hist, n=int(sc.get("top_n", 3)), leverage=lev)
             tr = smp.rebalance(db, cfg, tw, prices, date=str(d.date()), cost_bps=float(sc.get("cost_bps", 5.0)), max_gross=max(lev, 1.0))
             log.append((d.date(), "T-bills" if set(tw) == {"SHY"} else "risk-on", len(tr), round(sum(tw.values()), 2)))
         curve[d] = smp.equity(db, prices)
