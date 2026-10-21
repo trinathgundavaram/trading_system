@@ -80,8 +80,7 @@ def rebalance(db, cfg: dict, targets: dict, prices: dict, date: str = None, cost
             p = open_pos[t]
             avg = (p["entry_price"] * p["shares"] + px * buy) / (p["shares"] + buy)
             db.update_sm_position_shares(p["id"], p["shares"] + buy)
-            with db._conn() as conn:
-                conn.execute("UPDATE sm_positions SET entry_price = ? WHERE id = ?", (avg, p["id"]))
+            db.update_sm_position_entry_price(p["id"], avg)
         else:
             db.open_sm_position(t, date, px, buy)
         db.adjust_sm_cash(-buy * px)

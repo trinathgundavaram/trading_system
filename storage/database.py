@@ -3434,6 +3434,11 @@ class Database:
             conn.execute("UPDATE sm_positions SET shares = ?, updated_at = ? WHERE id = ?",
                          (shares, datetime.utcnow().isoformat(), position_id))
 
+    def update_sm_position_entry_price(self, position_id: int, entry_price: float):
+        with self._conn() as conn:
+            conn.execute("UPDATE sm_positions SET entry_price = ?, updated_at = ? WHERE id = ?",
+                         (entry_price, datetime.utcnow().isoformat(), position_id))
+
     def close_sm_position(self, position_id: int, exit_date: str, exit_price: float, realized_pnl: float):
         with self._conn() as conn:
             conn.execute(

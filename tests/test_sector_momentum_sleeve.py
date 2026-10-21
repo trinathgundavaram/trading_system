@@ -41,6 +41,7 @@ class FakeDb:
     def open_sm_position(self, t, d, px, sh):
         self._id += 1; self.pos.append({"id": self._id, "ticker": t, "status": "open", "entry_price": px, "shares": sh}); return self._id
     def update_sm_position_shares(self, i, sh): next(p for p in self.pos if p["id"] == i)["shares"] = sh
+    def update_sm_position_entry_price(self, i, px): next(p for p in self.pos if p["id"] == i)["entry_price"] = px
     def close_sm_position(self, i, d, px, pnl): next(p for p in self.pos if p["id"] == i)["status"] = "closed"
 
 
