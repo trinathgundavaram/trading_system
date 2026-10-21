@@ -1,6 +1,6 @@
 """Point-in-time S&P 500 membership + price loader for the stock-momentum test.
 
-Membership: research/reference/sp500_membership.csv (ticker,start_date,end_date),
+Membership: data/sp500_membership.csv (ticker,start_date,end_date),
 from github.com/fja05680/sp500 (MIT) - a ticker is a member from start_date until
 end_date (blank = still a member). A ticker can appear in several intervals.
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-MEMBERSHIP = Path(__file__).resolve().parent / "reference" / "sp500_membership.csv"
+MEMBERSHIP = Path(__file__).resolve().parent.parent / "data" / "sp500_membership.csv"
 CACHE = Path(__file__).resolve().parent / "cache" / "sp500_prices.pkl"
 
 

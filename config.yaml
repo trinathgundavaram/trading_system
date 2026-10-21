@@ -89,6 +89,20 @@ sector_momentum_sleeve:
   paper_starting_cash: 10000
   top_n: 3
   cost_bps: 5.0
+stock_momentum_sleeve:
+  # PAPER only. Top N S&P 500 stocks by 3/6/12-month momentum, equal weight,
+  # monthly; T-bills (SHY) when SPY is risk-off (same 200d rule + band as the
+  # ETF sleeve). rules/stock_momentum.py. Research (point-in-time membership,
+  # only ~63% price coverage so optimistic): ~11.7% CAGR / ~-21% drawdown at
+  # 1.0x; ~8% at 50 bps costs. Universe: data/sp500_membership.csv (refresh it
+  # quarterly - see data/README.md).
+  paper_enabled: true
+  paper_starting_cash: 10000
+  top_n: 40
+  leverage: 1.0
+  band_pct: 2.0
+  cost_bps: 5.0
+  financing_bps: 400.0
 tradingagents_advisor:
   # TauricResearch/TradingAgents as an ADVISORY rating logger (never trades).
   # Needs a local install of the repo and ANTHROPIC_API_KEY in the environment.

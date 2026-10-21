@@ -12,11 +12,11 @@ logger = logging.getLogger("trading")
 MIN_TRADE_FRAC = 0.01     # ignore rebalance deltas below 1% of equity
 
 
-def ensure_seeded(db, cfg: dict) -> dict:
+def ensure_seeded(db, cfg: dict, section: str = "sector_momentum_sleeve") -> dict:
     account = db.get_sm_account()
     if account:
         return account
-    cash = float(cfg.get("sector_momentum_sleeve", {}).get("paper_starting_cash", 10000.0))
+    cash = float(cfg.get(section, {}).get("paper_starting_cash", 10000.0))
     logger.info(f"Sector-momentum sleeve paper account seeded: ${cash:.2f}")
     return db.init_sm_account(cash)
 
@@ -27,23 +27,23 @@ def equity(db, prices: dict) -> float:
                               if p["ticker"] in prices)
 
 
-def accrue_financing(db, cfg: dict) -> float:
+def accrue_financing(db, cfg: dict, section: str = "sector_momentum_sleeve") -> float:
     """Charge interest on borrowed cash (negative cash balance) for one trading
     day. Call at most once per trading day. Returns the amount charged."""
     acct = db.get_sm_account()
     if not acct or acct["cash"] >= 0:
         return 0.0
-    bps = float(cfg.get("sector_momentum_sleeve", {}).get("financing_bps", 400.0))
+    bps = float(cfg.get(section, {}).get("financing_bps", 400.0))
     cost = -acct["cash"] * bps / 1e4 / 252
     db.adjust_sm_cash(-cost, realized_pnl_delta=-cost)
     return cost
 
 
 def rebalance(db, cfg: dict, targets: dict, prices: dict, date: str = None, cost_bps: float = 5.0,
-              max_gross: float = 1.0) -> list:
+              max_gross: float = 1.0, section: str = "sector_momentum_sleeve") -> list:
     """Move the ledger to `targets` ({ticker: weight of equity}). Sells first so
     the cash exists for the buys. Returns a list of trade dicts."""
-    ensure_seeded(db, cfg)
+    ensure_seeded(db, cfg, section)
     date = date or datetime.now(timezone.utc).date().isoformat()
     open_pos = {p["ticker"]: p for p in db.get_open_sm_positions()}
     missing = [t for t in set(targets) | set(open_pos) if not prices.get(t)]

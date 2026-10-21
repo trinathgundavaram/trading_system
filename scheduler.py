@@ -2109,6 +2109,23 @@ def run_sector_momentum_cycle():
         logger.error(f"Sector momentum cycle failed: {e}")
 
 
+def run_stock_momentum_cycle():
+    """Daily stock-momentum PAPER sleeve (scripts/stock_momentum_paper_cycle.py), own
+    ledger, child process. Gated by stock_momentum_sleeve.paper_enabled. Month-end runs
+    download ~500 tickers, so the timeout is generous."""
+    import subprocess
+    try:
+        if not load_config().get("stock_momentum_sleeve", {}).get("paper_enabled", False):
+            logger.info("Stock momentum sleeve: paper_enabled is false - skipping")
+            return
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "stock_momentum_paper_cycle.py")
+        r = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=1200)
+        log = logger.info if r.returncode == 0 else logger.error
+        log(f"Stock momentum cycle exit={r.returncode}: {(r.stdout or '').strip()[-500:]} {(r.stderr or '').strip()[-500:]}")
+    except Exception as e:
+        logger.error(f"Stock momentum cycle failed: {e}")
+
+
 def run_tradingagents_cycle():
     """Daily TradingAgents ADVISORY run (scripts/tradingagents_paper_cycle.py):
     logs ratings only, never trades. Gated by tradingagents_advisor.enabled."""
@@ -2166,6 +2183,10 @@ def start():
         id="sector_momentum_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
 
+    scheduler.add_job(
+        run_stock_momentum_cycle, "cron", day_of_week="mon-fri", hour=16, minute=20,
+        id="stock_momentum_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
+    )
     scheduler.add_job(
         run_tradingagents_cycle, "cron", day_of_week="mon-fri", hour=16, minute=30,
         id="tradingagents_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,

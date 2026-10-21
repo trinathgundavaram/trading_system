@@ -1064,7 +1064,7 @@ function ovCountUp(node, to, fmt) {
 
 function ovLineChart(c) {
   const W = 760, H = 270, L = 44, R = 14, T = 12, B = 26;
-  const series = [["sleeve", "Sector momentum", OV_COLORS[0]], ["spy", "SPY", OV_COLORS[7]], ["swing", "Swing engine", OV_COLORS[2]]]
+  const series = [["sleeve", "Sector momentum", OV_COLORS[0]], ["stock", "Stock momentum", OV_COLORS[1]], ["spy", "SPY", OV_COLORS[7]], ["swing", "Swing engine", OV_COLORS[2]]]
     .filter(([k]) => (c[k] || []).length > 1);
   if (!c.dates || c.dates.length < 2 || !series.length)
     return `<div class="ov-empty">Collecting data — the first daily mark is logged after today's close (16:15 ET).<br>
@@ -1125,6 +1125,21 @@ function ovGauge(m) {
       <div class="spy" style="left:${pos(m.spy)}"><b>SPY ${m.spy.toFixed(0)}</b></div></div>`;
 }
 
+function ovStockPanel(sk) {
+  if (!sk || !sk.account) return "";
+  const a = sk.account, top = sk.positions.slice(0, 10), more = sk.positions.length - top.length;
+  return `<div class="panel"><div class="panel-head">${svg("positions", 15)}<span class="panel-title">Stock momentum · top ${sk.top_n} S&amp;P 500 (paper)</span><span class="fill"></span>
+      <span class="pill ${a.return_pct >= 0 ? "pill-green" : "pill-red"}">${ovPct(a.return_pct, 2)}</span></div>
+    <div class="ov-note" style="margin-bottom:8px"><b>${ovUSD(a.equity)}</b> · ${sk.positions.length} holdings equal-weighted (~${(100 / sk.top_n).toFixed(1)}% each) ·
+      ${sk.market ? (sk.market.risk_on ? "risk-on" : "risk-off, in T-bills") : "waiting for the first run"} · rebalances at month-end.
+      The backtest for this sleeve is optimistic (only ~63% of historical index members had price data).</div>
+    <div class="table-wrap"><table class="ov-cmp" data-no-enhance><thead><tr><th>Ticker</th><th class="num">Weight</th><th class="num">Value</th><th class="num">P&amp;L</th></tr></thead><tbody>
+      ${top.map(p => `<tr><td><b>${p.ticker}</b></td><td class="num">${(p.weight * 100).toFixed(1)}%</td><td class="num">${ovUSD(p.value)}</td>
+        <td class="num ${ovCls(p.pnl)}">${ovUSD(p.pnl)} <span class="subtle">${ovPct(p.pnl_pct)}</span></td></tr>`).join("")}
+      ${more > 0 ? `<tr><td colspan="4" class="subtle">+ ${more} more holdings</td></tr>` : ""}
+    </tbody></table></div></div>`;
+}
+
 function ovDriftPanel(dr) {
   if (!dr) return "";
   const L = { ok: ["pill-green", "On track"], watch: ["pill-yellow", "Watch"], alert: ["pill-red", "Alert"], collecting: ["pill-blue", "Collecting data"] };
@@ -1180,6 +1195,7 @@ async function paintOverview(el, quiet) {
     </div>
 
     ${ovDriftPanel(d.drift)}
+    ${ovStockPanel(d.stock)}
 
     <div class="ov-row">
       <div class="panel"><div class="panel-head">${svg("performance", 15)}<span class="panel-title">Growth of 100 — strategies vs SPY</span></div>${ovLineChart(d.curves)}</div>
@@ -1211,6 +1227,8 @@ async function paintOverview(el, quiet) {
       <div class="table-wrap"><table class="ov-cmp" data-no-enhance><thead><tr><th>Strategy</th><th class="num">Return</th><th class="num">Max drawdown</th><th>How it works</th></tr></thead><tbody>
         ${cmpRow("Sector momentum", `<span class="pill pill-green">paper</span>`, st.sleeve_total, st.sleeve_dd,
           `${d.strategy === "blend" ? "Sector + broad 3/6/12m momentum" : "Top-3 sectors"} · ${d.leverage}× · monthly · T-bills when SPY &lt; 200d`)}
+        ${d.stock && d.stock.account ? cmpRow("Stock momentum", `<span class="pill pill-green">paper</span>`, st.stock_total, st.stock_dd,
+          `Top ${d.stock.top_n} S&amp;P 500 stocks · ${d.stock.leverage}× · monthly · T-bills when SPY &lt; 200d`) : ""}
         ${sw ? cmpRow("Swing engine", `<span class="pill pill-yellow">${sw.mode || "paper"}</span>`, swingRet, st.swing_dd,
           `Scans every ${sw.scan_minutes || "?"} min · ${sw.open || 0} open · realized ${ovUSD(sw.realized_pnl)}`) : ""}
         ${cmpRow("SPY (benchmark)", `<span class="pill pill-neutral">buy &amp; hold</span>`, st.spy_total, st.spy_dd, "The bar to beat")}
