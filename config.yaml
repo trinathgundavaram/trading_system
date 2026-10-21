@@ -82,7 +82,7 @@ sector_momentum_sleeve:
   # Research 2007-2026 at 1.25x: ~11.4% CAGR / ~-23% max drawdown vs SPY
   # 12.3% / -47%; borrowed cash is charged financing_bps. "sector" = the
   # unlevered top-3 sector version.
-  paper_enabled: false
+  paper_enabled: true
   strategy: blend
   leverage: 1.25
   financing_bps: 400.0
