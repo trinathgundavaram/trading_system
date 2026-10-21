@@ -234,3 +234,23 @@ def db(pg_dsn, monkeypatch):
         except Exception:
             pass
         database._POOL = None
+
+
+@pytest.fixture(autouse=True)
+def _no_real_alerts(monkeypatch):
+    """Tests that exercise the automatic kill switch reach
+    engine.notifications.send_critical("TRADING HALTED", ...), whose desktop
+    and webhook transports pop a real notification (and post to
+    NOTIFY_WEBHOOK_URL) on whoever ran the suite - including every pre-commit
+    hook run. That produced "trading halted" alerts on a machine whose kill
+    switch had never tripped. Neutralise only the two outbound transports; the
+    chain and the log transport still run, so tests of send_critical itself
+    keep working."""
+    import engine.notifications as notifications
+    sent = []
+    for name in ("desktop", "webhook"):
+        if name in notifications.TRANSPORTS:
+            monkeypatch.setitem(notifications.TRANSPORTS, name,
+                                lambda t, m, *a, _n=name, **k: sent.append((_n, t)) and False)
+    monkeypatch.delenv("NOTIFY_WEBHOOK_URL", raising=False)
+    yield sent
