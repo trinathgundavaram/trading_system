@@ -127,10 +127,10 @@ def _default_disk_dir():
 cache = TTLCache()
 
 # TTL constants (seconds)
-TTL_FEAR_GREED = 900   # 15 min
+TTL_FEAR_GREED = 1800  # 30 min (was 15: equal to the scan interval, so it expired just before every cycle and re-spawned its MCP server each time)
 TTL_FRED = 3600        # 60 min
 TTL_VIX = 300          # 5 min
-TTL_SECTOR = 900       # 15 min
+TTL_SECTOR = 1800      # 30 min (same boundary problem as TTL_FEAR_GREED; sector rotation moves slowly)
 TTL_CALENDAR = 3600    # 60 min
 TTL_TICKER = 300       # 5 min per ticker
 # 2026-07-16 (cycle-overrun fix): lite screener-candidate analyses get a
@@ -140,5 +140,5 @@ TTL_TICKER = 300       # 5 min per ticker
 # phase-2 promotion path still does a FULL fresh fetch for anything near the
 # buy bar, so no trade decision rides on a stale lite quote.
 TTL_TICKER_LITE = 600  # 10 min for lite (bars/quote/info-only) results
-TTL_FINVIZ = 900       # 15 min
+TTL_FINVIZ = 1500      # 25 min (was 15 = the scan interval)
 TTL_MAVERICK = 300     # 5 min
