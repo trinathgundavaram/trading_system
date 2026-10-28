@@ -304,11 +304,21 @@ def run_screener(cfg: dict, mode: str = "swing", regime=None) -> ScreenerResult:
         # as failed and the cycle carries on with the others.
         import time as _time
         from concurrent.futures import TimeoutError as _FutTimeout
-        budget = float(scfg.get("source_timeout_seconds", 60))
+        budget = float(scfg.get("source_timeout_seconds", 90))
+
+        def _timed(fn, source):
+            """Log how long each source takes - the screener stage dominates a cycle (~3 min)
+            and until now there was no way to see which source was responsible."""
+            def run(params):
+                t0 = _time.monotonic()
+                out = fn(params)
+                logger.info(f"screener source '{source}' took {_time.monotonic() - t0:.1f}s ({len(out or [])} candidates)")
+                return out
+            return run
         ex = ThreadPoolExecutor(max_workers=min(8, len(to_run)))
         try:
             futures = {
-                ex.submit(fn, params): source
+                ex.submit(_timed(fn, source), params): source
                 for source, (fn, params) in to_run.items()
             }
             deadline = _time.monotonic() + budget
