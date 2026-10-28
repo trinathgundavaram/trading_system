@@ -139,7 +139,11 @@ screener:
     pre_market_movers:
       enabled: true
     sector_leaders:
-      enabled: true
+      # DISABLED 2026-10-28: yfinance_get_top now returns industries with company NAMES
+      # (no ticker symbols), so this source yielded 0 candidates while spending ~80s
+      # (11 sequential MCP calls) of every scan cycle. Re-enable only after the parser in
+      # engine/screener.py::_screen_sector_leaders maps names to tickers.
+      enabled: false
       top_n_per_sector: 3
     universe_sweep:
       enabled: true
