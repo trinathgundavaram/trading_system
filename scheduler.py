@@ -2174,10 +2174,39 @@ def _scheduler_watchdog(scheduler, interval: float = 20.0, jump_threshold: float
             logger.error(f"scheduler watchdog error: {e}")
 
 
+_scheduler_lock_fh = None
+
+
+def _acquire_scheduler_lock(path=None) -> bool:
+    """Single-instance guard. Two schedulers (e.g. the launchd service AND a terminal
+    `./run.sh`, whose dashboard runs the scheduler in-process) fire every cron job twice:
+    duplicate sleeve runs, doubled log lines, overlapping cycles fighting over the
+    interlock. The first scheduler takes an exclusive file lock; later ones decline."""
+    import fcntl
+    global _scheduler_lock_fh
+    from storage.paths import output_dir
+    path = path or os.path.join(str(output_dir()), "scheduler.lock")
+    fh = open(path, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.seek(0)
+        holder = fh.read().strip() or "unknown pid"
+        fh.close()
+        logger.error(f"another scheduler is already running ({holder}) - this one will NOT start. "
+                     f"Stop the other (or use `main.py --ui` for the dashboard alone).")
+        return False
+    fh.seek(0); fh.truncate(); fh.write(f"pid {os.getpid()}\n"); fh.flush()
+    _scheduler_lock_fh = fh                    # held for the life of the process
+    return True
+
+
 def start():
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_SCHEDULER_STARTED
 
+    if not _acquire_scheduler_lock():
+        return
     _log_startup_health_check()
     cfg = load_config()
 

@@ -59,3 +59,12 @@ def test_screener_source_timeout_does_not_block_the_cycle(monkeypatch):
     result = screener.run_screener(cfg, mode="swing")
     assert time.monotonic() - t0 < 4.0
     assert "timed out" in result.sources_failed.get("rs_gainers", "")
+
+
+def test_second_scheduler_is_refused_by_the_lock(tmp_path):
+    import scheduler
+    path = str(tmp_path / "s.lock")
+    assert scheduler._acquire_scheduler_lock(path) is True
+    assert scheduler._acquire_scheduler_lock(path) is False      # another holder: decline
+    scheduler._scheduler_lock_fh.close()                          # release for other tests
+    scheduler._scheduler_lock_fh = None
