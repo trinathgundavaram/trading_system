@@ -89,6 +89,55 @@ def _stock_view(db, cfg: dict):
     return view, led.get_sm_equity_log()
 
 
+def scheduler_health(db, cfg: dict, now=None) -> dict:
+    """Is the swing scan loop alive? Silent staleness (laptop asleep, scheduler wedged) went
+    unnoticed for a week because nothing on screen said so. Status: running (a cycle is in
+    progress), ok (a cycle finished recently or the market is closed), stale (market open
+    and no cycle for well over two scan intervals)."""
+    import sqlite3
+    from datetime import datetime
+    now = now or datetime.utcnow()
+    st = db.get_cycle_status() or {}
+    last_ts = None
+    try:
+        with db._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT timestamp, triggered_by, duration FROM cycles WHERE blocked = 0 ORDER BY id DESC LIMIT 1").fetchone()
+            if row:
+                last_ts, last_by, last_dur = row["timestamp"], row["triggered_by"], row["duration"]
+    except Exception:
+        pass
+    minutes_since = None
+    if last_ts:
+        try:
+            minutes_since = (now - datetime.fromisoformat(last_ts)).total_seconds() / 60
+        except Exception:
+            pass
+    interval = float(cfg.get("trading", {}).get("day_trade_scan_interval_minutes")
+                     or cfg.get("trading", {}).get("scan_interval_minutes") or 15)
+    try:
+        from scheduler import is_market_open
+        market_open = bool(is_market_open(cfg))
+    except Exception:
+        market_open = None
+    elapsed = None
+    if st.get("is_running") and st.get("started_at"):
+        try:
+            elapsed = (now - datetime.fromisoformat(st["started_at"])).total_seconds()
+        except Exception:
+            pass
+    if st.get("is_running"):
+        status = "running"
+    elif market_open and (minutes_since is None or minutes_since > 2 * interval + 5):
+        status = "stale"
+    else:
+        status = "ok"
+    return {"status": status, "stage": st.get("stage"), "elapsed_s": elapsed, "market_open": market_open,
+            "minutes_since_last": minutes_since, "last_triggered_by": last_by if last_ts else None,
+            "last_duration_s": last_dur if last_ts else None, "interval_min": interval,
+            "hard_limit_min": float(cfg.get("trading", {}).get("hard_kill_minutes", 15))}
+
+
 def build(db, cfg: dict, today: date = None) -> dict:
     today = today or date.today()
     sc = cfg.get("sector_momentum_sleeve", {})
@@ -159,7 +208,11 @@ def build(db, cfg: dict, today: date = None) -> dict:
         drift = sleeve_drift.evaluate(sleeve_rows, account, cfg, today=today)
     except Exception as e:                          # a monitor must never break the page
         drift = {"status": "watch", "checks": [{"name": "Monitor", "status": "watch", "message": f"drift check failed: {e}"}]}
-    return {"stock": stock, "drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
+    try:
+        sched = scheduler_health(db, cfg)
+    except Exception as e:
+        sched = {"status": "ok", "error": str(e)}
+    return {"scheduler": sched, "stock": stock, "drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
             "leverage": sc.get("leverage", 1.0), "band_pct": sc.get("band_pct", 0.0),
             "account": account, "positions": positions, "market": market, "targets": targets,
             "curves": curves, "stats": stats, "swing": swing, "rsi2": rsi2,

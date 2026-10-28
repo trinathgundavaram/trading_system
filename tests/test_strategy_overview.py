@@ -40,3 +40,38 @@ def test_next_month_end_skips_weekends_and_rolls_over():
     assert so.next_month_end(date(2026, 10, 20)) == "2026-10-30"      # Oct 31 is a Saturday
     assert so.next_month_end(date(2026, 10, 30)) == "2026-10-30"
     assert so.next_month_end(date(2026, 10, 31)) == "2026-11-30"
+
+
+class _SchedDb:
+    def __init__(self, running=False, last_minutes_ago=3.0):
+        from datetime import datetime, timedelta
+        self.running = running
+        self.last = (datetime.utcnow() - timedelta(minutes=last_minutes_ago)).isoformat()
+        self.start = datetime.utcnow().isoformat()
+
+    def get_cycle_status(self): return {"is_running": self.running, "stage": "screener", "started_at": self.start}
+
+    def _conn(self):
+        import contextlib
+        last = self.last
+
+        class _C:
+            row_factory = None
+            def execute(self, *a, **k):
+                class R:
+                    def fetchone(_s): return {"timestamp": last, "triggered_by": "scheduler", "duration": 200.0}
+                return R()
+        @contextlib.contextmanager
+        def cm(): yield _C()
+        return cm()
+
+
+def test_scheduler_health_statuses(monkeypatch):
+    import scheduler
+    cfg = {"trading": {"day_trade_scan_interval_minutes": 15, "hard_kill_minutes": 15}}
+    monkeypatch.setattr(scheduler, "is_market_open", lambda c: True)
+    assert so.scheduler_health(_SchedDb(running=True), cfg)["status"] == "running"
+    assert so.scheduler_health(_SchedDb(last_minutes_ago=10), cfg)["status"] == "ok"
+    assert so.scheduler_health(_SchedDb(last_minutes_ago=90), cfg)["status"] == "stale"      # market open, silent > 2 intervals
+    monkeypatch.setattr(scheduler, "is_market_open", lambda c: False)
+    assert so.scheduler_health(_SchedDb(last_minutes_ago=600), cfg)["status"] == "ok"        # closed market: quiet is normal

@@ -1141,6 +1141,21 @@ function ovStockPanel(sk) {
     </tbody></table></div></div>`;
 }
 
+function ovSchedPill(sc) {
+  if (!sc) return "";
+  const m = { running: ["pill-blue", "Cycle running"], ok: ["pill-green", "Scheduler OK"], stale: ["pill-red", "No recent cycle"] }[sc.status] || ["pill-neutral", sc.status];
+  return `<span class="pill ${m[0]}">${m[1]}</span>`;
+}
+function ovSchedNote(sc) {
+  if (!sc) return "";
+  const mins = v => v == null ? "—" : v < 90 ? `${Math.round(v)} min` : `${(v / 60).toFixed(1)} h`;
+  let t;
+  if (sc.status === "running") t = `A scan cycle is running (${sc.stage || "starting"}, ${Math.round(sc.elapsed_s || 0)}s of a ${sc.hard_limit_min}-minute limit).`;
+  else if (sc.status === "stale") t = `<b>No scan cycle for ${mins(sc.minutes_since_last)} while the market is open</b> (expected every ${sc.interval_min} min). If the Mac was asleep or the scheduler stopped, restart it: <code>launchctl kickstart -k gui/$(id -u)/com.tradingplatform.scheduler</code>.`;
+  else t = `Last scan cycle ${mins(sc.minutes_since_last)} ago (${sc.last_triggered_by || "—"}${sc.last_duration_s ? `, took ${Math.round(sc.last_duration_s / 60 * 10) / 10} min` : ""}); scans every ${sc.interval_min} min while the market is open${sc.market_open === false ? " (market closed now)" : ""}.`;
+  return `<div class="ov-note" style="margin-bottom:8px">${t}</div>`;
+}
+
 function ovDriftPanel(dr) {
   if (!dr) return "";
   const L = { ok: ["pill-green", "On track"], watch: ["pill-yellow", "Watch"], alert: ["pill-red", "Alert"], collecting: ["pill-blue", "Collecting data"] };
@@ -1217,7 +1232,8 @@ async function paintOverview(el, quiet) {
         Between them it keeps its last decision, which avoids flip-flopping around the average.</div></div>
     </div>
 
-    <div class="panel"><div class="panel-head">${svg("monitor", 15)}<span class="panel-title">Schedule</span></div>
+    <div class="panel"><div class="panel-head">${svg("monitor", 15)}<span class="panel-title">Schedule</span><span class="fill"></span>${ovSchedPill(d.scheduler)}</div>
+      ${ovSchedNote(d.scheduler)}
       <div class="table-wrap"><table class="ov-cmp" data-no-enhance><thead><tr><th>Job</th><th>When</th><th>Status</th><th>What it does</th></tr></thead><tbody>
         ${(d.jobs || []).map(j => `<tr><td><b>${j.name}</b></td><td>${j.when}</td>
           <td>${j.enabled ? `<span class="pill pill-green">on</span>` : `<span class="pill pill-neutral">off</span>`}${j.last ? ` <span class="subtle">last ${j.last}</span>` : ""}</td>
