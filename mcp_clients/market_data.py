@@ -1012,8 +1012,8 @@ class FinanceQueryProvider:
                     except (TypeError, ValueError):
                         continue
                 return [r for r in out if r["ticker"]]
-            result = {"gainers": _rows("day_gainers"),
-                      "most_active": _rows("most_actives")}
+            result = {"gainers": _rows("day-gainers"),          # Yahoo screener ids are hyphenated (underscores 400)
+                      "most_active": _rows("most-actives")}
             ok = bool(result["gainers"] or result["most_active"])
             self.breaker.record(ok, error="" if ok else "empty screener response")
             if ok:

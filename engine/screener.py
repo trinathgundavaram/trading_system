@@ -296,21 +296,37 @@ def run_screener(cfg: dict, mode: str = "swing", regime=None) -> ScreenerResult:
 
     candidates_by_source = {}
     if to_run:
-        with ThreadPoolExecutor(max_workers=min(8, len(to_run))) as ex:
+        # 2026-10-28: this used to be `with ThreadPoolExecutor(...)` + future.result()
+        # with NO timeout - one source stuck on a network call froze the whole cycle
+        # in its "screener" stage until the supervisor's 15-minute kill, and the `with`
+        # block would have waited for the stuck thread even if result() had timed out.
+        # Each source now gets a shared deadline; a source that misses it is recorded
+        # as failed and the cycle carries on with the others.
+        import time as _time
+        from concurrent.futures import TimeoutError as _FutTimeout
+        budget = float(scfg.get("source_timeout_seconds", 60))
+        ex = ThreadPoolExecutor(max_workers=min(8, len(to_run)))
+        try:
             futures = {
                 ex.submit(fn, params): source
                 for source, (fn, params) in to_run.items()
             }
+            deadline = _time.monotonic() + budget
             for future in futures:
                 source = futures[future]
                 try:
-                    candidates = future.result() or []
+                    candidates = future.result(timeout=max(0.5, deadline - _time.monotonic())) or []
                     candidates_by_source[source] = candidates
                     if candidates:
                         result.sources_used.append(source)
+                except _FutTimeout:
+                    logger.error(f"Screener source '{source}' timed out after {budget:.0f}s - skipped this cycle")
+                    result.sources_failed[source] = f"timed out after {budget:.0f}s"
                 except Exception as e:
                     logger.error(f"Screener source '{source}' failed: {e}", exc_info=True)
                     result.sources_failed[source] = str(e)
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
     all_candidates = [c for cs in candidates_by_source.values() for c in cs]
     filtered = _pre_filter(all_candidates, cfg, mode)

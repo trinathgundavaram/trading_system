@@ -400,7 +400,7 @@ class LaunchdManager(ServiceManager):
         if name == "scheduler":
             caffeinate = shutil.which("caffeinate")
             if caffeinate:
-                cmd = [caffeinate, "-i", *cmd]
+                cmd = [caffeinate, "-i", "-s", *cmd]      # -s: also no system sleep while on AC power
         args = "".join(f"<string>{self._xml(a)}</string>" for a in cmd)
         envs = "".join(f"<key>{self._xml(k)}</key><string>{self._xml(v)}</string>"
                        for k, v in env.items())

@@ -39,6 +39,17 @@ def _spy_close() -> float:
     return float(pd.DataFrame(bars).sort_values("date")["close"].iloc[-1])
 
 
+def needs_rebalance(last_date: str, last_rebalance) -> bool:
+    """True if a month-end has passed since the last rebalance - a CATCH-UP rule, so a
+    month-end run that never happened (laptop asleep, scheduler down) is made up on the
+    next run instead of being skipped for a whole month. The 4-day tolerance absorbs a
+    month whose last weekday is a market holiday (the real rebalance was a day earlier)."""
+    if not last_rebalance:
+        return True
+    month_end = pd.offsets.BMonthEnd().rollback(pd.Timestamp(last_date).normalize())
+    return pd.Timestamp(last_rebalance) < month_end - pd.Timedelta(days=4)
+
+
 def is_month_end(closes: pd.DataFrame) -> bool:
     """True if the latest bar is the final trading day of its month (the next
     business day falls in a different month)."""
@@ -73,7 +84,9 @@ def main():
         print("(--dry-run: no trades)")
         return
     smp.ensure_seeded(db, cfg)
-    if a.force_rebalance or is_month_end(closes) or not db.get_open_sm_positions():
+    if (a.force_rebalance or is_month_end(closes) or not db.get_open_sm_positions()
+            or needs_rebalance(date, db.get_sm_state("last_rebalance"))):
+        db.set_sm_state("last_rebalance", date)
         if new_on is not None:
             db.set_sm_state("risk_on", "1" if new_on else "0")
         for t in smp.rebalance(db, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0)),

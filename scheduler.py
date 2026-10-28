@@ -2142,6 +2142,38 @@ def run_tradingagents_cycle():
         logger.error(f"TradingAgents cycle failed: {e}")
 
 
+def _scheduler_watchdog(scheduler, interval: float = 20.0, jump_threshold: float = 45.0):
+    """Wake the scheduler after a laptop sleep or any stall.
+
+    APScheduler waits for the next run time on a MONOTONIC timer, and on macOS the
+    monotonic clock does not advance while the machine sleeps. A Mac that sleeps
+    for six days therefore keeps waiting for "tomorrow 09:00" until it has been
+    AWAKE for the original number of hours - observed 2026-10-21..28: the process
+    was alive and healthy, and not one scheduled cycle fired for a week.
+
+    Every `interval` seconds this compares wall-clock time with monotonic time; a
+    jump means the machine slept. It also checks for any job whose next run time is
+    already in the past. Either way it calls scheduler.wakeup(), which makes the
+    scheduler recompute and run what is due right now."""
+    last_wall, last_mono = time.time(), time.monotonic()
+    while True:
+        time.sleep(interval)
+        wall, mono = time.time(), time.monotonic()
+        jump = (wall - last_wall) - (mono - last_mono)
+        last_wall, last_mono = wall, mono
+        try:
+            now = datetime.now(ET)
+            overdue = [j.id for j in scheduler.get_jobs()
+                       if getattr(j, "next_run_time", None) and (now - j.next_run_time).total_seconds() > 5]
+            if jump > jump_threshold or overdue:
+                logger.warning(f"scheduler watchdog: "
+                               f"{'machine slept ~%d min; ' % (jump / 60) if jump > jump_threshold else ''}"
+                               f"{'overdue jobs ' + str(overdue) + '; ' if overdue else ''}waking the scheduler")
+                scheduler.wakeup()
+        except Exception as e:                      # the watchdog must never die
+            logger.error(f"scheduler watchdog error: {e}")
+
+
 def start():
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_SCHEDULER_STARTED
@@ -2168,9 +2200,16 @@ def start():
     # dropped. The DB-level interlock in run_cycle() prevents them from executing
     # if a cycle is already running, so queued slots will execute in FIFO order
     # after the current one completes (not stack up or run concurrently).
+    # 2026-10-28 (a week of silently skipped scans): the comment above promised
+    # queued catch-up, but with APScheduler's DEFAULT misfire_grace_time of 1s a
+    # slot that fires even a moment late is simply DROPPED ("Run time ... was
+    # missed"), and coalesce=False only multiplies the noise after a wake-up.
+    # A slot delayed by up to 10 minutes (laptop wake, a long previous cycle) now
+    # still runs, once (coalesce=True); the DB interlock in run_cycle() keeps two
+    # cycles from overlapping.
     scheduler.add_job(
         run_cycle, "cron", day_of_week="mon-fri", hour="9-16", minute=f"*/{interval}",
-        id="trading_cycle", max_instances=1, coalesce=False,
+        id="trading_cycle", max_instances=1, coalesce=True, misfire_grace_time=600,
     )
 
     scheduler.add_job(
@@ -2223,8 +2262,32 @@ def start():
     # never blocks shutdown.
     threading.Thread(target=_price_watch_loop, daemon=True, name="price-watch").start()
 
-    run_cycle()  # run immediately on start
+    # The immediate cycle used to run HERE, synchronously, before scheduler.start():
+    # up to 15 minutes during which no cron job (including the sleeve marks) could
+    # fire, and a hang meant the scheduler never started at all. It now runs in
+    # its own thread; the DB interlock keeps it from overlapping a scheduled slot.
+    threading.Thread(target=run_cycle, daemon=True, name="startup-cycle").start()
+    threading.Thread(target=_scheduler_watchdog, args=(scheduler,), daemon=True, name="scheduler-watchdog").start()
     scheduler.start()
+
+
+def _install_hang_diagnostics():
+    """A hung cycle used to be killed with nothing in the log about WHERE it hung.
+    (1) kill -USR1 <pid> dumps every thread's stack to scheduler.log on demand;
+    (2) the same dump fires automatically ~45s before the hard-kill ceiling, so a
+    cycle the supervisor is about to kill leaves its own post-mortem behind."""
+    import faulthandler
+    import signal as _signal
+    try:
+        from storage.log_setup import LOG_DIR
+        f = open(os.path.join(LOG_DIR, "scheduler.log"), "a", buffering=1)
+        globals()["_hang_dump_file"] = f                        # keep it open for the process lifetime
+        faulthandler.register(_signal.SIGUSR1, file=f, all_threads=True)
+        limit = float(load_config().get("trading", {}).get("hard_kill_minutes", 15)) * 60
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} CYCLE-HANG-DIAGNOSTICS armed: stack dump in {max(30.0, limit - 45):.0f}s if this cycle is still running\n")
+        faulthandler.dump_traceback_later(max(30.0, limit - 45), repeat=False, file=f)
+    except Exception as e:
+        logger.warning(f"could not install hang diagnostics: {e}")
 
 
 def _run_once_cli():
@@ -2242,7 +2305,21 @@ def _run_once_cli():
     (run_supervised) already owns that around this child's whole lifetime,
     including the case where this process gets killed mid-cycle."""
     force = "--force" in sys.argv
-    _run_cycle_impl(force=force)
+    _install_hang_diagnostics()
+    code = 0
+    try:
+        _run_cycle_impl(force=force)
+    except BaseException:
+        logger.exception("cycle child crashed")
+        code = 1
+    finally:
+        # Exit NOW. Without this the interpreter waits for every non-daemon thread
+        # (screener / ticker ThreadPoolExecutor workers, MCP helpers) before exiting, so
+        # a cycle whose work was finished could linger - still counted as "running" -
+        # until the supervisor's 15-minute kill because one stray worker was hung.
+        import logging as _logging
+        _logging.shutdown()
+        os._exit(code)
 
 
 if __name__ == "__main__":

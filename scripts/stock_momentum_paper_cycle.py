@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config_loader import load_config_dict
 from engine import sector_momentum_paper as paper
 from rules import stock_momentum as rule
-from scripts.sector_momentum_paper_cycle import is_month_end
+from scripts.sector_momentum_paper_cycle import is_month_end, needs_rebalance
 from storage.database import Database
 from storage.sleeve_ledger import SleeveLedger
 
@@ -64,7 +64,8 @@ def main():
     # Cheap probe first: is today the month-end? (SPY alone decides the calendar.)
     probe = fetch_closes(["SPY"], "400d")
     month_end = is_month_end(probe)
-    rebalance = a.force_rebalance or month_end or first_run
+    rebalance = (a.force_rebalance or month_end or first_run
+                 or needs_rebalance(str(probe.index[-1])[:10], led.get_sm_state("last_rebalance")))
     members = rule.current_members(Path(sc.get("universe_file", rule.DEFAULT_UNIVERSE_FILE)))
     tickers = sorted(set(members) | {"SPY", rule.CASH}) if rebalance else sorted(set(held) | {"SPY", rule.CASH})
     closes = fetch_closes(tickers)
@@ -87,6 +88,7 @@ def main():
         return
     if rebalance:
         led.set_sm_state("risk_on", "1" if risk_on else "0")
+        led.set_sm_state("last_rebalance", date)
         trades = paper.rebalance(led, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0)),
                                  max_gross=max(lev, 1.0), section=SECTION,
                                  min_trade_frac=float(sc.get("min_trade_frac", 0.002)))

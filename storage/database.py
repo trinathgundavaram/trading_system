@@ -1983,7 +1983,20 @@ class Database:
             row = conn.execute("SELECT cancel_requested FROM cycle_status WHERE id=1").fetchone()
             return bool(row and row[0])
 
+    _stage_clock = {}      # process-wide: (stage, started monotonic) of the cycle stage now running
+
     def set_cycle_stage(self, stage: str, tickers_total: int = None, tickers_done: int = None):
+        """(2026-10-28) Also logs how long the PREVIOUS stage took, so a slow or hung cycle
+        shows in the log which stage ate the time instead of only that it ran long."""
+        import time as _t
+        prev = Database._stage_clock.get("cur")
+        if prev and prev[0] != stage:
+            logger.info(f"cycle stage '{prev[0]}' took {_t.monotonic() - prev[1]:.1f}s -> '{stage}'")
+        if not prev or prev[0] != stage:
+            Database._stage_clock["cur"] = (stage, _t.monotonic())
+        self._set_cycle_stage(stage, tickers_total, tickers_done)
+
+    def _set_cycle_stage(self, stage: str, tickers_total: int = None, tickers_done: int = None):
         """Progress-bar follow-up (2026-07-14): Trinath asked for a real 0-100%
         progress indicator instead of just an elapsed-time counter. A single
         percentage can't be computed from elapsed time alone (cycle length
