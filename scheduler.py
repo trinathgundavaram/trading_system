@@ -401,7 +401,19 @@ def _run_cycle_impl(force: bool = False):
     # inside paper_trader.execute_buy() - see §10.
     watch_mode = paper_trader.is_watch_mode(cfg)
     risk_check = RiskEngine(db, cfg, simulated=watch_mode).check()
-    if not risk_check["can_trade"]:
+    entries_paused = False
+    if not risk_check["can_trade"] and _is_trade_count_cap(risk_check["reason"]):
+        # 2026-10-28: the daily trade-COUNT cap used to end the whole cycle here, so once the
+        # 30th paper trade of the day happened (by ~12:00) no sell rule ran again until the
+        # next session - earnings / VIX / rule exits on open positions silently stopped. A cap
+        # on new entries must not switch off exit management. The cycle now continues with
+        # entries paused: no screener, scan list = held positions only; per-trade enforcement
+        # in paper_trader.execute_buy still refuses any new buy.
+        entries_paused = True
+        logger.warning(f"Risk limit: {risk_check['reason']} - NEW ENTRIES PAUSED, still managing open positions")
+        db.log_cycle(cycle_count, 0, blocked=True, reason=f"entries paused: {risk_check['reason']}",
+                     triggered_by=triggered_by)
+    elif not risk_check["can_trade"]:
         logger.warning(f"Risk limit: {risk_check['reason']}")
         # Every other blocking path in this function logs the block; this one
         # returned silently, so a cycle halted by a risk limit vanished from
@@ -493,7 +505,7 @@ def _run_cycle_impl(force: bool = False):
     # engine/screener.py's module docstring for exactly which sources are
     # backed by verified-real MCP tool calls vs. not-yet-implemented.
     screener_tickers = []
-    if cfg.get("screener", {}).get("enabled", False):
+    if cfg.get("screener", {}).get("enabled", False) and not entries_paused:
         try:
             screener_tickers = _get_screener_tickers(cfg, trading_mode, regime)
         except Exception as e:
@@ -553,7 +565,10 @@ def _run_cycle_impl(force: bool = False):
             held_sim_tickers += [p["ticker"] for p in db.get_all_positions(simulated=False)]
     except Exception as e:
         logger.warning(f"Could not add held positions to scan list: {e}")
-    watchlist = list(dict.fromkeys(cfg["watchlist"] + held_sim_tickers + screener_tickers))  # dedup, preserve order
+    if entries_paused:
+        watchlist = list(dict.fromkeys(held_sim_tickers))        # exits only: nothing new may be opened today
+    else:
+        watchlist = list(dict.fromkeys(cfg["watchlist"] + held_sim_tickers + screener_tickers))  # dedup, preserve order
     screener_ticker_set = set(screener_tickers)  # so _evaluate_ticker knows which tickers to feed
                                                   # real outcomes back to engine/screener.py's learning loop
     os.makedirs(PENDING_DIR, exist_ok=True)
@@ -677,6 +692,13 @@ def _run_cycle_impl(force: bool = False):
     db.set_cycle_stage("finalizing")
     _run_cycle_tail(mkt, cfg, trading_mode, regime, packets, ticker_data_cache,
                      triggered_by, start, cycle_count)
+
+
+def _is_trade_count_cap(reason: str) -> bool:
+    """True only for the daily trade-COUNT cap ("30/30 paper trades today"). Kill switch,
+    daily-loss and drawdown halts are NOT matched - those must still stop the whole cycle."""
+    r = str(reason or "")
+    return " trades today" in r and "Kill switch" not in r and "loss" not in r and "drawdown" not in r.lower()
 
 
 def _log_rejected(db, ticker: str, stage: str, reason: str,

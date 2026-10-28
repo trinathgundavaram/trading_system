@@ -50,6 +50,20 @@ def check(ticker: str, ticker_data: dict, market_data: dict,
     if ers > 80:
         return VetoResult(True, f"Earnings Risk Score {ers}/100", "EARNINGS_RISK")
 
+    # 1b. (2026-10-28) Do not enter what the exit rules would force out again. The
+    # earnings_approaching SELL rule exits any position with earnings within `days_before`
+    # days, but the score above only vetoes entries above 80 (earnings TODAY scores exactly
+    # 80), so the engine bought names on earnings day and sold them 13 minutes later - four
+    # round trips in one session, each burning a slot of the 30/day trade cap and a spread.
+    _ea = (((config.get("sell_rules") or {}).get("rules") or {}).get("earnings_approaching")) or {}
+    if _ea.get("enabled"):
+        _d = ticker_data.get("days_to_earnings", 99)
+        _w = int(_ea.get("days_before", 2))
+        if _d is not None and 0 <= _d <= _w:
+            return VetoResult(True, f"Earnings in {_d} day(s): the earnings_approaching exit rule "
+                                    f"(<= {_w} days) would force an immediate exit",
+                              "EARNINGS_IMMINENT")
+
     # 2. Spread too wide - graded/ATR-aware (see rules/spread_quality.py for
     # the full tiered scale and the rationale for why a flat 0.15%-of-price
     # cliff was replaced). Only the outermost "veto" tier hard-rejects here

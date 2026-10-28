@@ -93,3 +93,25 @@ def test_quality_gate_does_not_refetch_the_same_candidates(monkeypatch):
     second = screener._apply_quality_gate([mk("GOOD"), mk("THIN")], cfg, "swing")
     assert [c.ticker for c in second] == ["GOOD"]
     assert sorted(calls) == ["GOOD", "THIN"]                  # nothing re-fetched on the next cycle
+
+
+def test_only_the_trade_count_cap_pauses_entries_instead_of_ending_the_cycle():
+    import scheduler
+    assert scheduler._is_trade_count_cap("30/30 paper trades today")
+    assert scheduler._is_trade_count_cap("32/30 live trades today")
+    assert not scheduler._is_trade_count_cap("Kill switch is ON")
+    assert not scheduler._is_trade_count_cap("paper daily loss $5.00 breached -$2.00")
+    assert not scheduler._is_trade_count_cap("paper running drawdown 16% >= 15%")
+
+
+def test_entry_veto_matches_the_earnings_exit_rule():
+    from rules import hard_vetoes
+    cfg = {"sell_rules": {"rules": {"earnings_approaching": {"enabled": True, "days_before": 2}}}}
+    base = {"price": 50.0, "days_to_earnings": 0}
+    for d in (0, 1, 2):
+        r = hard_vetoes.check("X", dict(base, days_to_earnings=d), {}, cfg)
+        assert r.vetoed and r.veto_code == "EARNINGS_IMMINENT", d
+    r = hard_vetoes.check("X", dict(base, days_to_earnings=5), {}, cfg)
+    assert r.veto_code != "EARNINGS_IMMINENT"
+    off = {"sell_rules": {"rules": {"earnings_approaching": {"enabled": False, "days_before": 2}}}}
+    assert hard_vetoes.check("X", dict(base, days_to_earnings=0), {}, off).veto_code != "EARNINGS_IMMINENT"

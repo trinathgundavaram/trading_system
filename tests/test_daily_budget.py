@@ -318,7 +318,7 @@ def test_cycle_level_block_is_recorded():
     # installed is a structural test that gets skipped.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src = open(os.path.join(root, "scheduler.py")).read()
-    gate = src.split("risk_check = RiskEngine")[1][:700]
+    gate = src.split("risk_check = RiskEngine")[1][:2500]    # window widened 2026-10-28: the trade-cap branch carries a long explanation
     assert "log_cycle" in gate, "the risk-limit block is not recorded"
     assert "simulated=watch_mode" in gate, "cycle-level check is not book-aware"
 
