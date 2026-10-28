@@ -344,7 +344,10 @@ def run_screener(cfg: dict, mode: str = "swing", regime=None) -> ScreenerResult:
     gate_cfg = scfg.get("quality_gate", {}) or {}
     if gate_cfg.get("enabled", True):
         before = len(filtered)
+        import time as _tg
+        _t_gate = _tg.monotonic()
         filtered = _apply_quality_gate(filtered, cfg, mode)
+        logger.info(f"screener: quality gate took {_tg.monotonic() - _t_gate:.1f}s")
         result.quality_gate_dropped = before - len(filtered)
 
     # Re-group the SURVIVING (post-filter) candidates by source for quota
@@ -364,7 +367,10 @@ def run_screener(cfg: dict, mode: str = "swing", regime=None) -> ScreenerResult:
     # noting the others in .reason, same dedup spirit as v1.
     deduped = _dedup_keep_best(by_source)
 
+    import time as _ts
+    _t_score = _ts.monotonic()
     _score_candidates(deduped, mode, cfg=cfg)
+    logger.info(f"screener: discovery scoring took {_ts.monotonic() - _t_score:.1f}s")
 
     selected = _allocate_by_quota(deduped, QUOTAS, max_candidates)
     # Verified-first (2026-07-21, external review) - same _rank_key as the
@@ -634,9 +640,26 @@ def _apply_quality_gate(candidates: list, cfg: dict, mode: str) -> list:
 
     yf = YFinanceMCP()
 
+    # 2026-10-28: this gate fetched yfinance_get_ticker_info for EVERY candidate on EVERY cycle
+    # (~260 calls, ~110s - the biggest single cost of a scan cycle) even though the mover lists
+    # barely change in 15 minutes and averageVolume/sector/price band are stable for hours. Two
+    # cache layers (persistent across cycle processes, see engine/cache.py):
+    #   * a REJECTION is remembered for 3h per threshold set - the fetch is skipped entirely;
+    #   * a fetched info dict is reused for 30 min, so a candidate that stays on the movers
+    #     lists is not re-fetched on the next cycle. Bid/ask in a 30-min-old dict is only used
+    #     for this coarse pre-screen; real scoring later uses fresh data.
+    _thr = f"{min_price}_{max_price}_{min_avg_volume}_{mode}"
+
     def _check(c):
+        dropped = cache.get(f"qgate_drop_{c.ticker}_{_thr}")
+        if dropped:
+            return c, False, dropped
         try:
-            info = yf.get_ticker_info(c.ticker) or {}
+            info = cache.get(f"qgate_info_{c.ticker}")
+            if info is None:
+                info = yf.get_ticker_info(c.ticker) or {}
+                if info:
+                    cache.set(f"qgate_info_{c.ticker}", info, 1800)
         except Exception as e:
             logger.warning(f"Quality gate: {c.ticker} info fetch failed: {e}")
             # UNVERIFIED, not a free pass (2026-07-21, external review): an
@@ -656,9 +679,13 @@ def _apply_quality_gate(candidates: list, cfg: dict, mode: str) -> list:
         ask = info.get("ask") or price
 
         if price < min_price or price > max_price:
-            return c, False, f"price ${price:.2f} outside ${min_price:.0f}-${max_price:.0f}"
+            reason = f"price ${price:.2f} outside ${min_price:.0f}-${max_price:.0f}"
+            cache.set(f"qgate_drop_{c.ticker}_{_thr}", reason, 10800)
+            return c, False, reason
         if avg_vol < min_avg_volume:
-            return c, False, f"avg volume {avg_vol:,.0f} < {min_avg_volume:,}"
+            reason = f"avg volume {avg_vol:,.0f} < {min_avg_volume:,}"
+            cache.set(f"qgate_drop_{c.ticker}_{_thr}", reason, 10800)
+            return c, False, reason
 
         spread_result = evaluate_spread({"bid": bid, "ask": ask, "price": price}, mode=mode)
         if spread_result.hard_veto:

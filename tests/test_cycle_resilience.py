@@ -68,3 +68,28 @@ def test_second_scheduler_is_refused_by_the_lock(tmp_path):
     assert scheduler._acquire_scheduler_lock(path) is False      # another holder: decline
     scheduler._scheduler_lock_fh.close()                          # release for other tests
     scheduler._scheduler_lock_fh = None
+
+
+def test_quality_gate_does_not_refetch_the_same_candidates(monkeypatch):
+    from engine import screener
+    from engine.cache import TTLCache
+    import mcp_clients.yfinance_mcp as ym
+
+    calls = []
+    infos = {"GOOD": {"regularMarketPrice": 50.0, "averageVolume": 5_000_000, "bid": 49.99, "ask": 50.01, "sector": "Tech"},
+             "THIN": {"regularMarketPrice": 50.0, "averageVolume": 10_000, "bid": 49.99, "ask": 50.01}}
+
+    class FakeYF:
+        def get_ticker_info(self, t):
+            calls.append(t)
+            return infos[t]
+
+    monkeypatch.setattr(ym, "YFinanceMCP", FakeYF)
+    monkeypatch.setattr(screener, "cache", TTLCache(None))
+    mk = lambda t: screener.ScreenerCandidate(ticker=t, source="rs_gainers", reason="x", priority=1)
+    cfg = {"screener": {"quality_gate": {"min_price": 10, "max_price": 1000, "min_avg_volume": 1_000_000}}}
+    first = screener._apply_quality_gate([mk("GOOD"), mk("THIN")], cfg, "swing")
+    assert [c.ticker for c in first] == ["GOOD"] and sorted(calls) == ["GOOD", "THIN"]
+    second = screener._apply_quality_gate([mk("GOOD"), mk("THIN")], cfg, "swing")
+    assert [c.ticker for c in second] == ["GOOD"]
+    assert sorted(calls) == ["GOOD", "THIN"]                  # nothing re-fetched on the next cycle
