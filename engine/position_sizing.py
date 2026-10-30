@@ -61,6 +61,36 @@ def _promoted_position_pct(db, trading_cfg: dict):
     return float(trading_cfg.get("promoted_position_pct", 2.0)) if _PROMO_CACHE["stage"] == "promoted" else None
 
 
+def _risk_based_allocation(db, cfg: dict, scfg: dict, ticker_data: dict, mode, promoted: bool, max_position_usd: float):
+    """Full-conviction position size such that hitting the stop loses `risk_per_trade_pct` of the purse:
+
+        dollars = purse x risk% / stop distance     (capped at max_position_pct_of_purse and risk.max_position_size_usd)
+
+    The old fixed $100 base times a stack of fractional multipliers left almost every buy on the 20% floor ($20 on a
+    $10,000 purse), so conviction never mattered. Here the multipliers still scale this amount, but the base is tied
+    to the stop that actually protects the trade (same stop formula the engine uses when it opens the position), so a
+    stopped-out trade always costs a known, small share of the purse whatever the stock's price or volatility.
+    Returns (None, None) when it cannot be computed; the caller then keeps the fixed allocation."""
+    try:
+        purse = _get_equity(db, simulated=True) or _get_portfolio_total(db, simulated=True)
+        price = float(ticker_data.get("price") or 0)
+        if purse <= 0 or price <= 0:
+            return None, None
+        risk_pct = float(scfg.get("promoted_risk_per_trade_pct", 0.25) if promoted else scfg.get("risk_per_trade_pct", 0.10))
+        prof = (cfg or {}).get("risk", {}).get((cfg or {}).get("risk_level", "MODERATE"), {}) or {}
+        day = str(mode or "SWING").upper() == "DAY"
+        max_stop = float(prof.get("stop_loss_day_pct", float(prof.get("stop_loss_swing_pct", 5.0)) / 2) if day
+                         else prof.get("stop_loss_swing_pct", 5.0)) / 100.0
+        atr = float(ticker_data.get("atr") or 0)
+        stop_frac = min(max(1.2 * atr, price * 0.015), price * max_stop) / price
+        cap = min(purse * float(scfg.get("max_position_pct_of_purse", 5.0)) / 100.0, max_position_usd)
+        full = min(purse * risk_pct / 100.0 / stop_frac, cap)
+        return full, (f"Risk-based size: {risk_pct:.2f}% of ${purse:,.0f} purse / {stop_frac:.1%} stop = ${purse * risk_pct / 100 / stop_frac:,.0f}"
+                      f"{' (capped at $%.0f)' % cap if purse * risk_pct / 100 / stop_frac > cap else ''}")
+    except Exception:
+        return None, None
+
+
 @dataclass
 class PositionSizeResult:
     applicable: bool                 # False for already-open/vetoed/no-score tickers
@@ -209,7 +239,8 @@ def calculate(buy_result, score_result, ticker_data: dict, regime, cfg: dict,
     base_allocation = fallback_allocation
 
     promoted_pct = _promoted_position_pct(db, trading_cfg)
-    if promoted_pct is not None:
+    risk_method = str(scfg.get("method", "fixed")).lower() == "risk"
+    if promoted_pct is not None and not risk_method:
         use_dynamic_sizing = True
         trading_cfg = {**trading_cfg, "position_size_pct_of_portfolio": promoted_pct}
 
@@ -267,9 +298,14 @@ def calculate(buy_result, score_result, ticker_data: dict, regime, cfg: dict,
     raw_pct = base_pct * ev_mult * vol_mult * regime_mult * portfolio_mult * execution_mult * day_mult
     final_pct = max(min_pct, min(max_pct, raw_pct)) if raw_pct > 0 else 0.0
 
+    risk_note = None
+    if risk_method and db is not None:
+        full, risk_note = _risk_based_allocation(db, cfg, scfg, ticker_data, mode, promoted_pct is not None, max_position_usd)
+        if full is not None:
+            base_allocation = full
     dollar_amount = round(min(base_allocation * final_pct / 100.0, max_position_usd), 2)
 
-    reasons = [
+    reasons = ([risk_note] if risk_note else []) + [
         f"Score tier {pct_score:.0f}% -> base {base_pct:.0f}% ({tier_label} conviction)",
         f"EV confidence '{ev_conf_label}' -> x{ev_mult:.2f}",
         f"Volatility (ATR {atr_pct:.1f}% of price) -> x{vol_mult:.2f}",

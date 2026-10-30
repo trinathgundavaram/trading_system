@@ -3800,11 +3800,10 @@ function renderControlTab(el) {
         <div class="field"><div class="field-label">No new entries when Fear &amp; Greed above</div>
           <input type="number" id="sw-greed" min="30" max="95" value="${cfg.market_filters?.fear_greed?.no_buy_above ?? 60}" onchange="setSwing('no_buy_above', +this.value)">
           <div class="field-desc">Entries made in greed (above 55) averaged -4.8%; exits keep running.</div></div>
-        <div class="field"><div class="field-label">Position sizing</div>
-          <select id="sw-size" onchange="setSwing('use_dynamic_sizing', this.value === 'on')">
-            <option value="off" ${cfg.trading?.use_dynamic_sizing ? "" : "selected"}>small fixed (~$20-100)</option>
-            <option value="on" ${cfg.trading?.use_dynamic_sizing ? "selected" : ""}>% of purse (${cfg.trading?.position_size_pct_of_portfolio ?? 5}%)</option></select>
-          <div class="field-desc">Keep small until the forward test passes (see the Swing dashboard).</div></div>
+        <div class="field"><div class="field-label">Risk per trade (% of purse)</div>
+          <select id="sw-size" onchange="setSwing('risk_per_trade_pct', +this.value)">
+            ${[0.05, 0.1, 0.15, 0.2, 0.3, 0.5].map(v => `<option value="${v}" ${Math.abs((cfg.position_sizing?.risk_per_trade_pct ?? 0.15) - v) < 1e-9 ? "selected" : ""}>${v}%</option>`).join("")}</select>
+          <div class="field-desc">Position size = this ÷ the stop distance (about 1–5% of the purse per position, scaled by conviction). A stopped trade costs roughly this much. Steps to ${cfg.position_sizing?.promoted_risk_per_trade_pct ?? 0.3}% on its own if the forward test passes.</div></div>
       </div>
     </div>
 

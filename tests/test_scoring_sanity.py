@@ -492,6 +492,7 @@ def test_day_position_sizing_applies_multiplier():
         execution_quality = None
 
     cfg = _cfg()
+    cfg["position_sizing"] = {**cfg.get("position_sizing", {}), "min_size_pct": 0}   # keep the floor out of the multiplier math
     ticker_data = {"price": 100.0, "atr": 1.0}
     swing_result = calc_size(FakeBuyResult(), FakeScoreResult(), ticker_data, None, cfg, mode="SWING")
     day_result = calc_size(FakeBuyResult(), FakeScoreResult(), ticker_data, None, cfg, mode="DAY")

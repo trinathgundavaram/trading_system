@@ -74,3 +74,22 @@ def test_swing_decision_sent_once_on_the_date():
         assert maintenance.swing_decision_due(db, cfg, today=date(2026, 12, 16)) is None
     finally:
         so.swing_experiment_status = so_real
+
+
+def test_risk_based_sizing_ties_size_to_the_stop_and_caps_it(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from engine import position_sizing as ps
+    cfg = {"risk_level": "T", "risk": {"T": {"stop_loss_swing_pct": 8, "stop_loss_day_pct": 4}, "max_position_size_usd": 1000},
+           "trading": {}, "position_sizing": {"method": "risk", "risk_per_trade_pct": 0.2, "max_position_pct_of_purse": 5.0,
+                                              "min_size_pct": 100, "max_size_pct": 100}}
+    cfg["risk"]["max_position_size_usd"] = 1000
+    db = type("D", (), {"get_all_positions": lambda s, simulated=True: [], "get_paper_account": lambda s: {"cash": 10000.0}})()
+    monkeypatch.setattr(ps, "_get_equity", lambda db, simulated=True: 10000.0)
+    br, sr = NS(should_buy=True, pct_score=90), NS(ev_result=None, execution_quality=None)
+    # volatile stock: 6% stop -> 0.2% x 10000 / 0.06 = $333, under the $500 cap
+    r = ps.calculate(br, sr, {"price": 100.0, "atr": 5.0}, None, cfg, db=db)
+    assert round(r.suggested_dollar_amount) == 333
+    # calm stock: 1.5% stop floor -> $1333 uncapped, held to 5% of purse = $500
+    r = ps.calculate(br, sr, {"price": 100.0, "atr": 0.5}, None, cfg, db=db)
+    assert r.suggested_dollar_amount == 500.0

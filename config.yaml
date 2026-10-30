@@ -368,6 +368,17 @@ stop_machine:
     multiplier_bonus: 0.4
 position_sizing:
   enabled: true
+  # 2026-10-30: "risk" sizing. The old fixed $100 base x fractional multipliers put ~every buy on the 20% floor
+  # ($20 on a $10,000 purse), so conviction/EV/volatility never changed anything and nothing was meaningfully
+  # invested. Now the full-conviction size is risk_per_trade_pct of the purse divided by the stop distance (a stopped
+  # trade always costs about that share of the purse), capped at max_position_pct_of_purse; the multipliers below
+  # still scale it by conviction. Until the swing forward test passes, risk per trade stays at the small value;
+  # on a pass it steps to promoted_risk_per_trade_pct automatically (trading.auto_promote_sizing).
+  # Set method: fixed to restore the old behaviour.
+  method: risk
+  risk_per_trade_pct: 0.15
+  promoted_risk_per_trade_pct: 0.30
+  max_position_pct_of_purse: 5.0
   score_tiers:
   - min_score: 85
     size_pct: 100
@@ -391,7 +402,10 @@ position_sizing:
     multiplier: 0.65
   - max_atr_pct: 999.0
     multiplier: 0.45
-  min_size_pct: 20
+  # Floor of the conviction scaling. 20 was binding on nearly every trade (the tier, EV, volatility, regime and
+  # day-mode factors all multiply, so they stack to well under 20%); 40 keeps sizes between 40% and 100% of the
+  # risk-based amount so a weak setup is smaller than a strong one without shrinking to dust.
+  min_size_pct: 40
   max_size_pct: 100
   day_size_multiplier: 0.5
 portfolio_risk:

@@ -1017,6 +1017,8 @@ async def update_config(update: dict, _: bool = Depends(require_token)):
                 cfg["trading"]["use_dynamic_sizing"] = bool(sw["use_dynamic_sizing"])
             if "position_size_pct_of_portfolio" in sw:
                 cfg["trading"]["position_size_pct_of_portfolio"] = max(0.5, min(10.0, float(sw["position_size_pct_of_portfolio"])))
+            if "risk_per_trade_pct" in sw:
+                cfg.setdefault("position_sizing", {})["risk_per_trade_pct"] = max(0.05, min(0.5, float(sw["risk_per_trade_pct"])))
             if "no_buy_above" in sw:
                 cfg.setdefault("market_filters", {}).setdefault("fear_greed", {})["no_buy_above"] = max(30, min(95, int(sw["no_buy_above"])))
         except (TypeError, ValueError):
