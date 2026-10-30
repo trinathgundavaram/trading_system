@@ -1403,10 +1403,14 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
             # spread and a name that simply scored 58% are different
             # questions, and pooling them would make the dataset unusable for
             # either.
-            _stage = "veto" if getattr(buy_result, "veto_code", None) else "threshold"
-            _log_rejected(db, ticker, _stage,
-                          getattr(buy_result, "reason", None) or "below threshold",
-                          buy_result.pct_score, td.price, None)
+            # A name thrown out before scoring carries its veto code in rules_failed[0] (score_result is None). It used
+            # to be filed as "threshold / below threshold / 0%", which hid 3,400+ vetoes inside the threshold bucket.
+            _vf = (buy_result.rules_failed[0] if (score_result is None and buy_result.rules_failed) else None)
+            if _vf is not None:
+                _log_rejected(db, ticker, "veto", f"{_vf.name}: {_vf.detail}", None, td.price, None)
+            else:
+                _log_rejected(db, ticker, "threshold", getattr(buy_result, "reason", None) or "below threshold",
+                              buy_result.pct_score, td.price, None)
 
         # Dispatch the independent paper sell check computed above - only
         # populated when watch_mode is False (see its computation above), so

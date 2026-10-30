@@ -50,9 +50,9 @@ trading:
   # success test is forward-looking: >= 30 entry days from 2026-10-30 with profit factor > 1.3 - see
   # scripts/swing_experiment_report.py. Set to 0 to restore the same-day flatten.
   day_hold_sessions: 1
-  # 2026-10-30: 10 -> 15. DAY entries are now held to the next session, so the 10 slots stayed full and a 78% DAY buy
+  # 2026-10-30: 10 -> 20. DAY entries are now held to the next session, so the 10 slots stayed full and a 78% DAY buy
   # (NEE) was refused; DAY is the better mode so far (PF 1.5 vs 0.6 for SWING, n=127). Total cap stays 40.
-  max_day_positions: 15
+  max_day_positions: 20
 rotation:
   enabled: true
   min_candidate_score: 80.0

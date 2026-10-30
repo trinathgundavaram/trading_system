@@ -52,7 +52,7 @@ class SpreadResult:
     reason: str
 
 
-IMPLAUSIBLE_SPREAD_PCT = 0.10  # 10% of price - see guard note in evaluate() below
+IMPLAUSIBLE_SPREAD_PCT = 0.02  # 2% of price (was 10%; see the audit note in evaluate()) - see guard note in evaluate() below
 
 
 def evaluate(ticker_data: dict, mode: str = "swing") -> SpreadResult:
@@ -87,6 +87,14 @@ def evaluate(ticker_data: dict, mode: str = "swing") -> SpreadResult:
                              "Bid/ask implausible vs. price - treated as unreliable quote, not a real spread")
 
     spread_pct = (ask - bid) / price
+    # 2026-10-30 audit: 488 spread vetoes in four days hit GILD, MRK, ICE, MHK, GDDY, BAH, CVX - liquid names whose real
+    # spread is a few hundredths of a percent - with "spreads" of 2-10% and a median of 4.2%. Those are stale bid/ask
+    # values from the free quote feed, not market spreads. A genuine spread is never wider than the stock's whole average
+    # daily range, so a spread at or above 100% of ATR, or above 2% for anything that passed the 1M-volume gate, is
+    # treated as an unreliable quote (neutral), exactly like the implausible cases above.
+    if atr and (ask - bid) >= atr:
+        return SpreadResult(spread_pct, "excellent", 0.0, False,
+                             f"Spread {spread_pct*100:.2f}% is at least a full day's range (ATR) - stale bid/ask, not a real quote (ignored)")
     if spread_pct > IMPLAUSIBLE_SPREAD_PCT:
         return SpreadResult(spread_pct, "excellent", 0.0, False,
                              f"Spread {spread_pct*100:.2f}% implausibly wide - likely a stale/bad bid or ask, not a real quote (ignored)")

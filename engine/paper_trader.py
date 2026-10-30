@@ -78,6 +78,16 @@ def ensure_seeded(db, cfg: dict) -> dict:
     return db.get_paper_account()
 
 
+def _log_capacity(db, ticker: str, code: str, price, score):
+    """A qualified BUY that capacity refused (slots, trade budget, cash). Stored durably in rejected_signals so the
+    re-evaluation tracker can see which cap is costing entries. Never raises."""
+    try:
+        db.log_rejected_signal(ticker=ticker, reject_stage="capacity", reject_reason=code,
+                               score_at_rejection=score, price_at_rejection=price)
+    except Exception:
+        pass
+
+
 def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
                 pattern_id: int = None, trade_mode: str = None,
                 buy_score: float = None, prices: dict = None,
@@ -127,6 +137,7 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
         logger.info(f"{ticker}: [PAPER] buy blocked - {risk['reason']}")
         db.log_ui_event("paper_buy_skipped",
                         {"ticker": ticker, "reason": risk["reason"]})
+        _log_capacity(db, ticker, "trade_budget" if "paper trades today" in str(risk["reason"]) else "risk_gate", price, buy_score)
         return {}
 
     # DAY-specific position cap (2026-07-22, enhancement item #1 - Trinath's
@@ -149,6 +160,7 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
         if open_day_count >= max_day_positions:
             logger.info(f"{ticker}: [PAPER] DAY buy skipped - "
                         f"{open_day_count}/{max_day_positions} DAY positions open")
+            _log_capacity(db, ticker, "day_slots", price, buy_score)
             return {}
 
     # trade_mode='SEED' rows (robinhood_sync.py's seed-paper command, cloning
@@ -173,6 +185,7 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
             victim = None
         if not victim:
             logger.info(f"{ticker}: [PAPER] buy skipped - {open_count}/{max_positions} positions open")
+            _log_capacity(db, ticker, "position_slots", price, buy_score)
             return {}
         # §D: this position is not being closed on its own merits at all - it
         # is being closed to make room. Recording that as anything else would
@@ -203,6 +216,7 @@ def execute_buy(db, cfg: dict, ticker: str, price: float, position_size=None,
     if account["cash"] < amount:
         logger.info(f"{ticker}: [PAPER] buy skipped - purse ${account['cash']:.2f} "
                     f"< suggested ${amount:.2f} (insufficient cash, exactly as live)")
+        _log_capacity(db, ticker, "cash", price, buy_score)
         db.log_ui_event("paper_buy_skipped", {
             "ticker": ticker, "reason": "insufficient_cash",
             "cash": account["cash"], "needed": amount,

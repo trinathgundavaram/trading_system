@@ -159,3 +159,13 @@ def test_reevaluation_tracker_logs_history_and_flags_transitions(db):
     assert not any(r["changed"] for r in reevaluation.run_all(db, cfg, date(2026, 10, 31)) if r["status"] == "waiting")
     with db._conn() as c:
         assert c.execute("SELECT COUNT(*) FROM reeval_log").fetchone()[0] == 2 * len(reevaluation.ITEMS)
+
+
+def test_stale_bid_ask_is_not_a_spread_veto():
+    from rules.spread_quality import evaluate
+    # liquid large cap with a stale ask: 4% "spread" is 216% of a $1.85 ATR -> ignored, not vetoed
+    r = evaluate({"bid": 100.0, "ask": 104.0, "price": 100.0, "atr": 1.85}, mode="swing")
+    assert not r.hard_veto
+    # a real, merely wide spread on a volatile name still vetoes: 1.2% of price, 20% of a $6 ATR
+    r2 = evaluate({"bid": 100.0, "ask": 101.2, "price": 100.0, "atr": 6.0}, mode="swing")
+    assert r2.hard_veto

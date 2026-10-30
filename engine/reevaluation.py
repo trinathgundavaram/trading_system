@@ -35,6 +35,12 @@ ITEMS = [
     {"id": "entry_quality", "title": "Entry score bar (60 swing / 65 day)",
      "why": "After raising the bar from 50/55, do trades entered since still lose at the low end of the score range, and does CHOPPY still lose?",
      "knob": "risk.TURBO.buy_score_threshold_pct"},
+    {"id": "buy_capacity", "title": "Capacity refusing good buys",
+     "why": "Qualified BUYs refused by slots, the daily trade budget or cash. If refusals outnumber fills, a cap is the bottleneck.",
+     "knob": "trading.max_positions / max_day_positions, risk.max_trades_per_day"},
+    {"id": "veto_census", "title": "Data-quality vetoes",
+     "why": "A veto that fires on many liquid names (like the stale-spread one) is a data fault, not a market signal.",
+     "knob": "rules/hard_vetoes.py, rules/spread_quality.py"},
     {"id": "sleeves_vs_spy", "title": "Momentum sleeves vs SPY",
      "why": "Do the three paper sleeves beat buy-and-hold SPY after 60 daily marks?",
      "knob": "*_sleeve.paper_enabled"},
@@ -185,6 +191,53 @@ def _entry_quality(db, cfg, today):
     return ("adjust" if adjust else "ok"), "; ".join(msgs), m
 
 
+CAPACITY_SINCE = "2026-10-31"   # capacity / veto rows are only written from the 2026-10-30 evening restart on
+
+
+def _recent_rows(db, stage, days=3):
+    from datetime import timedelta
+    cut = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    with db._conn() as c:
+        return c.execute("SELECT ticker, timestamp, reject_reason FROM rejected_signals "
+                         "WHERE reject_stage = ? AND timestamp >= ?", (stage, cut)).fetchall()
+
+
+def _buy_capacity(db, cfg, today):
+    rows = _recent_rows(db, "capacity")
+    by = {}
+    for t, ts, why in rows:
+        by.setdefault(why, set()).add((t, str(ts)[:10]))
+    from datetime import timedelta
+    cut = (datetime.utcnow() - timedelta(days=3)).isoformat()
+    with db._conn() as c:
+        filled = c.execute("SELECT COUNT(*) FROM paper_trades WHERE side = 'buy' AND created_at >= ?", (cut,)).fetchone()[0]
+    m = {"blocked_unique": {k: len(v) for k, v in by.items()}, "filled_3d": filled}
+    if not rows:
+        return "waiting", "no capacity refusals logged yet (or none happening)", m
+    total = len(set().union(*by.values()))
+    top = max(by, key=lambda k: len(by[k]))
+    if total >= max(10, filled):
+        return "adjust", f"{total} qualified buys refused in 3 days vs {filled} filled; biggest cause: {top} ({len(by[top])})", m
+    return "ok", f"{total} refused vs {filled} filled in 3 days (top cause {top})", m
+
+
+def _veto_census(db, cfg, today):
+    rows = _recent_rows(db, "veto")
+    by, days = {}, set()
+    for t, ts, why in rows:
+        code = str(why).split(":")[0]
+        by.setdefault(code, set()).add((t, str(ts)[:10])); days.add(str(ts)[:10])
+    m = {k: len(v) for k, v in by.items()}
+    if not rows:
+        return "waiting", "no vetoes logged yet", m
+    nd = max(1, len(days))
+    flagged = [f"{k} {len(v) / nd:.0f}/day" for k, v in by.items()
+               if k in ("SPREAD_WIDE", "STALE_QUOTE", "STALE_DATA_CIRCUIT_BREAKER", "BAD_DATA") and len(v) / nd > 25]
+    if flagged:
+        return "adjust", "data-quality vetoes look high: " + ", ".join(flagged) + " - check the quote feed", m
+    return "ok", "; ".join(f"{k} {len(v) / nd:.0f}/day" for k, v in sorted(by.items(), key=lambda x: -len(x[1]))[:4]), m
+
+
 def _sleeves_vs_spy(db, cfg, today):
     from storage.sleeve_ledger import SleeveLedger
     out, m, waiting = [], {}, False
@@ -206,7 +259,7 @@ def _sleeves_vs_spy(db, cfg, today):
 
 
 CHECKS = {"swing_forward_test": _swing_forward_test, "risk_cap_blocks": _risk_cap_blocks, "rotation": _rotation,
-          "position_cap": _position_cap, "second_opinion": _second_opinion, "risk_sizing": _risk_sizing, "entry_quality": _entry_quality,
+          "position_cap": _position_cap, "second_opinion": _second_opinion, "risk_sizing": _risk_sizing, "entry_quality": _entry_quality, "buy_capacity": _buy_capacity, "veto_census": _veto_census,
           "sleeves_vs_spy": _sleeves_vs_spy}
 
 
