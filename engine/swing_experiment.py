@@ -39,3 +39,10 @@ def summarize(trades: list, start: str = EXPERIMENT_START) -> dict:
             "profit_factor": pf, "needs_days": MIN_ENTRY_DAYS, "needs_pf": MIN_PF,
             "verdict": ("collecting" if len(days) < MIN_ENTRY_DAYS else
                         "pass" if (pf is not None and pf > MIN_PF) else "fail")}
+
+
+def sizing_stage(trades: list) -> str:
+    """"promoted" only while the forward test is passing (>= MIN_ENTRY_DAYS entry days AND profit factor > MIN_PF);
+    "small" in every other state, including after a pass that later decays. Stateless on purpose: it is recomputed
+    from the trade history each time, so demotion needs no separate trigger."""
+    return "promoted" if summarize(trades)["verdict"] == "pass" else "small"

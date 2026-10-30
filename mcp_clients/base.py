@@ -91,8 +91,10 @@ class SourceCircuitBreaker:
         normal record() path)."""
         with self._lock:
             self._consecutive_failures += 1
+            already_open = self._down_until > time.time()
             self._down_until = time.time() + cooldown_seconds
-            logger.warning(
+            # A known-permanent failure (e.g. FMP 402) re-trips on every ticker of every cycle; say it once.
+            (logger.debug if already_open else logger.warning)(
                 f"{self.name}: circuit breaker forced OPEN for "
                 f"{cooldown_seconds / 3600:.1f}h{f' ({reason})' if reason else ''} - "
                 f"calls return empty instantly instead of retrying a known-permanent failure"

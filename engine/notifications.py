@@ -136,6 +136,15 @@ def _transport_webhook(title, message, subtitle, cfg, severity="info") -> bool:
     if not url:
         return False
     try:
+        if "ntfy" in url:
+            # ntfy publishes the raw body as the message and reads the title/priority from headers, so a JSON body
+            # would arrive as literal JSON text on the phone.
+            headers = {"Title": title.encode("ascii", "replace").decode(),
+                       "Priority": {"critical": "urgent", "summary": "default"}.get(severity, "default"),
+                       "Tags": {"critical": "rotating_light", "summary": "chart_with_upwards_trend"}.get(severity, "bell")}
+            req = urllib.request.Request(url, data=f"{subtitle + chr(10) if subtitle else ''}{message}".encode(), headers=headers)
+            urllib.request.urlopen(req, timeout=8)
+            return True
         body = json.dumps({
             "title": title,
             "text": f"{subtitle or ''}\n{message}".strip(),
@@ -180,6 +189,20 @@ def notify(cfg: dict, title: str, message: str, subtitle: str = None,
     if not _enabled(cfg):
         return False
     order = _cfg_section(cfg).get("transports") or list(DEFAULT_TRANSPORTS)
+    if _cfg_section(cfg).get("broadcast", False):
+        # Phone AND desktop: try every real transport, fall back to the log only if none got through.
+        delivered = False
+        for name in order:
+            fn = TRANSPORTS.get(name)
+            if fn is None or name == "log":
+                continue
+            try:
+                delivered = bool(fn(title, message, subtitle, cfg, severity)) or delivered
+            except Exception as e:
+                logger.warning(f"notification transport {name!r} raised: {e}")
+        if not delivered:
+            _transport_log(title, message, subtitle, cfg, severity)
+        return delivered
     for name in order:
         fn = TRANSPORTS.get(name)
         if fn is None:
@@ -205,6 +228,13 @@ def notify_buy_signal(cfg: dict, ticker: str, pct_score: float, regime: str = ""
         message=f"Score {pct_score:.0f}%" + (f" | {regime} regime" if regime else ""),
         subtitle="Trading Platform",
     )
+
+
+def notify_rebalance(cfg: dict, label: str, value: float, ret_pct: float, buys: int, sells: int, risk_on=None):
+    """One line per sleeve after a month-end rebalance, so you never have to open the UI to know it ran."""
+    mood = "" if risk_on is None else (" | risk-on" if risk_on else " | RISK-OFF (T-bills)")
+    notify(cfg, title=f"{label} rebalanced", message=f"value ${value:,.0f} ({ret_pct:+.2f}% since start) | {buys} buys, {sells} sells{mood}",
+           subtitle="Month-end summary", severity="summary")
 
 
 def notify_urgent_exit(cfg: dict, ticker: str, reason: str):

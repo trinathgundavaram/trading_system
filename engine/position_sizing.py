@@ -38,6 +38,29 @@ _DEFAULT_ATR_BANDS = [
 ]
 
 
+_PROMO_CACHE = {"at": 0.0, "stage": "small"}
+
+
+def _promoted_position_pct(db, trading_cfg: dict):
+    """% of purse per position while the swing forward test is passing, else None (stay on the small fixed size).
+    Opt-in via trading.auto_promote_sizing; the stage is derived from paper_trades (engine/swing_experiment.py)
+    and cached for 10 minutes. Any error means "not promoted"."""
+    if not trading_cfg.get("auto_promote_sizing", False) or db is None:
+        return None
+    import time
+    if time.time() - _PROMO_CACHE["at"] > 600:
+        try:
+            import sqlite3
+            from engine.swing_experiment import sizing_stage
+            with db._conn() as conn:
+                conn.row_factory = sqlite3.Row
+                trades = [dict(r) for r in conn.execute("SELECT * FROM paper_trades ORDER BY id").fetchall()]
+            _PROMO_CACHE.update(at=time.time(), stage=sizing_stage(trades))
+        except Exception:
+            _PROMO_CACHE.update(at=time.time(), stage="small")
+    return float(trading_cfg.get("promoted_position_pct", 2.0)) if _PROMO_CACHE["stage"] == "promoted" else None
+
+
 @dataclass
 class PositionSizeResult:
     applicable: bool                 # False for already-open/vetoed/no-score tickers
@@ -184,6 +207,11 @@ def calculate(buy_result, score_result, ticker_data: dict, regime, cfg: dict,
     # Dynamic sizing: scales position with portfolio growth
     use_dynamic_sizing = trading_cfg.get("use_dynamic_sizing", False)
     base_allocation = fallback_allocation
+
+    promoted_pct = _promoted_position_pct(db, trading_cfg)
+    if promoted_pct is not None:
+        use_dynamic_sizing = True
+        trading_cfg = {**trading_cfg, "position_size_pct_of_portfolio": promoted_pct}
 
     if use_dynamic_sizing and db is not None:
         portfolio_total = _get_equity(db, simulated=True) or _get_portfolio_total(db, simulated=True)

@@ -73,6 +73,13 @@ def main():
     tickers = sorted(set(members) | {"SPY", rule.CASH}) if rebalance else sorted(set(held) | {"SPY", rule.CASH})
     closes = fetch_closes(tickers)
     date = str(closes.index[-1])[:10]
+    try:
+        from engine.mark_backfill import backfill_missing_marks
+        filled = backfill_missing_marks(led, closes, today=date)
+        if filled:
+            print(f"backfilled missed marks: {filled}")
+    except Exception as e:                       # never block the real cycle on a cosmetic fill
+        print(f"mark backfill skipped: {e}")
     spy = closes["SPY"].dropna()
     prev = led.get_sm_state("risk_on")
     risk_on = rule.market_state(closes[["SPY"]].dropna(), None if prev is None else prev == "1", band)
@@ -90,6 +97,7 @@ def main():
     if a.dry_run:
         print("(--dry-run: no trades)")
         return
+    trades = []
     if rebalance:
         led.set_sm_state("risk_on", "1" if risk_on else "0")
         led.set_sm_state("last_rebalance", date)
@@ -108,6 +116,14 @@ def main():
         paper.accrue_financing(led, cfg, SECTION)
     s = paper.snapshot(led, prices)
     led.log_sm_equity(date, s["total_value"], float(spy.iloc[-1]))
+    if rebalance and month_end:
+        try:
+            from engine.notifications import notify_rebalance
+            notify_rebalance(cfg, sc.get("label") or ("Stock low-vol sleeve" if a.prefix == "stl" else "Stock momentum sleeve"),
+                             s["total_value"], s["total_return_pct"], sum(t["side"] == "buy" for t in trades),
+                             sum(t["side"] == "sell" for t in trades), risk_on)
+        except Exception as e:
+            print(f"summary notification skipped: {e}")
     print(f"Stock sleeve: value ${s['total_value']:.2f} ({s['total_return_pct']}%), {len(s['positions'])} positions")
 
 

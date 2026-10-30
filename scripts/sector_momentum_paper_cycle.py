@@ -84,13 +84,22 @@ def main():
         print("(--dry-run: no trades)")
         return
     smp.ensure_seeded(db, cfg)
+    try:
+        from engine.mark_backfill import backfill_missing_marks
+        filled = backfill_missing_marks(db, closes, today=date)
+        if filled:
+            print(f"backfilled missed marks: {filled}")
+    except Exception as e:                       # never block the real cycle on a cosmetic fill
+        print(f"mark backfill skipped: {e}")
+    trades = []
     if (a.force_rebalance or is_month_end(closes) or not db.get_open_sm_positions()
             or needs_rebalance(date, db.get_sm_state("last_rebalance"))):
         db.set_sm_state("last_rebalance", date)
         if new_on is not None:
             db.set_sm_state("risk_on", "1" if new_on else "0")
-        for t in smp.rebalance(db, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0)),
-                             max_gross=max(lev, 1.0)):
+        trades = smp.rebalance(db, cfg, targets, prices, date=date, cost_bps=float(sc.get("cost_bps", 5.0)),
+                               max_gross=max(lev, 1.0))
+        for t in trades:
             print(f"  {t['side'].upper()} {t['shares']:.4f} {t['ticker']} @ {t['price']:.2f}")
     else:
         print("not a rebalance day - mark to market only")
@@ -114,6 +123,13 @@ def main():
             out = Path(__file__).resolve().parent.parent / "output" / "sleeve_vs_spy.md"
             out.write_text(render(summarize(rows, db.get_paper_equity_history(limit=100000))) + "\n")
             print(f"report written: {out}")
+    if trades and is_month_end(closes):
+        try:
+            from engine.notifications import notify_rebalance
+            notify_rebalance(cfg, "Sector momentum sleeve", s["total_value"], s["total_return_pct"],
+                             sum(t["side"] == "buy" for t in trades), sum(t["side"] == "sell" for t in trades), new_on)
+        except Exception as e:
+            print(f"summary notification skipped: {e}")
     print(f"Sleeve: value ${s['total_value']:.2f} ({s['total_return_pct']}%) positions={s['positions']}")
 
 

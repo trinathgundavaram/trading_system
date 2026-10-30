@@ -2175,6 +2175,15 @@ def run_stock_momentum_cycle():
         logger.error(f"Stock momentum cycle failed: {e}")
 
 
+def run_daily_maintenance():
+    """Reference rebuild if leverage changed, file pruning, and a message only when something is wrong."""
+    try:
+        from engine import maintenance
+        maintenance.run(db, load_config())
+    except Exception as e:
+        logger.error(f"daily maintenance failed: {e}", exc_info=True)
+
+
 def run_stock_lowvol_cycle():
     """Daily PAPER run of the momentum + low-volatility stock sleeve (own ledger `stl`); the same script as the
     momentum stock sleeve, pointed at its own config block and tables. Child process, gated by paper_enabled."""
@@ -2324,6 +2333,10 @@ def start():
     scheduler.add_job(
         run_stock_lowvol_cycle, "cron", day_of_week="mon-fri", hour=16, minute=25,
         id="stock_lowvol_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        run_daily_maintenance, "cron", hour=6, minute=30,
+        id="daily_maintenance", max_instances=1, coalesce=True, misfire_grace_time=7200,
     )
     scheduler.add_job(
         run_tradingagents_cycle, "cron", day_of_week="mon-fri", hour=16, minute=30,

@@ -52,7 +52,10 @@ def _curves(sleeve_rows, swing_rows, stock_rows=None, lowvol_rows=None):
         df["stock_lowvol"] = lv.reindex(lv.index.union(df.index)).ffill().reindex(df.index)
     out = {"dates": [d.strftime("%Y-%m-%d") for d in df.index]}
     for c in ("sleeve", "spy", "swing", "stock", "stock_lowvol"):
-        out[c] = [round(float(v), 3) for v in (df[c] / df[c].iloc[0] * 100)] if c in df else []
+        # A sleeve that started after the others has no value on the earlier dates; back-fill so it is a flat 100
+        # until it starts instead of NaN (which poisoned the whole series and logged a warning every poll).
+        col = df[c].bfill() if c in df else None
+        out[c] = [round(float(v), 3) for v in (col / col.iloc[0] * 100)] if col is not None else []
     return out
 
 

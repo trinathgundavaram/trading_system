@@ -20,6 +20,14 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+### Automation upgrades (2026-10-30)
+- Missed daily marks are backfilled automatically (`engine/mark_backfill.py`, `scripts/backfill_marks.py`); Oct 22-27 filled for both sleeves.
+- Phone alerts: ntfy webhook (`NOTIFY_WEBHOOK_URL` in `.env`), `notifications.broadcast` sends to phone AND desktop; month-end rebalance summaries.
+- Swing sizing auto-promotes to 2% of purse only while the forward test passes (`trading.auto_promote_sizing`), and drops back on its own.
+- `engine/maintenance.py` daily 06:30 job: rebuild the drift reference if leverage/band changed, prune cache and old prompts, message only when something is wrong.
+- Quieter logs (repeated FMP breaker warnings, NaN curve warning every poll fixed).
+
+
 ### Decision function: CHANGED (position SIZE) - trade history before 2026-10-30 is not poolable
 
 - **Swing paper position sizing** is now 5% of the whole paper purse (`trading.use_dynamic_sizing: true`,
