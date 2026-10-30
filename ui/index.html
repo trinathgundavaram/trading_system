@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Trading Platform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
 <!-- Chart.js was loaded here from a CDN on every page load and never used:
      the file contains exactly one occurrence of the string "Chart", and it
      was this script tag. The one chart in this UI (the paper equity curve)
@@ -719,58 +721,82 @@
   }
   #theme-btn { width: 34px; height: 32px; justify-content: center; padding: 0; font-size: 15px; }
 </style>
-<style id="readability-2026-10-30">
-  /* Readability pass: everything was 10-12px. Base text 15px, tables 13.5px, labels 12-12.5px, nothing under 12px.
-     Inline font sizes (written as style="font-size:Npx" all over the templates) are raised with attribute selectors. */
-  body { font-size: 15px; line-height: 1.55; }
-  #sidebar { width: 236px; }
-  #sidebar .brand .name { font-size: 16px; }
-  #sidebar .brand .sub { font-size: 12px; }
-  #sidebar .navitem { font-size: 14.5px; padding: 11px 13px; gap: 12px; }
-  #sidebar .navitem svg { width: 18px; height: 18px; }
-  #sidebar .conn { font-size: 12.5px; }
-  #topbar h1 { font-size: 20px; }
-  .pill { font-size: 12.5px; padding: 4px 11px; }
-  .btn { font-size: 14px; padding: 9px 15px; }
-  .btn-sm { font-size: 13px; padding: 6px 12px; }
-  #subnav button { font-size: 14px; padding: 7px 16px; }
-  .panel { padding: 22px; }
-  .panel-title { font-size: 13px; letter-spacing: .7px; }
-  .panel-head svg { width: 17px; height: 17px; }
-  table { font-size: 14px; }
-  th { font-size: 12px; padding: 10px 12px; }
-  td { padding: 10px 12px; }
-  .field-desc, .ov-note { font-size: 13px; line-height: 1.55; }
-  .field-label { font-size: 13px; }
-  input, select, textarea { font-size: 14.5px; padding: 8px 10px; }
-  .ov-label { font-size: 12.5px; letter-spacing: .6px; }
-  .ov-value { font-size: 32px; }
-  .ov-sub { font-size: 13.5px; }
-  .ov-tile { padding: 20px 22px; }
-  .ov-attn .item { font-size: 14.5px; padding: 12px 16px; }
-  .stat .label { font-size: 12px; } .stat .value { font-size: 24px; } .stat .sub { font-size: 12.5px; }
-  .subtle { font-size: inherit; }
-  .grid > * { min-width: 0; }
-  .table-wrap { overflow-x: auto; }
-  .ov-cmp td:first-child, .ov-cmp th:first-child { white-space: nowrap; }
-  details.ctl-adv > summary { font-size: 15px; }
-  #content { padding: 28px 32px 72px; max-width: 1480px; }
-  /* inline sizes written in the templates */
-  [style*="font-size:9px"], [style*="font-size:10px"], [style*="font-size: 10px"], [style*="font-size:10.5px"] { font-size: 12px !important; }
-  [style*="font-size:11px"], [style*="font-size: 11px"], [style*="font-size:11.5px"] { font-size: 13px !important; }
-  [style*="font-size:12px"], [style*="font-size: 12px"], [style*="font-size:12.5px"] { font-size: 14px !important; }
-  [style*="font-size:13px"] { font-size: 14.5px !important; }
-  [style*="font-size:14px"] { font-size: 15.5px !important; }
-  [style*="font-size:15px"] { font-size: 16.5px !important; }
+<style id="polish-2026-10-30">
+  /* Polish pass: original type sizes (nothing enlarged), a sharper font, tidier tiles. Tile text never wraps: each
+     line is one line, long ones are clipped with an ellipsis (full text in the tooltip). */
+  body { font-family: "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         font-size: 13.5px; letter-spacing: -0.003em; font-feature-settings: "tnum" 1, "cv11" 1, "ss01" 1; }
+  #sidebar { width: 216px; }
+  .ov-hero { grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); gap: 14px; }
+  .ov-tile { padding: 16px 18px; min-width: 0; }
+  .ov-label { font-size: 10.5px; letter-spacing: .08em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ov-value { font-size: 26px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ov-sub { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.45; }
+  .ov-sub b { font-weight: 650; color: var(--text-0); }
+  .ov-bar { height: 6px; border-radius: 99px; }
+  .panel { border-radius: 14px; }
+  .panel-title { font-size: 11px; letter-spacing: .09em; }
+  th { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; }
+  td, th { padding: 9px 12px; }
+  td.num, th.num { font-variant-numeric: tabular-nums; }
+  .pill { font-size: 11px; }
+  #topbar h1 { font-size: 17px; letter-spacing: -0.02em; }
   @media (max-width: 760px) {
-    body { font-size: 15px; }
     #sidebar { width: 100%; }
-    #sidebar .navitem { padding: 9px 12px; font-size: 14px; }
-    #content { padding: 16px 14px 56px; }
-    .ov-value { font-size: 26px; }
-    .panel { padding: 16px; }
+    .ov-hero { grid-template-columns: 1fr 1fr; gap: 10px; }
+    .ov-value { font-size: 22px; }
   }
 </style>
+<style id="motion-2026-10-30">
+  /* Colour + motion pass. No sizes change. Everything respects prefers-reduced-motion. */
+  :root {
+    --ease: cubic-bezier(.22,.8,.3,1);
+    --glow: 0 0 0 1px var(--accent-border), 0 8px 28px rgba(91,91,240,.16);
+  }
+  :root[data-theme="dark"] { --bg-0:#080c18; --bg-1:#111828; --bg-2:#172136; --glow: 0 0 0 1px var(--accent-border), 0 10px 32px rgba(0,0,0,.45); }
+  body { background: radial-gradient(1100px 420px at 85% -120px, var(--accent-dim), transparent 70%), var(--bg-0); background-attachment: fixed; }
+  /* tiles: soft lift on hover, accent rail keeps its colour */
+  .ov-tile { transition: transform .22s var(--ease), box-shadow .22s var(--ease), border-color .22s; position: relative; }
+  .ov-tile:hover { transform: translateY(-2px); box-shadow: var(--glow); }
+  .ov-tile .ov-value { background: linear-gradient(180deg,var(--text-0),var(--text-1)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .ov-tile.up .ov-value, .ov-tile .ov-value.pos { background: none; -webkit-text-fill-color: var(--green); }
+  .ov-tile.down .ov-value, .ov-tile .ov-value.neg { background: none; -webkit-text-fill-color: var(--red); }
+  .ov-bar > div, .ov-bar > span { transition: width .9s var(--ease); background-image: linear-gradient(90deg,var(--accent),var(--blue)); }
+  /* entrance: panels and tiles fade up, staggered */
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .ov-tile, .panel { animation: rise .45s var(--ease) both; }
+  .ov-hero > :nth-child(2), .grid > :nth-child(2) { animation-delay: .05s; }
+  .ov-hero > :nth-child(3), .grid > :nth-child(3) { animation-delay: .10s; }
+  .ov-hero > :nth-child(4), .grid > :nth-child(4) { animation-delay: .15s; }
+  .ov-hero > :nth-child(n+5) { animation-delay: .2s; }
+  /* buttons, nav, pills, rows */
+  .btn, #subnav button, .navitem, .pill, tbody tr td { transition: background .18s, border-color .18s, color .18s, box-shadow .18s, transform .12s; }
+  .btn:active, #subnav button:active { transform: scale(.97); }
+  .btn-primary:hover { box-shadow: 0 6px 18px rgba(91,91,240,.35); }
+  #sidebar .navitem:hover { transform: translateX(2px); }
+  tbody tr:hover td { background: var(--accent-dim); }
+  /* live dot pulses; value flashes handled by .flash if the page sets it */
+  .dot.live, #sidebar .conn .dot { animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(52,211,153,.55); } 50% { box-shadow: 0 0 0 5px rgba(52,211,153,0); } }
+  .flash { animation: flash .9s ease-out; }
+  @keyframes flash { from { background: var(--accent-dim); } to { background: transparent; } }
+  /* subnav pills: softer, accent gradient when active */
+  #subnav button.active { background: linear-gradient(135deg,var(--accent),#4f46e5); box-shadow: 0 4px 14px rgba(91,91,240,.35); }
+  /* sidebar footer: version string must not spill out */
+  #sidebar .conn, #sidebar .ver, #sidebar [id*="version"] { overflow-wrap: anywhere; font-size: 11px; line-height: 1.35; }
+  /* panels: hairline accent on top edge */
+  .panel { border-top: 1px solid var(--accent-border); }
+  .grid > *, .ov-row > * { min-width: 0; }
+  .table-wrap { overflow-x: auto; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 99px; border: 2px solid var(--bg-0); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--bg-hover); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+</style>
+
+
 
 
 </head>
@@ -1334,9 +1360,10 @@ function swingReportTile(sc, perf) {
   const prog = ex ? Math.min(100, ex.entry_days / ex.needs_days * 100) : 0;
   return `<div class="ov-tile ${tone}" title="${v.text.replace(/"/g, "&quot;")}"><div class="ov-label">Swing report card</div>
     <div class="ov-value" style="font-size:24px;padding-top:4px">${v.label}</div>
-    <div class="ov-sub">${o.n} closed trades · win ${o.win_pct == null ? "—" : o.win_pct.toFixed(0)}% · profit factor ${pf} · ${o.usd >= 0 ? "+" : "-"}$${Math.abs(o.usd).toFixed(2)}</div>
+    <div class="ov-sub">${o.n} trades · win ${o.win_pct == null ? "—" : o.win_pct.toFixed(0)}% · PF ${pf}</div>
+    <div class="ov-sub">${o.usd >= 0 ? "+" : "-"}$${Math.abs(o.usd).toFixed(2)} realized</div>
     ${ex ? `<div class="ov-bar" style="margin-top:8px"><span style="width:${prog}%;background:var(--indigo)"></span></div>
-      <div class="ov-sub">Forward test: ${ex.entry_days}/${ex.needs_days} entry days${ex.profit_factor != null ? ` · PF ${ex.profit_factor.toFixed(2)} (needs ${ex.needs_pf})` : ""}</div>` : ""}</div>`;
+      <div class="ov-sub">Forward test ${ex.entry_days}/${ex.needs_days} days${ex.profit_factor != null ? ` · PF ${ex.profit_factor.toFixed(2)}` : ""}</div>` : ""}</div>`;
 }
 
 function swingScorecardPanel(sc) {
@@ -1457,7 +1484,7 @@ async function paintOverview(el, quiet) {
         <div class="ov-sub"><span class="${ovCls(a.return_pct)}">${ovPct(a.return_pct, 2)}</span> since start · started ${ovUSD(a.starting_cash)}</div></div>
       <div class="ov-tile ${vsSpy == null ? "" : vsSpy >= 0 ? "up" : "down"}"><div class="ov-label">vs SPY</div>
         <div class="ov-value ${ovCls(vsSpy)}">${vsSpy == null ? "—" : ovPct(vsSpy, 2)}</div>
-        <div class="ov-sub">${st.days > 1 ? `${st.days} daily marks` : "needs 2+ daily marks (first full day tomorrow)"}</div></div>
+        <div class="ov-sub">${st.days > 1 ? `${st.days} daily marks` : "needs 2+ daily marks"}</div></div>
       <div class="ov-tile accent"><div class="ov-label">Exposure</div>
         <div class="ov-value">${a.gross.toFixed(2)}×</div>
         <div class="ov-sub">target ${d.leverage}× · borrowed ${ovUSD(a.borrowed)} @ 4%</div></div>
@@ -2247,7 +2274,8 @@ async function renderDashboard(el) {
           <div class="ov-sub">${swRet == null ? "not started" : `<span class="${ovCls(swRet)}">${ovPct(swRet, 2)}</span> since start`}${sw ? ` · cash ${ovUSD(sw.cash)}` : ""}</div></div>
         <div class="ov-tile ${mainPnl > 0 ? "up" : mainPnl < 0 ? "down" : ""}"><div class="ov-label">Realized today (${isPaper ? "paper" : "real"})</div>
           <div class="ov-value ${ovCls(mainPnl)}">${fmtUSD(mainPnl)}</div>
-          <div class="ov-sub">${stats.cycles_run || 0} cycles · ${stats.signals_generated || 0} signals · ${isPaper && sw && sw.today ? `<b>${sw.today.buys}</b> buys + <b>${sw.today.sells}</b> sells = <b>${sw.today.buys + sw.today.sells}</b> trades` : `${stats.trades_placed || 0} trades`}</div></div>
+          <div class="ov-sub">${isPaper && sw && sw.today ? `<b>${sw.today.buys}</b> buys + <b>${sw.today.sells}</b> sells = <b>${sw.today.buys + sw.today.sells}</b> trades` : `${stats.trades_placed || 0} trades`}</div>
+          <div class="ov-sub">${stats.cycles_run || 0} cycles · ${stats.signals_generated || 0} signals</div></div>
         <div class="ov-tile ${heatPct > 90 ? "down" : heatPct > 60 ? "warn" : "accent"}"><div class="ov-label">${withTip("Portfolio heat", "portfolio_heat")}</div>
           <div class="ov-value">${heat.current_heat_pct}<span style="font-size:15px;color:var(--text-2)"> / ${heat.max_heat_pct}%</span></div>
           <div class="ov-bar" style="margin-top:8px"><span style="width:${heatPct}%;background:${heatPct > 90 ? "var(--red)" : heatPct > 60 ? "var(--yellow)" : "var(--indigo)"}"></span></div>
