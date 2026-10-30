@@ -2168,7 +2168,7 @@ async function renderDashboard(el) {
           <div class="ov-sub">${swRet == null ? "not started" : `<span class="${ovCls(swRet)}">${ovPct(swRet, 2)}</span> since start`}${sw ? ` · cash ${ovUSD(sw.cash)}` : ""}</div></div>
         <div class="ov-tile ${mainPnl > 0 ? "up" : mainPnl < 0 ? "down" : ""}"><div class="ov-label">Realized today (${isPaper ? "paper" : "real"})</div>
           <div class="ov-value ${ovCls(mainPnl)}">${fmtUSD(mainPnl)}</div>
-          <div class="ov-sub">${stats.cycles_run || 0} cycles · ${stats.signals_generated || 0} signals · ${(isPaper ? stats.paper_trades_placed : stats.trades_placed) || 0} trades (buys + sells)</div></div>
+          <div class="ov-sub">${stats.cycles_run || 0} cycles · ${stats.signals_generated || 0} signals · ${isPaper && sw && sw.today ? `<b>${sw.today.buys}</b> buys + <b>${sw.today.sells}</b> sells = <b>${sw.today.buys + sw.today.sells}</b> trades` : `${stats.trades_placed || 0} trades`}</div></div>
         <div class="ov-tile ${heatPct > 90 ? "down" : heatPct > 60 ? "warn" : "accent"}"><div class="ov-label">${withTip("Portfolio heat", "portfolio_heat")}</div>
           <div class="ov-value">${heat.current_heat_pct}<span style="font-size:15px;color:var(--text-2)"> / ${heat.max_heat_pct}%</span></div>
           <div class="ov-bar" style="margin-top:8px"><span style="width:${heatPct}%;background:${heatPct > 90 ? "var(--red)" : heatPct > 60 ? "var(--yellow)" : "var(--indigo)"}"></span></div>
@@ -3395,10 +3395,12 @@ async function renderPortfolioTab(el, prefetched) {
     </div>
 
     <div class="panel">
-      <div class="panel-head">${svg('journal',15)}<span class="panel-title">${withTip('Trade Ledger', 'pf_ledger')}</span><span class="fill"></span><span class="pill pill-neutral">${trades.length}</span></div>
+      <div class="panel-head">${svg('journal',15)}<span class="panel-title">${withTip('Trade Ledger', 'pf_ledger')}</span><span class="fill"></span>
+        <div class="segmented" style="margin-right:8px">${[["all", "All"], ["buy", "Buys"], ["sell", "Sells"]].map(([k, l]) => `<button class="${(window._ledgerSide || "all") === k ? "active" : ""}" onclick="setLedgerSide('${k}')">${l}</button>`).join("")}</div>
+        <span class="pill pill-neutral">${trades.filter(t => t.side === "buy").length} buys + ${trades.filter(t => t.side === "sell").length} sells = ${trades.length}</span></div>
       ${trades.length ? `<div class="table-wrap"><table><thead><tr>
         <th>Time</th><th>Side</th><th>Ticker</th><th>${withTip('Mode', 'trade_mode')}</th><th class="num">Price</th><th class="num">Shares</th><th class="num">Amount</th><th class="num">P&amp;L</th><th>Reason</th>
-      </tr></thead><tbody>${trades.map(t => `
+      </tr></thead><tbody>${trades.filter(t => (window._ledgerSide || "all") === "all" || t.side === window._ledgerSide).map(t => `
         <tr>
           <td class="subtle">${fmtCST(t.created_at)}</td>
           <td><span class="pill ${t.side === 'buy' ? 'pill-blue' : 'pill-neutral'}">${t.side.toUpperCase()}</span></td>
@@ -4030,6 +4032,8 @@ function initThemeToggle() {
   paint();
   const r = document.getElementById("refresh-btn"); r.parentNode.insertBefore(b, r);
 }
+
+function setLedgerSide(side) { window._ledgerSide = side; loadTab("portfolio"); }
 
 function setSleeve(name, key, value) { saveConfig({ sleeves: { [name]: { [key]: value } } }, false); }
 function setSwing(key, value) { saveConfig({ swing: { [key]: value } }, false); }

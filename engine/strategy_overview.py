@@ -102,6 +102,13 @@ def _stock_view(db, cfg: dict, section: str = "stock_momentum_sleeve", prefix: s
     return view, led.get_sm_equity_log()
 
 
+def _today_counts(db):
+    try:
+        return db.paper_trade_counts_today()
+    except Exception:
+        return None
+
+
 def swing_experiment_status(db, cfg: dict, today=None) -> dict | None:
     """Forward-test verdict plus the decision date from config (swing_experiment.decision_date)."""
     import sqlite3
@@ -224,6 +231,7 @@ def build(db, cfg: dict, today: date = None) -> dict:
         swing = {"starting_cash": pa["starting_cash"], "cash": pa["cash"], "realized_pnl": pa["realized_pnl"],
                  "total_value": last.get("total_value", pa["cash"]), "open": last.get("n_open", 0),
                  "mode": cfg.get("trading", {}).get("mode"),
+                 "today": _today_counts(db),
                  "scan_minutes": cfg.get("trading", {}).get("day_trade_scan_interval_minutes")}
     rsi2 = None
     if cfg.get("rsi2_sleeve", {}).get("paper_enabled"):

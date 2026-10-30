@@ -4286,6 +4286,25 @@ class Database:
             except Exception:
                 pass
 
+    def paper_trade_counts_today(self) -> dict:
+        """{"buys": n, "sells": n, "wins": n, "losses": n} for today's local calendar day (paper book)."""
+        start_utc, end_utc = _local_day_window_utc()
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT side, COUNT(*), "
+                "COALESCE(SUM(CASE WHEN side = 'sell' AND pnl > 0 THEN 1 ELSE 0 END), 0), "
+                "COALESCE(SUM(CASE WHEN side = 'sell' AND pnl < 0 THEN 1 ELSE 0 END), 0) "
+                "FROM paper_trades WHERE created_at >= ? AND created_at < ? GROUP BY side",
+                (start_utc, end_utc)).fetchall()
+        out = {"buys": 0, "sells": 0, "wins": 0, "losses": 0}
+        for r in rows:
+            r = tuple(r.values()) if isinstance(r, dict) else tuple(r)
+            if r[0] == "buy":
+                out["buys"] = int(r[1])
+            elif r[0] == "sell":
+                out["sells"], out["wins"], out["losses"] = int(r[1]), int(r[2]), int(r[3])
+        return out
+
     def paper_realized_pnl_today(self) -> float:
         """Sum of today's PAPER sell P/L, for the dashboard's Realized P&L
         tile (2026-07-16, Akhil's 'Realized P&L doesn't show values' report:
