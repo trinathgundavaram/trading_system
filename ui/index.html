@@ -3155,11 +3155,11 @@ function _pfFingerprint(summary, trades) {
   return `${t}|${trades.length}|${summary.seeded}`;
 }
 
-async function _fetchPortfolio() {
+async function _fetchPortfolio(live = true) {
   // live=1: fresh quotes for open positions (provider chain, cached
   // briefly) so the tab tracks the market between scan cycles.
   const [summary, trades, history] = await Promise.all([
-    (await fetch("/api/paper/summary?live=1")).json(),
+    (await fetch(live ? "/api/paper/summary?live=1" : "/api/paper/summary")).json(),
     (await fetch("/api/paper/trades?limit=300")).json(),
     (await fetch("/api/paper/equity_history?limit=500")).json(),
   ]);
@@ -3233,7 +3233,9 @@ async function renderPortfolioTab(el, prefetched) {
       ({ summary, trades, history } = prefetched);
     } else {
       el.innerHTML = `<div class="panel">Loading portfolio…</div>`;
-      ({ summary, trades, history } = await _fetchPortfolio());
+      // First paint uses the cached summary (instant); live quotes take ~9 s, so they arrive via the in-place refresh.
+      ({ summary, trades, history } = await _fetchPortfolio(false));
+      setTimeout(() => { if (currentTab === "portfolio") _refreshPortfolioInPlace(); }, 50);
     }
   } catch (e) {
     el.innerHTML = `<div class="panel">${emptyBlock('alert', "Couldn't load portfolio", e.message)}</div>`;
