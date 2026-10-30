@@ -18,6 +18,20 @@ different strategy, and averaging the two sets together is a measurement error.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 
+## [Unreleased]
+
+### Decision function: CHANGED (position SIZE) - trade history before 2026-10-30 is not poolable
+
+- **Swing paper position sizing** is now 5% of the whole paper purse (`trading.use_dynamic_sizing: true`,
+  `position_size_pct_of_portfolio: 5.0`) instead of an effectively fixed ~$20 per trade. The "% of portfolio" base used
+  to be the sum of OPEN positions, which is near zero for a small book; it is now cash + positions
+  (`engine/position_sizing.py::_get_equity`). Trades before this date were sized by a different function.
+- A trade-count cap no longer ends the whole scan cycle: new entries pause, exits keep running.
+- New entry veto `EARNINGS_IMMINENT` (earnings within the `earnings_approaching` exit window).
+- Scheduler/supervisor resilience (sleep-aware cycle supervisor, watchdog, persistent cache), the sector- and
+  stock-momentum paper sleeves, drift monitor, and the Overview UI. The Learning and Journal tabs were removed
+  from the UI (their data and backend modules are unchanged).
+
 ## [3.4] — v3.4.0 — 2026-07-28
 
 ### Decision function: dynamic position sizing touches it; everything else in this release does not

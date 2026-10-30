@@ -804,12 +804,8 @@ const TABS = [
     // engine/live_trader.py, and this tab is where the switch that makes it
     // false actually lives. Corrected 2026-07-26 (UI audit).
     desc: "Watchlist, risk level, trading mode, rotation, and the arming controls - including the Live Execution master switch, Auto-Trade, and the kill switch. This is the only tab that can arm real-money execution." },
-  { id: "learning",    label: "Learning",    icon: "learning", group: "Swing engine",
-    desc: "The automated learning loop's rule-attribution analysis (edge, stability). Every result is a proposal for human review - nothing is auto-applied to live scoring." },
   { id: "strategy",    label: "Swing rules",    icon: "strategy", group: "Swing engine",
     desc: "The actual current rule set: every buy bucket/rule, the dynamic threshold formula, hard vetoes, sell rules, and how the strategy has evolved over time." },
-  { id: "journal",     label: "Journal",     icon: "journal", group: "Swing engine",
-    desc: "Every confirmed real trade (via confirm_fill.py), with the indicators and rules that were in play at that moment. Click a row to expand it." },
   { id: "monitor",     label: "Monitor",     icon: "monitor", group: "System",
     desc: "Scheduler status, market hours, and the last scan cycle - includes the manual \"Run cycle now\" override." },
   { id: "logs",        label: "Logs",        icon: "logs", group: "System",
@@ -1041,8 +1037,8 @@ function loadTab(name) {
   const renderers = {
     overview: renderOverview, dashboard: renderDashboard, signals: renderSignalsTab, positions: renderPositionsTab,
     portfolio: (el) => (viewMode === "real" ? renderRealPortfolioTab(el) : renderPortfolioTab(el)),
-    control: renderControlTab, learning: renderLearningTab,
-    strategy: renderStrategyTab, journal: renderJournalTab, monitor: renderMonitorTab,
+    control: renderControlTab,
+    strategy: renderStrategyTab, monitor: renderMonitorTab,
     logs: renderLogsTab, news: renderNewsTab,
   };
   (renderers[name] || renderOverview)(el);
@@ -1986,10 +1982,8 @@ async function renderDashboard(el) {
   if (!el.querySelector(".ov")) el.innerHTML = `<div class="ov"><div class="panel"><span class="subtle">Loading dashboard…</span></div></div>`;
   // Purse + track record come from read-only endpoints; the page renders first
   // and fills these in, so a slow call never blanks the dashboard.
-  const [ov, perf] = await Promise.all([
-    fetch("/api/strategies/overview").then(r => r.json()).catch(() => null),
-    fetch("/api/analytics/performance").then(r => r.json()).catch(() => null),
-  ]);
+  const ov = await fetch("/api/strategies/overview").then(r => r.json()).catch(() => null);
+  const perf = ov && ov.track_record;      // one call: purse, schedule and track record together
   if (currentTab !== "dashboard") return;
   const sw = ov && ov.swing;
   const swRet = sw ? sw.total_value / sw.starting_cash - 1 : null;
@@ -3382,7 +3376,7 @@ async function renderRealPortfolioTab(el) {
 
     <div class="panel">
       <div class="panel-head">${svg('journal',15)}<span class="panel-title">Real Trade Ledger</span><span class="fill"></span><span class="pill pill-neutral">${trades.length}</span></div>
-      <p class="field-desc" style="margin-bottom:10px;">Full indicator/rule detail for each trade lives on the Journal tab.</p>
+      <p class="field-desc" style="margin-bottom:10px;">Full indicator/rule detail for each real trade is stored in the database (trades table).</p>
       ${trades.length ? `<div class="table-wrap"><table><thead><tr>
         <th>Time</th><th>Side</th><th>Ticker</th><th class="num">Amount</th><th class="num">Shares</th><th class="num">Fill Price</th><th>Status</th>
       </tr></thead><tbody>${trades.map(t => `
@@ -4011,274 +4005,6 @@ async function toggleKillSwitch() {
 // whenever the book had no losing trade (profit_factor was float('inf'), which
 // Starlette refuses to serialise), and summary.profit_factor.toFixed(2) would
 // have thrown on the null that endpoint now legitimately returns.
-/* ============================== LEARNING TAB ============================== */
-async function renderLearningTab(el) {
-  el.innerHTML = `
-    <div class="panel"><div class="panel-head">${svg('learning',15)}<span class="panel-title">Learning Backend</span></div><div id="learning-body">Loading…</div></div>
-    <div class="panel" style="margin-top:14px;"><div class="panel-head">${svg('learning',15)}<span class="panel-title">Automated Learning Loop</span></div><div id="learning-runs-body">Loading…</div></div>
-    <div class="panel" style="margin-top:14px;">
-      <div class="panel-head" style="justify-content:space-between;display:flex;">
-        <div style="display:flex;align-items:center;gap:8px;">${svg('learning',15)}<span class="panel-title">Historical Replay (Backtest)</span></div>
-        <div style="display:flex;gap:8px;">
-          <button class="btn btn-sm btn-danger backtest-abort-trigger" style="display:none;" onclick="abortBacktestNow(event)" title="Force-kill the running backtest subprocess immediately (same hard kill /api/cycle/cancel uses for a stuck scan cycle) and mark the run failed so it doesn't block the next one.">${svg('x',13)}<span>Abort backtest</span></button>
-          <button class="btn btn-sm backtest-run-trigger" onclick="runBacktestNow(event)">${svg('refresh',13)}<span>Run backtest now</span></button>
-        </div>
-      </div>
-      <p class="field-desc" style="margin-bottom:12px;">engine/backtest_engine.py's Stage 1 market-data-only replay - runs the REAL rules/hard_vetoes.py + rules/swing_buy_rules.py against historical bars for config.yaml's backtest.tickers/months. Also runs automatically once a week (engine/backtest_loop.py, scheduler.py) - this button just triggers one on demand.</p>
-      <div id="backtest-body">Loading…</div>
-    </div>
-  `;
-  /* The three-metric strip that used to live here (Closed patterns / Profit
-     factor / Sharpe) was a byte-for-byte duplicate of the one at the top of
-     the Performance tab, reading the same /api/analytics/performance call -
-     two tabs, same numbers, no added context on either. Worse, this copy
-     called summary.profit_factor.toFixed(2) directly while the Performance
-     tab's copy went through fmtRatio(), which exists precisely because
-     profit_factor is legitimately null until the book has a losing trade to
-     divide by. So the moment there were closed trades but no losses, this
-     panel threw a TypeError and rendered "Couldn't load this panel" - the
-     duplicate was not just redundant, it was the broken one.
-
-     Replaced with a one-line pointer. The metrics have exactly one home. */
-  document.getElementById("learning-body").innerHTML = `
-    <p class="field-desc" style="margin-bottom:0;">Pattern database, EV engine, Bayesian weight updater, walk-forward, and champion/challenger all run against closed <code>pattern_database</code> rows — see README for what's real vs. simulated.
-    Headline numbers for this book (closed patterns, profit factor, Sharpe) are on the <a href="#dashboard" onclick="showTab('dashboard');return false;">Swing dashboard</a>.</p>
-  `;
-
-  loadBacktestPanel(); // fire-and-forget - independent of the learning_runs early-return below
-
-  const runsBody = document.getElementById("learning-runs-body");
-  // 2026-07-26: everything - the fetch AND the HTML-building below - is now
-  // wrapped in ONE try/catch (same fix already applied to renderStrategyTab/
-  // renderPerformanceTab - see their comments for the exact failure shape).
-  // Previously only the fetch was guarded, so any exception while building
-  // the rule-attribution table or the champion/challenger summary (a
-  // malformed/partial learning_runs row, a field the backend hasn't started
-  // sending yet, etc.) was an UNCAUGHT rejection: the panel stayed on
-  // "Loading…" forever with nothing but a console error, rather than the
-  // "Couldn't load this panel" message tabErrorHTML actually produces -
-  // which meant a real failure here was invisible, not just unhelpfully
-  // worded.
-  try {
-    const runs = await fetchJSON("/api/learning/runs?limit=10");
-    if (!runs.length) {
-      runsBody.innerHTML = emptyBlock('learning', 'No automated runs yet',
-        `scheduler.py runs this every ${state.config?.learning?.walk_forward_trigger_trades ?? 50} closed trades or ${state.config?.learning?.walk_forward_trigger_days ?? 30} days, whichever comes first.`);
-      return;
-    }
-    const latest = runs[0];
-    const props = Object.entries(latest.proposals?.proposals || {});
-    const stable = props.filter(([,p]) => p.stability?.stability_label === 'STABLE' && !p.attribution?.insufficient_data);
-    const other = props.filter(([,p]) => !(p.stability?.stability_label === 'STABLE' && !p.attribution?.insufficient_data));
-
-    const ruleRow = ([name, p]) => {
-      const a = p.attribution || {}, s = p.stability || {};
-      const edge = a.edge != null ? (a.edge*100).toFixed(1)+'pp' : '—';
-      const badge = s.stability_label === 'STABLE' ? 'pill-green' : s.stability_label === 'SPIKING' ? 'pill-yellow' : s.stability_label === 'VOLATILE' ? 'pill-red' : 'pill';
-      return `<tr>
-        <td><code style="font-size:12px;">${name}</code></td>
-        <td class="num">${a.n_fired ?? 0}</td>
-        <td class="num">${edge}</td>
-        <td><span class="pill ${badge}">${s.stability_label || '—'}</span></td>
-        <td class="subtle">${a.insufficient_data ? 'insufficient data (<20 fires)' : ''}</td>
-      </tr>`;
-    };
-
-    runsBody.innerHTML = `
-      <p class="field-desc" style="margin-bottom:10px;">
-        Last run: <b>${fmtCST(latest.run_at)}</b> —
-        trigger: <span class="subtle">${latest.trigger_reason}</span> —
-        ${latest.n_patterns} closed patterns analyzed —
-        ${latest.challenges_evaluated?.length || 0} active challenger test(s) evaluated.
-        Every result below is a <b>proposal for human review</b> — nothing is auto-applied to rule weights.
-      </p>
-      ${props.length ? `<div class="table-wrap"><table><thead><tr><th>Rule</th><th class="num">Fired</th><th class="num">Edge</th><th>Stability</th><th>Note</th></tr></thead><tbody>
-        ${[...stable, ...other].map(ruleRow).join('')}
-      </tbody></table></div>` : `<p class="field-desc">No rule attribution data yet — needs closed patterns with <code>rules_passed</code> populated.</p>`}
-      ${latest.challenges_evaluated?.length ? `<div style="margin-top:14px;">
-        <div class="field-label">Champion/Challenger</div>
-        ${latest.challenges_evaluated.map(c => `<p class="field-desc">${c.challenge_id?.slice(0,8) || '—'}: ${c.ready ? `<b>${c.recommendation}</b> (champion ${(c.champion_win_rate*100).toFixed(0)}% vs challenger ${(c.challenger_win_rate*100).toFixed(0)}%)` : (c.message || c.error || 'not ready')}</p>`).join('')}
-      </div>` : ''}
-    `;
-  } catch (e) {
-    runsBody.innerHTML = tabErrorHTML(e);
-  }
-}
-
-// 2026-07-23: Learning tab's "Historical Replay (Backtest)" panel -
-// engine/backtest_engine.py's Stage 1 replay, triggered weekly by
-// engine/backtest_loop.py (scheduler.py) or on demand via the button below
-// (server.py's POST /api/backtest/run). Polls /api/backtest/status while a
-// run is in progress since there's no websocket push for this yet (unlike
-// runCycleNow's cycle_complete event) - simplest thing that works.
-let _backtestPollTimer = null;
-
-async function loadBacktestPanel() {
-  const body = document.getElementById("backtest-body");
-  if (!body) return;
-  try {
-    const [latest, runs, status] = await Promise.all([
-      fetch("/api/backtest/latest").then(r => r.json()),
-      fetch("/api/backtest/runs?limit=10").then(r => r.json()),
-      fetch("/api/backtest/status").then(r => r.json()),
-    ]);
-    body.innerHTML = renderBacktestBody(latest, runs);
-    _setBacktestButtonRunning(!!status.running);
-    if (status.running) _startBacktestPolling();
-  } catch (e) {
-    body.innerHTML = `<p class="field-desc">Couldn't load backtest results: ${e.message}</p>`;
-  }
-}
-
-function _setBacktestButtonRunning(running) {
-  const btn = document.querySelector(".backtest-run-trigger");
-  if (btn) {
-    btn.disabled = running;
-    btn.innerHTML = running ? `${svg("refresh",13)}<span>Running…</span>` : `${svg("refresh",13)}<span>Run backtest now</span>`;
-  }
-  // 2026-07-27 (Trinath: a backtest ran too long and there was no way to
-  // stop it short of finding the PID by hand): only shown while a run is
-  // actually in flight, same "can't click it against nothing" rule
-  // cancelRunBtnHtml() uses for the scan-cycle Cancel button.
-  const abortBtn = document.querySelector(".backtest-abort-trigger");
-  if (abortBtn) {
-    abortBtn.style.display = running ? "" : "none";
-    if (!running) {
-      abortBtn.disabled = false;
-      abortBtn.innerHTML = `${svg("x",13)}<span>Abort backtest</span>`;
-    }
-  }
-}
-
-async function abortBacktestNow(evt) {
-  const btn = evt ? evt.currentTarget : document.querySelector(".backtest-abort-trigger");
-  if (!btn) return;
-  btn.disabled = true;
-  btn.innerHTML = `${svg("x",13)}<span>Aborting…</span>`;
-  try {
-    const res = await authFetch("/api/backtest/abort", { method: "POST" });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      toast(`Couldn't abort: ${body.detail || res.statusText}`, "error");
-      btn.disabled = false;
-      btn.innerHTML = `${svg("x",13)}<span>Abort backtest</span>`;
-      return;
-    }
-    toast(body.note || "Backtest force-killed.", body.status === "killed" ? "info" : "error");
-    if (_backtestPollTimer) { clearInterval(_backtestPollTimer); _backtestPollTimer = null; }
-    _setBacktestButtonRunning(false);
-    if (currentTab === "learning") loadBacktestPanel();
-  } catch (e) {
-    toast(`Couldn't reach the server: ${e.message}`, "error");
-    btn.disabled = false;
-    btn.innerHTML = `${svg("x",13)}<span>Abort backtest</span>`;
-  }
-}
-
-function _startBacktestPolling() {
-  if (_backtestPollTimer) return; // already polling
-  _backtestPollTimer = setInterval(async () => {
-    try {
-      const status = await (await fetch("/api/backtest/status")).json();
-      if (!status.running) {
-        clearInterval(_backtestPollTimer);
-        _backtestPollTimer = null;
-        _setBacktestButtonRunning(false);
-        toast("Backtest complete.", "success");
-        if (currentTab === "learning") loadBacktestPanel();
-      }
-    } catch (e) { /* keep polling - a transient fetch error shouldn't stop it */ }
-  }, 5000);
-}
-
-async function runBacktestNow(evt) {
-  const btn = evt ? evt.currentTarget : document.querySelector(".backtest-run-trigger");
-  if (!btn) return;
-  btn.disabled = true;
-  btn.innerHTML = `${svg("refresh",13)}<span>Starting…</span>`;
-  try {
-    const res = await authFetch("/api/backtest/run", { method: "POST" });
-    if (res.status === 409) {
-      toast("A backtest is already running - hang tight.", "info");
-      _setBacktestButtonRunning(true);
-      _startBacktestPolling();
-      return;
-    }
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      toast(`Couldn't start backtest: ${errBody.detail || res.statusText}`, "error");
-      _setBacktestButtonRunning(false);
-      return;
-    }
-    toast("Backtest started - this can take a minute or two for a dozen-plus tickers.", "success");
-    _setBacktestButtonRunning(true);
-    _startBacktestPolling();
-  } catch (e) {
-    toast(`Couldn't reach the server: ${e.message}`, "error");
-    _setBacktestButtonRunning(false);
-  }
-}
-
-function renderBacktestBody(latest, runs) {
-  if (!latest || !latest.status) {
-    return emptyBlock('learning', 'No backtest runs yet',
-      `Runs automatically every ${state.config?.backtest?.weekly_trigger_days ?? 7} days, or click "Run backtest now" above.`);
-  }
-  const s = latest.summary || {};
-  const statusPill = latest.status === 'completed' ? 'pill-green' : latest.status === 'running' ? 'pill-yellow' : 'pill-red';
-  const tickerList = (latest.tickers || []).join(', ');
-  const header = `
-    <p class="field-desc" style="margin-bottom:10px;">
-      Last run: <b>${fmtCST(latest.started_at)}</b> (<span class="pill ${statusPill}" style="padding:1px 6px;">${latest.status}</span>, triggered by <span class="subtle">${latest.triggered_by || '—'}</span>) —
-      ${latest.start_date} to ${latest.end_date} — tickers: <span class="subtle">${tickerList}</span>
-    </p>`;
-  if (latest.status === 'failed') {
-    return header + `<p class="field-desc">Failed: <span style="color:var(--red);">${latest.error || 'unknown error'}</span></p>` + _renderBacktestHistory(runs);
-  }
-  if (latest.status === 'running' || !s.n_trades) {
-    const body = latest.status === 'running'
-      ? `<p class="field-desc">Still running…</p>`
-      : `<p class="field-desc">Scored ${latest.n_scored ?? 0} candidate-days, ${Object.keys(latest.veto_counts||{}).length ? 'vetoes: ' + JSON.stringify(latest.veto_counts) : 'no vetoes fired'}. No trades cleared the dynamic threshold this run - see engine/backtest_engine.py's module docstring on Stage 1's scope (EXTERNAL/SENTIMENT_MACRO/MARKET_BREADTH unavailable) before assuming this is a bug.</p>`;
-    return header + body + _renderBacktestHistory(runs);
-  }
-  return header + `
-    <div class="metrics-row" style="margin-bottom:12px;">
-      <div class="metric"><div class="metric-label">Trades</div><div class="metric-value">${s.n_trades}</div></div>
-      <div class="metric"><div class="metric-label">Win rate</div><div class="metric-value">${s.win_rate}%</div></div>
-      <div class="metric"><div class="metric-label">Avg outcome</div><div class="metric-value">${s.avg_outcome_pct}%</div></div>
-      <div class="metric"><div class="metric-label">Profit factor</div><div class="metric-value">${s.profit_factor ?? '—'}</div></div>
-      <div class="metric"><div class="metric-label">Avg hold</div><div class="metric-value">${s.avg_hold_days}d</div></div>
-    </div>
-    <p class="field-desc" style="margin-bottom:10px;">Exit reasons: ${Object.entries(s.exit_reason_counts||{}).map(([k,v])=>`${k} (${v})`).join(', ') || '—'} — Scored ${latest.n_scored ?? 0} candidate-days total.</p>
-    ${(latest.trades||[]).length ? `<div class="table-wrap" style="margin-bottom:12px;"><table><thead><tr><th>Ticker</th><th>Entry</th><th>Exit</th><th class="num">Score</th><th class="num">Outcome</th><th>Reason</th></tr></thead><tbody>
-      ${latest.trades.slice(0,20).map(t => `<tr>
-        <td><code style="font-size:11px;">${t.ticker}</code></td>
-        <td class="subtle">${t.entry_date}</td>
-        <td class="subtle">${t.exit_date}</td>
-        <td class="num">${t.buy_score_pct}%</td>
-        <td class="num" style="color:${t.outcome_pct>=0?'var(--green)':'var(--red)'};">${t.outcome_pct>=0?'+':''}${t.outcome_pct}%</td>
-        <td class="subtle">${t.exit_reason}</td>
-      </tr>`).join('')}
-    </tbody></table></div>${latest.trades.length > 20 ? `<p class="field-desc">+${latest.trades.length-20} more in results.json (${latest.output_dir || 'output/backtest_results/'}).</p>` : ''}` : ''}
-    ${_renderBacktestHistory(runs)}
-  `;
-}
-
-function _renderBacktestHistory(runs) {
-  if (!runs || runs.length < 2) return '';
-  return `
-    <div class="field-label" style="margin-top:14px;margin-bottom:6px;">Recent runs</div>
-    <div class="table-wrap"><table><thead><tr><th>Started</th><th>Status</th><th>Trigger</th><th class="num">Trades</th><th class="num">Win rate</th></tr></thead><tbody>
-      ${runs.map(r => `<tr>
-        <td class="subtle">${fmtCST(r.started_at)}</td>
-        <td><span class="pill ${r.status==='completed'?'pill-green':r.status==='running'?'pill-yellow':'pill-red'}" style="padding:1px 6px;">${r.status}</span></td>
-        <td class="subtle">${r.triggered_by || '—'}</td>
-        <td class="num">${r.summary?.n_trades ?? '—'}</td>
-        <td class="num">${r.summary?.win_rate != null ? r.summary.win_rate+'%' : '—'}</td>
-      </tr>`).join('')}
-    </tbody></table></div>`;
-}
-
 /* ============================== STRATEGY TAB ============================== */
 // REAL_APPROXIMATE was missing (added 2026-07-26, UI audit). The lookup falls
 // back to a bare 'pill' class, which sets no background, border or colour - so
@@ -4796,9 +4522,9 @@ function renderEvolutionSection(evo) {
         const stable = props.filter(p => p.stability?.stability_label === 'STABLE' && !p.attribution?.insufficient_data).length;
         return `<tr><td class="subtle">${fmtCST(r.run_at)}</td><td class="subtle">${r.trigger_reason}</td><td class="num">${r.n_patterns}</td><td class="num">${stable}/${props.length}</td></tr>`;
       }).join('')}
-    </tbody></table></div><p class="field-desc" style="margin-top:6px;">Full rule-by-rule breakdown is on the Learning tab.</p>`);
+    </tbody></table></div><p class="field-desc" style="margin-top:6px;">Rule-by-rule results are stored in the learning_runs table.</p>`);
   } else {
-    parts.push(`<p class="field-desc">No runs yet - scheduler.py triggers this automatically every N closed trades / M days (see the Learning tab).</p>`);
+    parts.push(`<p class="field-desc">No runs yet - scheduler.py triggers this automatically every N closed trades / M days (see the learning_runs table).</p>`);
   }
 
   parts.push(`<div class="field-label" style="margin-top:18px;margin-bottom:6px;">Bayesian weight-change history</div>`);
@@ -4841,252 +4567,6 @@ function renderEvolutionSection(evo) {
 // Single source for the portfolio-heat explanation, referenced by both the
 // Risk tab caption and TIPS.portfolio_heat so they cannot drift apart again.
 const _HEAT_CAPTION = "Approximate dollar risk across open positions, measured against your configured <code>max_portfolio_risk_pct</code> budget (not against real account equity — the balance data is available, but heat feeds position sizing, so re-basing it is a deliberate change rather than a fix). Stay under 100% of max: the bar turns yellow above 60% and red above 90%.";
-
-/* ============================== JOURNAL TAB ============================== */
-async function renderJournalTab(el) {
-  el.innerHTML = `
-    <div class="panel" style="margin-bottom:16px;">
-      <div class="panel-head">${svg('journal',15)}<span class="panel-title">Trade Journal</span></div>
-      <div id="journal-body">Loading…</div>
-    </div>
-    <div class="panel">
-      <div class="panel-head">${svg('risk',15)}<span class="panel-title">Regret Analysis</span><span class="fill"></span>
-        <button class="btn btn-sm" onclick="loadRegretPanel(true)">${svg('refresh',13)}<span>Refresh</span></button>
-      </div>
-      <div id="regret-body">Loading…</div>
-    </div>
-    <div class="panel" style="margin-top:14px;">
-      <div class="panel-head">${svg('risk',15)}<span class="panel-title">Threshold Regret (Missed Buys)</span><span class="fill"></span>
-        <button class="btn btn-sm" onclick="loadThresholdRegretPanel(true)">${svg('refresh',13)}<span>Run Now</span></button>
-      </div>
-      <div id="threshold-regret-body">Loading…</div>
-    </div>`;
-  const body = document.getElementById("journal-body");
-  let trades;
-  try {
-    trades = await fetchJSON("/api/trades?limit=100");
-  } catch (e) {
-    body.innerHTML = tabErrorHTML(e);
-    return;
-  }
-  if (!trades.length) { body.innerHTML = emptyBlock('inbox','No confirmed trades yet','Use confirm_fill.py buy/sell after executing a trade in Claude Desktop.'); }
-  else {
-    body.innerHTML = `<p class="field-desc" style="margin-bottom:10px;">Click a row to see the indicators and rule breakdown that led to that transaction.</p>
-      <div class="table-wrap"><table><thead><tr><th></th><th>Time</th><th>Ticker</th><th>Side</th><th class="num">Amount</th><th>Status</th></tr></thead><tbody>
-      ${trades.map((t, i) => `<tr class="signal-row" style="cursor:pointer;" onclick="toggleDetailRow('trade', ${i})">
-        <td class="subtle"><span id="trade-caret-${i}" style="display:inline-block;transition:transform .15s;">${svg('chevron', 12)}</span></td>
-        <td class="subtle">${fmtCST(t.timestamp)}</td>
-        <td><b>${tickerLabel(t.ticker)}</b></td>
-        <td><span class="pill ${t.side==='buy'?'pill-green':'pill-red'}">${t.side}</span></td>
-        <td class="num">$${t.amount?.toFixed(2)||"—"}</td>
-        <td class="subtle">${t.status||"—"}</td>
-      </tr>
-      <tr id="trade-detail-${i}" style="display:none;"><td colspan="6">${renderTradeDetail(t)}</td></tr>
-      `).join("")}
-    </tbody></table></div>`;
-  }
-  loadRegretPanel(false);
-  loadThresholdRegretPanel(false);
-}
-
-// Threshold Regret panel (2026-07-23, OXY dynamic-threshold review, Trinath:
-// "build a process for that evaluation and learning so such false negatives
-// are identified and at same time potential stocks are not missed") - the
-// buy-side mirror of the Regret Analysis panel above: instead of "was the
-// EXIT well-timed", this asks "was the REJECTION (HOLD via dynamic
-// threshold) justified". Segments HOLD signals by the size of the threshold
-// adjustment that rejected them and isolates the market-breadth
-// double-counting concern the review specifically flagged. Plain GET loads
-// the latest cached run (automatic weekly, engine/learning_loop.py) instantly;
-// "Run Now" hits POST /api/analytics/threshold_regret/run for an on-demand
-// evaluation, same parity Trinath asked for with the Learning tab's "Run
-// Backtest Now" button - but this one runs inline (cheap, mostly cached),
-// no polling loop needed.
-function verdictPillClass(v) {
-  if (v === "threshold_may_be_too_strict_here") return "pill-yellow";
-  if (v === "threshold_appears_justified_here") return "pill-green";
-  return "pill-neutral";
-}
-const VERDICT_LABELS = {
-  threshold_may_be_too_strict_here: "May be too strict",
-  threshold_appears_justified_here: "Appears justified",
-  insufficient_data: "Insufficient data",
-};
-async function loadThresholdRegretPanel(runNow) {
-  const el = document.getElementById("threshold-regret-body");
-  if (!el) return;
-  el.innerHTML = "Loading…" + (runNow ? " (evaluating, may take a moment)" : "");
-  let report;
-  try {
-    if (runNow) {
-      report = await (await authFetch("/api/analytics/threshold_regret/run", { method: "POST" })).json();
-    } else {
-      report = await (await fetch("/api/analytics/threshold_regret")).json();
-    }
-  } catch (e) {
-    el.innerHTML = `<p class="field-desc">Couldn't load threshold regret analysis: ${e.message}</p>`;
-    return;
-  }
-  if (report && report.not_yet_run) {
-    el.innerHTML = emptyBlock('inbox', 'Not evaluated yet',
-      report.message || 'Click "Run Now" above to evaluate, or wait for the weekly automatic run.');
-    return;
-  }
-  if (!report || !report.n_signals) {
-    el.innerHTML = emptyBlock('inbox', 'No HOLD signals to evaluate yet',
-      'Once the scanner scores tickers that miss the dynamic buy threshold, this checks what they did afterward and flags whether the rejection was justified — broken down by how large the threshold adjustment was.');
-    return;
-  }
-  const overall = report.overall || {};
-  const buckets = report.by_adjustment_bucket || [];
-  const br = report.breadth_isolation || {};
-  const pen = br.breadth_penalized || {}, neu = br.breadth_neutral_or_better || {};
-  el.innerHTML = `
-    <p class="field-desc" style="margin-bottom:8px;">${report.n_evaluated} of ${report.n_signals} HOLD signal(s) evaluated (${report.n_still_pending} still pending). ${overall.n ? `Overall avg would-have-returned <b>${overall.avg_would_have_returned_pct>=0?'+':''}${overall.avg_would_have_returned_pct}%</b>, win rate ${overall.pct_would_have_won}% (n=${overall.n}).` : ''}</p>
-    <div class="field-label" style="margin:12px 0 6px;">By threshold-adjustment size</div>
-    <div class="table-wrap"><table><thead><tr><th>Adjustment</th><th class="num">n</th><th class="num">Avg return</th><th class="num">Win rate</th><th>Verdict</th></tr></thead><tbody>
-    ${buckets.map(b => `<tr>
-      <td>${b.bucket}</td>
-      <td class="num">${b.n}</td>
-      <td class="num">${b.avg_would_have_returned_pct != null ? (b.avg_would_have_returned_pct>=0?'+':'')+b.avg_would_have_returned_pct.toFixed(1)+'%' : "—"}</td>
-      <td class="num">${b.pct_would_have_won != null ? b.pct_would_have_won.toFixed(0)+'%' : "—"}</td>
-      <td><span class="pill ${verdictPillClass(b.verdict)}">${VERDICT_LABELS[b.verdict] || b.verdict}</span></td>
-    </tr>`).join("")}
-    </tbody></table></div>
-    <div class="field-label" style="margin:14px 0 6px;">Breadth-penalty isolation</div>
-    <p class="field-desc">MARKET_BREADTH is both an 11%-weighted scoring bucket AND a separate threshold penalty — this checks whether the penalty is doing real work or double-counting.</p>
-    <div style="margin-top:6px;">
-      <span class="pill pill-neutral" style="margin-right:6px;">Breadth penalized: n=${pen.n||0}${pen.n?`, ${pen.avg_would_have_returned_pct>=0?'+':''}${pen.avg_would_have_returned_pct}% avg, ${pen.pct_would_have_won}% win`:''}</span>
-      <span class="pill pill-neutral">Breadth neutral/better: n=${neu.n||0}${neu.n?`, ${neu.avg_would_have_returned_pct>=0?'+':''}${neu.avg_would_have_returned_pct}% avg, ${neu.pct_would_have_won}% win`:''}</span>
-    </div>`;
-}
-
-// Regret Analysis panel (2026-07-17, Akhil: "is it possible to build a
-// process that monitors the sold stocks for stop loss and see how they
-// behave for a few weeks and learn from the behaviour") - analytics/
-// regret_analysis.py already existed (forward-simulates real price history
-// after every closed trade and classifies the exit as well-timed vs. too
-// tight/conservative) but had no route or UI before this. Covers PAPER
-// closes too (most of what this account has right now), not just confirmed
-// real fills - that's why it's a separate panel from the Trade Journal table
-// above rather than folded into it. First load per trade can be slow (real
-// yfinance forward-price lookups); results are cached server-side per
-// pattern_id, so a plain reload is fast - "Refresh" forces recomputation.
-const CLASSIFICATION_LABELS = {
-  well_timed_exit: "Well-timed exit",
-  well_timed_exit_avoided_downside: "Well-timed (avoided downside)",
-  stop_too_tight: "Stop too tight",
-  target_too_conservative: "Target too conservative",
-  exit_score_too_aggressive: "Exit score too aggressive",
-  time_stop_too_early: "Time stop too early",
-  manual_exit_left_upside: "Manual exit left upside",
-  unclassified_material_regret: "Unclassified regret",
-  still_maturing: "Still maturing",
-};
-function classificationPillClass(cls) {
-  if (cls === "stop_too_tight" || cls === "target_too_conservative" ||
-      cls === "exit_score_too_aggressive" || cls === "time_stop_too_early" ||
-      cls === "manual_exit_left_upside" || cls === "unclassified_material_regret") return "pill-yellow";
-  if (cls === "well_timed_exit" || cls === "well_timed_exit_avoided_downside") return "pill-green";
-  return "pill-neutral";
-}
-async function loadRegretPanel(forceRecompute, limit) {
-  const el = document.getElementById("regret-body");
-  if (!el) return;
-  limit = limit || 25;
-  el.innerHTML = "Loading…" + (forceRecompute || limit > 25
-    ? ` (evaluating up to ${limit} trades against real price history — first-time evaluations take a couple seconds each, so this can take a minute or two; already-evaluated trades are cached and load instantly)`
-    : "");
-  let report;
-  try {
-    const url = `/api/analytics/regret?limit=${limit}` + (forceRecompute ? "&force_recompute=true" : "");
-    report = await (await fetch(url)).json();
-  } catch (e) {
-    el.innerHTML = `<p class="field-desc">Couldn't load regret analysis: ${e.message}</p>`;
-    return;
-  }
-  const records = report.records || [];
-  if (!records.length) {
-    el.innerHTML = emptyBlock('inbox', 'No closed trades to evaluate yet',
-      'Once trades close (paper or real), this checks what the ticker did in the following weeks and flags whether the exit was well-timed or left upside on the table.');
-    return;
-  }
-  const summary = report.summary || {};
-  const summaryHtml = Object.entries(summary).map(([cls, s]) =>
-    `<span class="pill ${classificationPillClass(cls)}" style="margin:2px 4px 2px 0;" title="avg regret ${s.avg_regret_pct>=0?'+':''}${s.avg_regret_pct}%">${CLASSIFICATION_LABELS[cls]||cls}: ${s.n}</span>`
-  ).join("");
-  el.innerHTML = `
-    <p class="field-desc" style="margin-bottom:8px;">For each closed trade, checks real price history in the weeks after the exit and flags whether it was well-timed or left upside on the table. ${report.n_evaluated} trade(s) evaluated (most recent ${limit} considered). <a href="#" onclick="loadRegretPanel(false, ${limit + 25}); return false;">Load ${limit + 25}</a></p>
-    <div style="margin-bottom:12px;">${summaryHtml}</div>
-    <div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Exit reason</th><th class="num">Regret</th><th class="num">Downside avoided</th><th>Classification</th></tr></thead><tbody>
-    ${records.map(r => `<tr>
-      <td><b>${tickerLabel(r.ticker)}</b></td>
-      <td class="subtle" style="max-width:260px;white-space:normal;">${r.exit_reason || "—"}</td>
-      <td class="num">${r.regret_pct != null ? (r.regret_pct>=0?'+':'')+r.regret_pct.toFixed(1)+'%' : "—"}</td>
-      <td class="num">${r.downside_avoided_pct != null ? (r.downside_avoided_pct>=0?'+':'')+r.downside_avoided_pct.toFixed(1)+'%' : "—"}</td>
-      <td><span class="pill ${classificationPillClass(r.classification)}">${CLASSIFICATION_LABELS[r.classification] || r.classification}</span></td>
-    </tr>`).join("")}
-  </tbody></table></div>`;
-}
-
-function renderTradeDetail(t) {
-  const snap = t.snapshot;
-  if (!snap) {
-    return `<div style="padding:12px 4px 16px 34px;"><p class="field-desc">No indicator/rule snapshot recorded for this transaction (logged before this feature was added).</p></div>`;
-  }
-  const parts = [];
-  const sig = snap.recent_signal;
-  const feats = snap.trigger === 'buy' ? snap.pattern_features : snap.entry_pattern_features;
-
-  if (snap.trigger === 'sell') {
-    parts.push(`<div class="field-label" style="margin-bottom:6px;">Exit result</div>`);
-    parts.push(`<p class="field-desc">Entry $${snap.entry_price?.toFixed(2)} &rarr; Exit $${snap.fill_price?.toFixed(2)} | P&L $${snap.pnl?.toFixed(2)} (${snap.pnl_pct>=0?'+':''}${snap.pnl_pct?.toFixed(2)}%)</p>`);
-  }
-
-  if (sig && sig.bucket_scores && sig.bucket_scores.length) {
-    parts.push(`<div class="field-label" style="margin-top:14px;margin-bottom:6px;">6-bucket score breakdown (most recent scan before this ${snap.trigger})</div>`);
-    parts.push(renderBucketScores(sig.bucket_scores));
-  } else if (sig && sig.rules_failed && sig.rules_failed.length) {
-    parts.push(`<p class="field-desc" style="margin-top:14px;">${sig.rules_failed.map(r=>`<b>${r.name}</b>: ${r.detail}`).join('<br>')}</p>`);
-  }
-
-  if (sig && sig.sell_triggered_rule) {
-    parts.push(`<div class="field-label" style="margin-top:14px;margin-bottom:4px;">Sell rule (most recent scan)</div>`);
-    parts.push(`<p class="field-desc"><b>${sig.sell_triggered_rule}</b>: ${sig.sell_reason||''}</p>`);
-    parts.push(`<p class="field-desc">${sellRuleExplainer(sig.sell_triggered_rule)}</p>`);
-  }
-
-  if (feats) {
-    const fmt = (v, d=1) => (v === undefined || v === null) ? null : (typeof v === 'number' ? v.toFixed(d) : v);
-    const rows = [
-      [withTip('RSI(14)', 'ind_rsi'), fmt(feats.rsi14)],
-      ['MACD crossover', feats.macd_crossover],
-      [withTip('Bollinger %B', 'ind_bb_pct'), fmt(feats.bb_pct, 2)],
-      [withTip('Stochastic K', 'ind_stoch'), fmt(feats.stochastic_k)],
-      [withTip('Volume ratio', 'ind_vol_ratio'), feats.volume_ratio!=null?fmt(feats.volume_ratio,2)+'x':null],
-      [withTip('Change %', 'ind_change_pct'), feats.change_pct!=null?fmt(feats.change_pct,2)+'%':null],
-      [withTip('VIX', 'vix'), fmt(feats.vix_raw)],
-      [withTip('Fear &amp; Greed', 'fg_score'), feats.fg_score!=null?`${feats.fg_score} (${feats.fg_rating||''})`:null],
-      ['Regime', feats.regime],
-      ['Setup type', feats.setup_type],
-      ['Sector', feats.sector],
-      ['Finviz rating', feats.finviz_rating],
-      ['Analyst consensus', feats.analyst_consensus],
-      ['Insider direction', feats.insider_direction],
-    ].filter(([,v]) => v !== null && v !== undefined && v !== 'unknown' && v !== 'N/A');
-    if (rows.length) {
-      parts.push(`<div class="field-label" style="margin-top:14px;margin-bottom:6px;">Key indicators ${snap.trigger==='buy'?'at entry':'at original entry'}</div>`);
-      parts.push(`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;">` +
-        rows.map(([k,v]) => `<div class="subtle" style="font-size:11px;"><b style="color:var(--text-0);">${k}:</b> ${v}</div>`).join('') + `</div>`);
-    }
-  }
-
-  if (!sig && !feats) {
-    parts.push(`<p class="field-desc">No rule/indicator detail in this snapshot.</p>`);
-  }
-
-  return `<div style="padding:12px 4px 16px 34px;">${parts.join("")}</div>`;
-}
 
 /* ============================== MONITOR TAB ============================== */
 async function renderMonitorTab(el) {

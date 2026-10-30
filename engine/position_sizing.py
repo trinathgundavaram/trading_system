@@ -82,6 +82,24 @@ def _get_portfolio_total(db, simulated=True) -> float:
         return 0.0
 
 
+def _get_equity(db, simulated=True) -> float:
+    """Total equity of the paper purse: cash + open positions (cost basis). 0.0 when unavailable.
+
+    2026-10-30: "% of portfolio" sizing used the sum of OPEN positions as its base, which is
+    nearly zero for a book that holds few positions - so on a $10,000 purse every trade came out
+    at $20 (0.2%), and the paper results were too small to mean anything. The base is the whole
+    purse. Live books fall back to the open-position sum (no purse row to read)."""
+    if db is None or not simulated:
+        return 0.0
+    try:
+        acct = db.get_paper_account()
+        if not acct:
+            return 0.0
+        return float(acct["cash"]) + _get_portfolio_total(db, simulated=True)
+    except Exception:
+        return 0.0
+
+
 def _score_tier(pct_score: float, tiers: list) -> tuple:
     """tiers sorted descending by min_score by config convention - returns
     (size_pct, label) for the first tier the score clears."""
@@ -168,7 +186,7 @@ def calculate(buy_result, score_result, ticker_data: dict, regime, cfg: dict,
     base_allocation = fallback_allocation
 
     if use_dynamic_sizing and db is not None:
-        portfolio_total = _get_portfolio_total(db, simulated=True)
+        portfolio_total = _get_equity(db, simulated=True) or _get_portfolio_total(db, simulated=True)
         if portfolio_total > 0:
             position_pct = float(trading_cfg.get("position_size_pct_of_portfolio", 3.0))
             base_allocation = portfolio_total * position_pct / 100.0

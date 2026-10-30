@@ -213,3 +213,18 @@ def test_fallback_to_static_on_empty_portfolio():
         f"Empty portfolio should fall back to trade_size_usd, "
         f"got base_allocation_usd={result.base_allocation_usd}"
     )
+
+
+def test_dynamic_base_is_the_whole_purse_not_just_open_positions():
+    from engine import position_sizing as ps
+
+    class Db:
+        def get_paper_account(self): return {"cash": 9000.0}
+        def get_all_positions(self, simulated=True): return [{"dollar_amount": 1000.0, "closed_at": None}]
+
+    assert ps._get_equity(Db(), simulated=True) == 10000.0
+    assert ps._get_equity(Db(), simulated=False) == 0.0           # live book: no purse row, caller falls back
+
+    class NoPurse:
+        def get_paper_account(self): return None
+    assert ps._get_equity(NoPurse(), simulated=True) == 0.0

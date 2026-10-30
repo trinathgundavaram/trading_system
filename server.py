@@ -1873,12 +1873,34 @@ async def get_version():
     }
 
 
+_overview_cache = {"t": 0.0, "data": None}
+_OVERVIEW_TTL = 10.0        # seconds; the Overview polls every 30s and the Swing dashboard shares this call
+
+
 @app.get("/api/strategies/overview")
 async def strategies_overview():
-    """Side-by-side paper strategies for the Overview tab (read-only)."""
+    """Side-by-side paper strategies for the Overview and the Swing dashboard (read-only).
+    One call carries everything both pages need (including the swing engine's track record),
+    and the result is cached for a few seconds so two tabs or two browsers do not each rebuild it."""
+    import time as _t
+    now = _t.monotonic()
+    if _overview_cache["data"] is not None and now - _overview_cache["t"] < _OVERVIEW_TTL:
+        return _overview_cache["data"]
     from engine import strategy_overview
     from config_loader import load_config_dict
-    return strategy_overview.build(Database(), load_config_dict())
+    db = Database()
+    data = strategy_overview.build(db, load_config_dict())
+    try:
+        from analytics.performance import profit_factor, sharpe_ratio
+        outcomes = [p["outcome_pct"] for p in db.get_patterns(mode=None, closed_only=True)
+                    if p.get("outcome_pct") is not None]
+        data["track_record"] = {"n_closed_patterns": len(outcomes),
+                                "profit_factor": profit_factor(outcomes) if outcomes else 0.0,
+                                "sharpe_ratio": sharpe_ratio(outcomes) if outcomes else 0.0}
+    except Exception:
+        data["track_record"] = None
+    _overview_cache.update(t=now, data=data)
+    return data
 
 
 @app.get("/api/status")
