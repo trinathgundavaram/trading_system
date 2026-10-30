@@ -406,6 +406,10 @@ position_sizing:
 portfolio_risk:
   enabled: true
   max_sector_exposure_pct: 35
+  # Sector/theme shares are measured against max(invested $, this % of the paper purse). The book is ~20% deployed, so
+  # against invested $ alone one sector read 32% when it was 7% of the purse and strong buys in it were refused
+  # (309 "scaled to zero" blocks). 0 = old behaviour. Fades out once the book is more than this % deployed.
+  concentration_base_floor_pct_of_purse: 50
   max_theme_exposure_pct: 40
   max_portfolio_beta: 1.6
   correlation_lookback_days: 60

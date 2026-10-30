@@ -329,6 +329,14 @@ class PortfolioRiskEngine:
 
         existing_total = sum((p.get("dollar_amount") or 0) for p in positions)
         post_total = existing_total + candidate_dollar_amount
+        # Sector / theme shares are measured against the larger of the dollars invested and a floor of the paper
+        # purse. Against invested dollars alone, a book that is only 20% deployed reads "Energy 32%" when that is
+        # 7% of the purse, and any strong buy in the sector is refused. The floor fades out as the book fills.
+        _floor_pct = float(rcfg.get("concentration_base_floor_pct_of_purse", 50))
+        _purse = float((cfg.get("paper_trading", {}) or {}).get("starting_cash", 0) or 0) if _watch else 0.0
+        conc_floor = _purse * _floor_pct / 100.0
+        conc_existing = max(existing_total, conc_floor)
+        conc_post = max(post_total, conc_floor)
 
         reasons, warnings = [], []
 
@@ -338,8 +346,8 @@ class PortfolioRiskEngine:
             (p.get("dollar_amount") or 0) for p in positions
             if (info_map.get(p["ticker"], {}) or {}).get("sector") == candidate_sector
         )
-        pre_sector_pct = (existing_sector_dollars / existing_total * 100) if existing_total else 0.0
-        post_sector_pct = ((existing_sector_dollars + candidate_dollar_amount) / post_total * 100) if post_total else 0.0
+        pre_sector_pct = (existing_sector_dollars / conc_existing * 100) if conc_existing else 0.0
+        post_sector_pct = ((existing_sector_dollars + candidate_dollar_amount) / conc_post * 100) if conc_post else 0.0
         mult_sector = _scale_for_cap(pre_sector_pct, post_sector_pct, sector_cap)
         if mult_sector < 1.0:
             reasons.append(
@@ -374,8 +382,8 @@ class PortfolioRiskEngine:
             # rationed rather than allowed to accumulate under the same
             # allowance as a risk you can actually see.
             this_cap = unclassified_cap if theme == UNCLASSIFIED else theme_cap
-            pre_theme_pct = (existing_theme_dollars / existing_total * 100) if existing_total else 0.0
-            post_theme_pct = ((existing_theme_dollars + candidate_dollar_amount) / post_total * 100) if post_total else 0.0
+            pre_theme_pct = (existing_theme_dollars / conc_existing * 100) if conc_existing else 0.0
+            post_theme_pct = ((existing_theme_dollars + candidate_dollar_amount) / conc_post * 100) if conc_post else 0.0
             if post_theme_pct > worst_theme_post_pct:
                 worst_theme_post_pct, worst_theme_name, worst_theme_cap = (
                     post_theme_pct, theme, this_cap)

@@ -265,3 +265,18 @@ def test_beta_breach_is_severe_past_the_multiple():
     result = _evaluate(db, _cfg(), sector="Energy", industry="Oil", beta=3.0)
     assert any("beta" in b for b in result.severe_breaches)
     assert result.allowed is False
+
+
+def test_thin_book_sector_share_is_measured_against_the_purse_floor():
+    """Three healthcare names at $100 in a $10k WATCH purse are 3% of it, not 100% of 'the book'. A fourth healthcare
+    buy must be allowed at full size once the floor is on, and refused when the floor is switched off."""
+    db = FakeDB(positions=[_pos("FLYW", 100), _pos("ERAS", 100), _pos("XRAY", 100)],
+                info={t: {"sector": "Healthcare", "industry": "Biotechnology", "beta": 1.0}
+                      for t in ("FLYW", "ERAS", "XRAY")})
+    cfg_on, cfg_off = _cfg(concentration_base_floor_pct_of_purse=50), _cfg(concentration_base_floor_pct_of_purse=0)
+    for c in (cfg_on, cfg_off):
+        c["paper_trading"] = {"starting_cash": 10000}
+    r_on = PortfolioRiskEngine(db).evaluate("ADPT", "Healthcare", 1.0, 100.0, 1.0, cfg_on, candidate_industry="Biotechnology")
+    r_off = PortfolioRiskEngine(db).evaluate("ADPT", "Healthcare", 1.0, 100.0, 1.0, cfg_off, candidate_industry="Biotechnology")
+    assert r_on.allowed and r_on.size_multiplier == 1.0
+    assert r_off.size_multiplier < 1.0
