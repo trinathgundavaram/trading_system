@@ -214,3 +214,24 @@ def test_swing_experiment_pairs_trades_and_only_counts_new_entries():
     s = summarize(trades)
     assert s["round_trips"] == 2 and s["entry_days"] == 2 and s["verdict"] == "collecting"
     assert abs(s["profit_factor"] - 3.0 / 2.0) < 1e-9
+
+
+def test_strategy_controls_endpoint_whitelists_and_clamps(tmp_path, monkeypatch):
+    import asyncio, shutil
+    import yaml
+    import server
+    cfgp = tmp_path / "config.yaml"
+    shutil.copy(server.CONFIG_PATH, cfgp)
+    monkeypatch.setattr(server, "CONFIG_PATH", cfgp)
+    update = {"sleeves": {"sector_momentum_sleeve": {"leverage": 9, "paper_enabled": False, "evil": 1},
+                          "stock_momentum_sleeve": {"selection": "mom_lowvol"},
+                          "not_a_sleeve": {"leverage": 2}},
+              "swing": {"day_hold_sessions": 99, "no_buy_above": 10, "position_size_pct_of_portfolio": 50}}
+    asyncio.run(server.update_config(update, True))
+    c = yaml.safe_load(cfgp.read_text())
+    assert c["sector_momentum_sleeve"]["leverage"] == 3.0 and c["sector_momentum_sleeve"]["paper_enabled"] is False
+    assert "evil" not in c["sector_momentum_sleeve"] and "not_a_sleeve" not in c
+    assert c["stock_momentum_sleeve"]["selection"] == "mom_lowvol"
+    assert c["trading"]["day_hold_sessions"] == 3 and c["market_filters"]["fear_greed"]["no_buy_above"] == 30
+    assert c["trading"]["position_size_pct_of_portfolio"] == 10.0
+    assert cfgp.read_text().count("#") > 100                       # comments survived the save

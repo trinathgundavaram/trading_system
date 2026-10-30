@@ -982,6 +982,45 @@ async def update_config(update: dict, _: bool = Depends(require_token)):
                 cfg["trading"]["max_positions"] = max(1, min(50, n))
             except (TypeError, ValueError):
                 pass
+    # --- Strategy controls (2026-10-30): paper sleeves + the swing experiment. Whitelisted keys, strict types and
+    # clamps; paper-only settings (none of these can arm live trading).
+    if "sleeves" in update and isinstance(update["sleeves"], dict):
+        allowed = {"sector_momentum_sleeve": ("paper_enabled", "leverage", "band_pct"),
+                   "stock_momentum_sleeve": ("paper_enabled", "leverage", "band_pct", "selection"),
+                   "stock_lowvol_sleeve": ("paper_enabled", "leverage", "band_pct"),
+                   "rsi2_sleeve": ("paper_enabled",),
+                   "tradingagents_advisor": ("enabled",)}
+        for name, patch in update["sleeves"].items():
+            if name not in allowed or not isinstance(patch, dict) or name not in cfg:
+                continue
+            for k, v in patch.items():
+                if k not in allowed[name]:
+                    continue
+                try:
+                    if k in ("paper_enabled", "enabled"):
+                        cfg[name][k] = bool(v)
+                    elif k == "leverage":
+                        cfg[name][k] = max(1.0, min(3.0, float(v)))
+                    elif k == "band_pct":
+                        cfg[name][k] = max(0.0, min(5.0, float(v)))
+                    elif k == "selection" and v in ("momentum", "mom_lowvol"):
+                        cfg[name][k] = v
+                except (TypeError, ValueError):
+                    pass
+    if "swing" in update and isinstance(update["swing"], dict):
+        sw = update["swing"]
+        cfg.setdefault("trading", {})
+        try:
+            if "day_hold_sessions" in sw:
+                cfg["trading"]["day_hold_sessions"] = max(0, min(3, int(sw["day_hold_sessions"])))
+            if "use_dynamic_sizing" in sw:
+                cfg["trading"]["use_dynamic_sizing"] = bool(sw["use_dynamic_sizing"])
+            if "position_size_pct_of_portfolio" in sw:
+                cfg["trading"]["position_size_pct_of_portfolio"] = max(0.5, min(10.0, float(sw["position_size_pct_of_portfolio"])))
+            if "no_buy_above" in sw:
+                cfg.setdefault("market_filters", {}).setdefault("fear_greed", {})["no_buy_above"] = max(30, min(95, int(sw["no_buy_above"])))
+        except (TypeError, ValueError):
+            pass
     if "account" in update and isinstance(update["account"], dict):
         # Robinhood account link (2026-07-17, agentic-account gap): which
         # account number robin_stocks reads/trades (empty = primary), and

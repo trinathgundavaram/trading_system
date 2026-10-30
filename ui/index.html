@@ -547,6 +547,12 @@
   .ov-value { font-size: 28px; font-weight: 700; letter-spacing: -.6px; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .ov-sub { font-size: 12px; color: var(--text-1); margin-top: 3px; }
   .ov-gain { color: var(--green); } .ov-loss { color: var(--red); }
+  details.ctl-adv { padding: 0; }
+  details.ctl-adv > summary { cursor: pointer; padding: 14px 18px; list-style: none; font-size: 13px; color: var(--text-1); }
+  details.ctl-adv > summary::-webkit-details-marker { display: none; }
+  details.ctl-adv > summary::before { content: "▸ "; color: var(--text-2); }
+  details.ctl-adv[open] > summary::before { content: "▾ "; }
+  details.ctl-adv > .panel, details.ctl-adv > .grid { margin: 0 16px 16px; }
   /* Phone layout for the grouped nav (2026-10-30): the earlier mobile rules assumed a flat list
      of links; with section labels and nested groups the sidebar became a tall, mostly empty block.
      On a phone it is one horizontal, scrollable strip of every tab. */
@@ -3614,6 +3620,33 @@ function renderControlTab(el) {
   el.innerHTML = `
     <div id="execution-posture-slot">${executionPosturePanel()}</div>
 
+
+    <div class="panel">
+      <div class="panel-head">${svg('strategy',15)}<span class="panel-title">Strategies (paper)</span><span class="fill"></span>
+        <button class="btn btn-sm" id="kill-btn-top" onclick="toggleKillSwitch()" title="Stops all new swing BUY signals. Existing positions are unaffected.">${killOn ? 'Kill switch ON — reset' : 'Kill switch'}</button></div>
+      <div class="table-wrap"><table class="ov-cmp" data-no-enhance><thead><tr><th>Strategy</th><th>Status</th><th>Leverage</th><th>Selection</th><th>Notes</th></tr></thead><tbody id="sleeve-rows"></tbody></table></div>
+      <div class="field-desc">Each strategy trades its own simulated ledger; none can place a real order. Changing leverage or the selection takes effect at the next rebalance (month-end). If you change leverage, regenerate the drift reference: <code>python3 scripts/build_sleeve_reference.py</code>.</div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">${svg('risk',15)}<span class="panel-title">Swing engine experiment</span></div>
+      <div class="grid grid-3" style="gap:14px">
+        <div class="field"><div class="field-label">Day trades held for</div>
+          <select id="sw-hold" onchange="setSwing('day_hold_sessions', +this.value)">
+            ${[[0, "same day (flatten 15:55 ET)"], [1, "next session's close"], [2, "two sessions"]].map(([v, l]) => `<option value="${v}" ${(cfg.trading?.day_hold_sessions ?? 0) === v ? "selected" : ""}>${l}</option>`).join("")}</select>
+          <div class="field-desc">Replaying real entries, the pop lasted through the next close and faded from day 3.</div></div>
+        <div class="field"><div class="field-label">No new entries when Fear &amp; Greed above</div>
+          <input type="number" id="sw-greed" min="30" max="95" value="${cfg.market_filters?.fear_greed?.no_buy_above ?? 60}" onchange="setSwing('no_buy_above', +this.value)">
+          <div class="field-desc">Entries made in greed (above 55) averaged -4.8%; exits keep running.</div></div>
+        <div class="field"><div class="field-label">Position sizing</div>
+          <select id="sw-size" onchange="setSwing('use_dynamic_sizing', this.value === 'on')">
+            <option value="off" ${cfg.trading?.use_dynamic_sizing ? "" : "selected"}>small fixed (~$20-100)</option>
+            <option value="on" ${cfg.trading?.use_dynamic_sizing ? "selected" : ""}>% of purse (${cfg.trading?.position_size_pct_of_portfolio ?? 5}%)</option></select>
+          <div class="field-desc">Keep small until the forward test passes (see the Swing dashboard).</div></div>
+      </div>
+    </div>
+
+    <details class="panel ctl-adv"><summary><b>Swing engine settings</b> — watchlist, risk level, screener, rotation</summary>
     <div class="panel">
       <div class="panel-head">${svg('positions',15)}<span class="panel-title">Watchlist</span></div>
       <div class="chips" id="watchlist-chips"></div>
@@ -3630,6 +3663,65 @@ function renderControlTab(el) {
       <div class="field-desc">Thresholds shown are read live from <code>config.yaml</code>'s <code>risk.&lt;LEVEL&gt;</code> blocks.</div>
     </div>
 
+    <div class="panel">
+      <div class="panel-head">${svg('control',15)}<span class="panel-title">Auto-Discovery Screener</span></div>
+      <div class="field">
+        <div class="field-label">Status</div>
+        <div class="segmented" id="screener-seg"></div>
+        <div class="field-desc">When ON, engine/screener.py adds extra candidates (gainers, volume surges, gap-ups, sector leaders) to each scan cycle's watchlist alongside your manual tickers - same scoring/veto pipeline, no shortcuts, never auto-buys anything. A few sources (Maverick momentum, Finviz, insider-buying screens) are honest no-ops until a real market-wide screening tool exists on those servers - see the Strategy tab or engine/screener.py's docstring for exactly which.</div>
+      </div>
+      <div class="field" style="margin-bottom:0;">
+        <div class="field-label">Max candidates per cycle</div>
+        <input type="number" id="screener-max" min="1" max="50" value="${screenerMax}"
+               style="width:100px;" onchange="setScreenerMax(this.value)" ${screenerOn ? '' : 'disabled'}>
+        <div class="field-desc">Caps how many extra screener-found tickers get evaluated in one cycle, on top of the watchlist.</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">${svg('positions',15)}<span class="panel-title">Portfolio Cap &amp; Rotation</span></div>
+      <div class="field">
+        <div class="field-label">Max open positions</div>
+        <input type="number" id="max-positions" min="1" max="50" value="${maxPositions}"
+               style="width:100px;" onchange="setMaxPositions(this.value)">
+        <div class="field-desc">The portfolio cap (<code>trading.max_positions</code>) - once this many positions are open, new buy signals are skipped (or rotated, below). Applies to both the paper and real book. Requires the auth token.</div>
+      </div>
+      <div class="field">
+        <div class="field-label">Rotation</div>
+        <div class="segmented" id="rotation-seg"></div>
+        <div class="field-desc">When ON and the book is full, a top-tier new candidate may close the WEAKEST current holding to take its slot. The victim is picked by the exit engine's own Position Health score - never by comparing entry scores - so a healthy position is never sacrificed for a shinier setup, and anti-churn guardrails (below) apply to every rotation. See <code>engine/rotation.py</code>.</div>
+      </div>
+      <div class="grid grid-2" style="gap:10px;">
+        <div class="field">
+          <div class="field-label">Min candidate score (%)</div>
+          <input type="number" id="rot-min-score" min="50" max="100" value="${rot.min_candidate_score ?? 85}"
+                 style="width:100px;" onchange="setRotationField('min_candidate_score', this.value)" ${rotOn ? '' : 'disabled'}>
+          <div class="field-desc">Only a candidate scoring at least this may displace anything - "merely higher than something I hold" is not enough.</div>
+        </div>
+        <div class="field">
+          <div class="field-label">Max victim health (0-100)</div>
+          <input type="number" id="rot-max-health" min="0" max="75" value="${rot.max_victim_health_score ?? 55}"
+                 style="width:100px;" onchange="setRotationField('max_victim_health_score', this.value)" ${rotOn ? '' : 'disabled'}>
+          <div class="field-desc">A holding is only rotation-eligible when its Position Health has already fallen to this or below (REDUCE / deep MONITOR tier).</div>
+        </div>
+        <div class="field" style="margin-bottom:0;">
+          <div class="field-label">Min hold days</div>
+          <input type="number" id="rot-min-days" min="0" max="30" value="${rot.min_hold_days ?? 3}"
+                 style="width:100px;" onchange="setRotationField('min_hold_days', this.value)" ${rotOn ? '' : 'disabled'}>
+          <div class="field-desc">A position gets this long to develop before it can be rotated out (anti-churn).</div>
+        </div>
+        <div class="field" style="margin-bottom:0;">
+          <div class="field-label">Max rotations / week</div>
+          <input type="number" id="rot-max-week" min="0" max="20" value="${rot.max_rotations_per_week ?? 2}"
+                 style="width:100px;" onchange="setRotationField('max_rotations_per_week', this.value)" ${rotOn ? '' : 'disabled'}>
+          <div class="field-desc">Hard weekly budget per book - score noise can't churn the portfolio no matter what.</div>
+        </div>
+      </div>
+    </div>
+
+    </details>
+
+    <details class="panel ctl-adv danger-zone"><summary><b>Live trading &amp; Robinhood</b> — trading mode, execution gates (all OFF; env veto set)</summary>
     <div class="grid grid-2">
       <div class="panel">
         <div class="panel-head">${svg('control',15)}<span class="panel-title">Trading Mode</span></div>
@@ -3689,62 +3781,6 @@ function renderControlTab(el) {
     </div>
 
     <div class="panel">
-      <div class="panel-head">${svg('control',15)}<span class="panel-title">Auto-Discovery Screener</span></div>
-      <div class="field">
-        <div class="field-label">Status</div>
-        <div class="segmented" id="screener-seg"></div>
-        <div class="field-desc">When ON, engine/screener.py adds extra candidates (gainers, volume surges, gap-ups, sector leaders) to each scan cycle's watchlist alongside your manual tickers - same scoring/veto pipeline, no shortcuts, never auto-buys anything. A few sources (Maverick momentum, Finviz, insider-buying screens) are honest no-ops until a real market-wide screening tool exists on those servers - see the Strategy tab or engine/screener.py's docstring for exactly which.</div>
-      </div>
-      <div class="field" style="margin-bottom:0;">
-        <div class="field-label">Max candidates per cycle</div>
-        <input type="number" id="screener-max" min="1" max="50" value="${screenerMax}"
-               style="width:100px;" onchange="setScreenerMax(this.value)" ${screenerOn ? '' : 'disabled'}>
-        <div class="field-desc">Caps how many extra screener-found tickers get evaluated in one cycle, on top of the watchlist.</div>
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="panel-head">${svg('positions',15)}<span class="panel-title">Portfolio Cap &amp; Rotation</span></div>
-      <div class="field">
-        <div class="field-label">Max open positions</div>
-        <input type="number" id="max-positions" min="1" max="50" value="${maxPositions}"
-               style="width:100px;" onchange="setMaxPositions(this.value)">
-        <div class="field-desc">The portfolio cap (<code>trading.max_positions</code>) - once this many positions are open, new buy signals are skipped (or rotated, below). Applies to both the paper and real book. Requires the auth token.</div>
-      </div>
-      <div class="field">
-        <div class="field-label">Rotation</div>
-        <div class="segmented" id="rotation-seg"></div>
-        <div class="field-desc">When ON and the book is full, a top-tier new candidate may close the WEAKEST current holding to take its slot. The victim is picked by the exit engine's own Position Health score - never by comparing entry scores - so a healthy position is never sacrificed for a shinier setup, and anti-churn guardrails (below) apply to every rotation. See <code>engine/rotation.py</code>.</div>
-      </div>
-      <div class="grid grid-2" style="gap:10px;">
-        <div class="field">
-          <div class="field-label">Min candidate score (%)</div>
-          <input type="number" id="rot-min-score" min="50" max="100" value="${rot.min_candidate_score ?? 85}"
-                 style="width:100px;" onchange="setRotationField('min_candidate_score', this.value)" ${rotOn ? '' : 'disabled'}>
-          <div class="field-desc">Only a candidate scoring at least this may displace anything - "merely higher than something I hold" is not enough.</div>
-        </div>
-        <div class="field">
-          <div class="field-label">Max victim health (0-100)</div>
-          <input type="number" id="rot-max-health" min="0" max="75" value="${rot.max_victim_health_score ?? 55}"
-                 style="width:100px;" onchange="setRotationField('max_victim_health_score', this.value)" ${rotOn ? '' : 'disabled'}>
-          <div class="field-desc">A holding is only rotation-eligible when its Position Health has already fallen to this or below (REDUCE / deep MONITOR tier).</div>
-        </div>
-        <div class="field" style="margin-bottom:0;">
-          <div class="field-label">Min hold days</div>
-          <input type="number" id="rot-min-days" min="0" max="30" value="${rot.min_hold_days ?? 3}"
-                 style="width:100px;" onchange="setRotationField('min_hold_days', this.value)" ${rotOn ? '' : 'disabled'}>
-          <div class="field-desc">A position gets this long to develop before it can be rotated out (anti-churn).</div>
-        </div>
-        <div class="field" style="margin-bottom:0;">
-          <div class="field-label">Max rotations / week</div>
-          <input type="number" id="rot-max-week" min="0" max="20" value="${rot.max_rotations_per_week ?? 2}"
-                 style="width:100px;" onchange="setRotationField('max_rotations_per_week', this.value)" ${rotOn ? '' : 'disabled'}>
-          <div class="field-desc">Hard weekly budget per book - score noise can't churn the portfolio no matter what.</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="panel">
       <div class="panel-head">${svg('positions',15)}<span class="panel-title">Robinhood Account Link</span></div>
       <div class="field">
         <div class="field-label">Account number</div>
@@ -3768,7 +3804,8 @@ function renderControlTab(el) {
         <div class="segmented" id="autosync-seg"></div>
         <div class="field-desc">When ON, every cycle (throttled to 15 min) pulls the account's real holdings and portfolio value. Positions held on Robinhood but missing locally are imported at their real average cost, and from then on the exit engines analyze them every cycle (health, exit score, stops). Never auto-closes anything - a position you sold elsewhere raises an alert with the <code>confirm_fill.py</code> command to run. Requires the auth token.</div>
       </div>
-    </div>
+    </div>    </details>
+
   `;
 
   document.getElementById("watchlist-chips").innerHTML = watchlist.map(t => `
@@ -3796,8 +3833,30 @@ function renderControlTab(el) {
   document.getElementById("autosync-seg").innerHTML = [["OFF",false],["ON",true]].map(([label,val]) =>
     `<button class="${val===autoSyncOn?'active':''}" onclick="setAutoSyncEnabled(${val})">${label}</button>`).join("");
 
+  const sleeveDefs = [
+    ["sector_momentum_sleeve", "Sector momentum", "paper_enabled", true, false, "ETF sectors + broad momentum, T-bills when SPY is weak"],
+    ["stock_momentum_sleeve", "Stock momentum", "paper_enabled", true, true, "Top 40 S&P 500 by momentum"],
+    ["stock_lowvol_sleeve", "Stock mom + low-vol", "paper_enabled", true, false, "Top 40 by momentum + low-volatility rank"],
+    ["rsi2_sleeve", "RSI(2) SPY", "paper_enabled", false, false, "SPY mean-reversion (small, off)"],
+    ["tradingagents_advisor", "TradingAgents advisor", "enabled", false, false, "LLM ratings only, never trades (needs install + API key)"],
+  ];
+  const sl = document.getElementById("sleeve-rows");
+  if (sl) sl.innerHTML = sleeveDefs.map(([name, label, key, hasLev, hasSel, note]) => {
+    const c = cfg[name] || {};
+    const on = !!c[key];
+    const lev = c.leverage ?? 1.0;
+    return `<tr><td><b>${label}</b></td>
+      <td><div class="segmented">${[["OFF", false], ["ON", true]].map(([t, v]) => `<button class="${v === on ? "active" : ""}" onclick="setSleeve('${name}','${key}',${v})">${t}</button>`).join("")}</div></td>
+      <td>${hasLev === false ? "—" : `<select onchange="setSleeve('${name}','leverage',+this.value)">${[1, 1.25, 1.5, 2, 2.5, 3].map(v => `<option value="${v}" ${v === lev ? "selected" : ""}>${v}×</option>`).join("")}</select>`}</td>
+      <td>${hasSel ? `<select onchange="setSleeve('${name}','selection',this.value)">${["momentum", "mom_lowvol"].map(v => `<option ${v === (c.selection || "momentum") ? "selected" : ""}>${v}</option>`).join("")}</select>` : "—"}</td>
+      <td class="subtle" style="white-space:normal">${note}</td></tr>`;
+  }).join("");
+
   loadExecutionPosture();  // fills in the read_ok / breaker / execution_path rows
 }
+
+function setSleeve(name, key, value) { saveConfig({ sleeves: { [name]: { [key]: value } } }, false); }
+function setSwing(key, value) { saveConfig({ swing: { [key]: value } }, false); }
 
 // Live Execution master switch (2026-07-17): enabling requires the auth
 // token AND typing the exact confirmation phrase - shown in the prompt so
@@ -4850,6 +4909,10 @@ async function boot() {
   await loadStatus();
   await loadTickerNames();
   await loadTickerHealth();
+  // The first render used to happen before any state had arrived over the websocket, so opening the
+  // Control tab directly showed defaults (risk cards as dashes, screener OFF, mode SWING) that looked
+  // like real settings. Load the state first.
+  try { Object.assign(state, await (await fetch("/api/state")).json()); } catch (e) { /* websocket will fill it */ }
   connect();
 
   // Restore the tab (and book) from the URL instead of hardcoding the
