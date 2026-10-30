@@ -2702,11 +2702,14 @@ async function renderSignalsTab(el) {
   const body = document.getElementById("signals-body");
   let signals;
   try {
-    signals = await fetchJSON("/api/signals?limit=100");
+    signals = await fetchJSON("/api/signals?limit=400");
   } catch (e) {
     body.innerHTML = tabErrorHTML(e);
     return;
   }
+  // A ticker the engine already holds is skipped before scoring every cycle ("ALREADY_OPEN"); those rows are
+  // noise here. Show only signals for names we do not hold.
+  signals = signals.filter(s => !(s.rules_failed && s.rules_failed[0] && s.rules_failed[0].name === "ALREADY_OPEN")).slice(0, 100);
   _signalsCache = signals;
   if (!signals.length) { body.innerHTML = emptyBlock('inbox','No signals logged yet','Runs after the first scheduler.py cycle.'); return; }
   body.innerHTML = `<p class="field-desc" style="margin-bottom:10px;">Click a row to see the bucket/rule breakdown behind that score.</p>
