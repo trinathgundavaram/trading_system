@@ -22,7 +22,7 @@ def round_trips(trades: list) -> list:
                 continue
             out.append({"ticker": t["ticker"], "mode": b.get("trade_mode"), "entry": b["created_at"],
                         "exit": t["created_at"], "pnl_pct": (t["price"] / b["price"] - 1) * 100,
-                        "pnl": t.get("pnl") or 0.0})
+                        "pnl": t.get("pnl") or 0.0, "reason": t.get("reason") or ""})
     return out
 
 

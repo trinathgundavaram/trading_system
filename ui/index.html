@@ -719,6 +719,59 @@
   }
   #theme-btn { width: 34px; height: 32px; justify-content: center; padding: 0; font-size: 15px; }
 </style>
+<style id="readability-2026-10-30">
+  /* Readability pass: everything was 10-12px. Base text 15px, tables 13.5px, labels 12-12.5px, nothing under 12px.
+     Inline font sizes (written as style="font-size:Npx" all over the templates) are raised with attribute selectors. */
+  body { font-size: 15px; line-height: 1.55; }
+  #sidebar { width: 236px; }
+  #sidebar .brand .name { font-size: 16px; }
+  #sidebar .brand .sub { font-size: 12px; }
+  #sidebar .navitem { font-size: 14.5px; padding: 11px 13px; gap: 12px; }
+  #sidebar .navitem svg { width: 18px; height: 18px; }
+  #sidebar .conn { font-size: 12.5px; }
+  #topbar h1 { font-size: 20px; }
+  .pill { font-size: 12.5px; padding: 4px 11px; }
+  .btn { font-size: 14px; padding: 9px 15px; }
+  .btn-sm { font-size: 13px; padding: 6px 12px; }
+  #subnav button { font-size: 14px; padding: 7px 16px; }
+  .panel { padding: 22px; }
+  .panel-title { font-size: 13px; letter-spacing: .7px; }
+  .panel-head svg { width: 17px; height: 17px; }
+  table { font-size: 14px; }
+  th { font-size: 12px; padding: 10px 12px; }
+  td { padding: 10px 12px; }
+  .field-desc, .ov-note { font-size: 13px; line-height: 1.55; }
+  .field-label { font-size: 13px; }
+  input, select, textarea { font-size: 14.5px; padding: 8px 10px; }
+  .ov-label { font-size: 12.5px; letter-spacing: .6px; }
+  .ov-value { font-size: 32px; }
+  .ov-sub { font-size: 13.5px; }
+  .ov-tile { padding: 20px 22px; }
+  .ov-attn .item { font-size: 14.5px; padding: 12px 16px; }
+  .stat .label { font-size: 12px; } .stat .value { font-size: 24px; } .stat .sub { font-size: 12.5px; }
+  .subtle { font-size: inherit; }
+  .grid > * { min-width: 0; }
+  .table-wrap { overflow-x: auto; }
+  .ov-cmp td:first-child, .ov-cmp th:first-child { white-space: nowrap; }
+  details.ctl-adv > summary { font-size: 15px; }
+  #content { padding: 28px 32px 72px; max-width: 1480px; }
+  /* inline sizes written in the templates */
+  [style*="font-size:9px"], [style*="font-size:10px"], [style*="font-size: 10px"], [style*="font-size:10.5px"] { font-size: 12px !important; }
+  [style*="font-size:11px"], [style*="font-size: 11px"], [style*="font-size:11.5px"] { font-size: 13px !important; }
+  [style*="font-size:12px"], [style*="font-size: 12px"], [style*="font-size:12.5px"] { font-size: 14px !important; }
+  [style*="font-size:13px"] { font-size: 14.5px !important; }
+  [style*="font-size:14px"] { font-size: 15.5px !important; }
+  [style*="font-size:15px"] { font-size: 16.5px !important; }
+  @media (max-width: 760px) {
+    body { font-size: 15px; }
+    #sidebar { width: 100%; }
+    #sidebar .navitem { padding: 9px 12px; font-size: 14px; }
+    #content { padding: 16px 14px 56px; }
+    .ov-value { font-size: 26px; }
+    .panel { padding: 16px; }
+  }
+</style>
+
 
 </head>
 <body>
@@ -1271,6 +1324,32 @@ function ovStockPanel(sk) {
         <td class="num ${ovCls(p.pnl)}">${ovUSD(p.pnl)} <span class="subtle">${ovPct(p.pnl_pct)}</span></td></tr>`).join("")}
       ${more > 0 ? `<tr><td colspan="4" class="subtle">+ ${more} more holdings</td></tr>` : ""}
     </tbody></table></div></div>`;
+}
+
+function swingReportTile(sc, perf) {
+  if (!sc) return `<div class="ov-tile"><div class="ov-label">Swing report card</div><div class="ov-value">—</div></div>`;
+  const v = sc.verdict, o = sc.overall, ex = perf && perf.experiment;
+  const tone = { good: "up", bad: "down", warn: "warn" }[v.tone] || "";
+  const pf = o.pf == null ? "—" : o.pf.toFixed(2);
+  const prog = ex ? Math.min(100, ex.entry_days / ex.needs_days * 100) : 0;
+  return `<div class="ov-tile ${tone}" title="${v.text.replace(/"/g, "&quot;")}"><div class="ov-label">Swing report card</div>
+    <div class="ov-value" style="font-size:24px;padding-top:4px">${v.label}</div>
+    <div class="ov-sub">${o.n} closed trades · win ${o.win_pct == null ? "—" : o.win_pct.toFixed(0)}% · profit factor ${pf} · ${o.usd >= 0 ? "+" : "-"}$${Math.abs(o.usd).toFixed(2)}</div>
+    ${ex ? `<div class="ov-bar" style="margin-top:8px"><span style="width:${prog}%;background:var(--indigo)"></span></div>
+      <div class="ov-sub">Forward test: ${ex.entry_days}/${ex.needs_days} entry days${ex.profit_factor != null ? ` · PF ${ex.profit_factor.toFixed(2)} (needs ${ex.needs_pf})` : ""}</div>` : ""}</div>`;
+}
+
+function swingScorecardPanel(sc) {
+  if (!sc || !sc.overall || !sc.overall.n) return "";
+  const row = g => `<tr><td>${g.name}</td><td class="num">${g.n}</td><td class="num ${ovCls(g.avg_pct)}">${g.avg_pct == null ? "—" : (g.avg_pct >= 0 ? "+" : "") + g.avg_pct.toFixed(2) + "%"}</td>
+    <td class="num">${g.win_pct == null ? "—" : g.win_pct.toFixed(0) + "%"}</td><td class="num ${g.pf != null && g.pf < 1 ? "ov-loss" : g.pf != null && g.pf >= 1.3 ? "ov-gain" : ""}">${g.pf == null ? "—" : g.pf.toFixed(2)}</td></tr>`;
+  const table = (title, groups) => groups && groups.length ? `<div class="panel" style="margin:0"><div class="panel-head"><span class="panel-title">${title}</span></div>
+    <div class="table-wrap"><table data-no-enhance><thead><tr><th></th><th class="num">Trades</th><th class="num">Avg</th><th class="num">Win</th><th class="num">PF</th></tr></thead><tbody>${groups.map(row).join("")}</tbody></table></div></div>` : "";
+  const r = sc.recent;
+  return `<div class="panel"><div class="panel-head">${svg("strategy", 15)}<span class="panel-title">Where the swing engine wins and loses</span><span class="fill"></span>
+      <span class="pill pill-neutral">last ${Math.min(30, sc.overall.n)} trades: avg ${r.avg_pct == null ? "—" : (r.avg_pct >= 0 ? "+" : "") + r.avg_pct.toFixed(2) + "%"}</span></div>
+    <div class="grid" style="gap:14px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">${table("By mode", sc.by_mode)}${table("By hold time", sc.by_hold)}${table("By how it exited", sc.by_exit)}${table("By second opinion", sc.by_opinion)}</div>
+    <div class="ov-note">Real paper round trips (buy matched to its sell). PF = profit factor (gains ÷ losses; above 1.3 is the bar). Small groups are noise — read the direction, not the decimals. ${sc.verdict.text}</div></div>`;
 }
 
 function ovReadiness(r) {
@@ -2173,12 +2252,10 @@ async function renderDashboard(el) {
           <div class="ov-value">${heat.current_heat_pct}<span style="font-size:15px;color:var(--text-2)"> / ${heat.max_heat_pct}%</span></div>
           <div class="ov-bar" style="margin-top:8px"><span style="width:${heatPct}%;background:${heatPct > 90 ? "var(--red)" : heatPct > 60 ? "var(--yellow)" : "var(--indigo)"}"></span></div>
           <div class="ov-sub">${positions.length} open of ${state.config?.trading?.max_positions ?? "—"} max</div></div>
-        <div class="ov-tile ${perf && perf.profit_factor < 1 ? "warn" : ""}"><div class="ov-label">Signal record (closed patterns)</div>
-          <div class="ov-value">${perf && perf.n_closed_patterns != null ? perf.n_closed_patterns : "—"}<span style="font-size:14px;color:var(--text-2)"> signals · ${perf && perf.entry_days != null ? perf.entry_days : "—"} entry days</span></div>
-          <div class="ov-sub">profit factor ${fmtRatio(perf && perf.profit_factor)} · avg ${perf && perf.avg_per_entry_day != null ? perf.avg_per_entry_day.toFixed(1) + "%" : "—"} per entry day${perf && perf.paper ? ` · paper exits ${perf.paper.exits}, P/L ${fmtUSD(perf.paper.pnl)}` : ""}</div>
-          ${perf && perf.experiment ? `<div class="ov-sub">Forward test since ${perf.experiment.start}: ${perf.experiment.entry_days}/${perf.experiment.needs_days} entry days${perf.experiment.profit_factor != null ? " · PF " + perf.experiment.profit_factor.toFixed(2) : ""} · <b>${perf.experiment.verdict}</b></div>` : ""}
-          ${perf && perf.entry_days != null && perf.entry_days < 30 ? `<div class="ov-sub" style="color:var(--yellow)">Signals on the same day are one market episode. ${perf.entry_days} entry days is too few to judge the edge.</div>` : ""}</div>
+        ${swingReportTile(ov && ov.scorecard, perf)}
       </div>
+
+      ${swingScorecardPanel(ov && ov.scorecard)}
 
       <div class="ov-row">
         <div class="panel"><div class="panel-head">${svg("performance", 15)}<span class="panel-title">Market pulse</span></div>

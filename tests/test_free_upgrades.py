@@ -117,3 +117,18 @@ def test_second_opinion_outcomes_match_by_entry_time():
            {"ticker": "C", "entry": "2026-11-02T14:05:00", "pnl_pct": 9.0}]
     out = so.outcome_stats(ops, rts)
     assert out["CAUTION"]["avg_pct"] == -2.0 and out["AGREE"]["win_pct"] == 100.0 and sum(v["n"] for v in out.values()) == 2
+
+
+def test_swing_scorecard_groups_and_verdict():
+    from engine import swing_scorecard as sc
+
+    def t(tick, side, price, ts, reason="", mode="DAY", pnl=0):
+        return {"ticker": tick, "side": side, "price": price, "created_at": ts, "trade_mode": mode, "reason": reason, "pnl": pnl}
+    trades = [t("A", "buy", 100, "2026-11-02T10:00"), t("A", "sell", 103, "2026-11-02T15:00", "loop_b_urgent: x", pnl=3),
+              t("B", "buy", 100, "2026-11-02T10:00", mode="SWING"), t("B", "sell", 95, "2026-11-06T15:00", "price_watch:stop", pnl=-5)]
+    out = sc.build(trades)
+    assert out["overall"]["n"] == 2 and out["overall"]["win_pct"] == 50.0
+    assert {g["name"] for g in out["by_mode"]} == {"DAY", "SWING"}
+    assert any(g["name"] == "Exit engine (urgent)" for g in out["by_exit"])
+    assert any(g["name"] == "3-6 days" and g["n"] == 1 for g in out["by_hold"])
+    assert out["verdict"]["label"] == "Unproven"

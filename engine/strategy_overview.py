@@ -109,6 +109,22 @@ def _today_counts(db):
         return None
 
 
+def swing_scorecard(db, experiment=None):
+    import sqlite3
+    try:
+        from engine.swing_scorecard import build as _sc
+        with db._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            trades = [dict(r) for r in conn.execute("SELECT * FROM paper_trades ORDER BY id").fetchall()]
+        try:
+            ops = db.get_second_opinions()
+        except Exception:
+            ops = []
+        return _sc(trades, ops, experiment)
+    except Exception:
+        return None
+
+
 def swing_experiment_status(db, cfg: dict, today=None) -> dict | None:
     """Forward-test verdict plus the decision date from config (swing_experiment.decision_date)."""
     import sqlite3
@@ -281,7 +297,8 @@ def build(db, cfg: dict, today: date = None) -> dict:
                     tax[name] = t
     except Exception:
         tax = None
-    _out = {"tax": tax, "experiment": swing_experiment_status(db, cfg), "scheduler": sched, "stock": stock, "stock_lowvol": stock_lowvol, "drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
+    _exp = swing_experiment_status(db, cfg)
+    _out = {"scorecard": swing_scorecard(db, _exp), "tax": tax, "experiment": _exp, "scheduler": sched, "stock": stock, "stock_lowvol": stock_lowvol, "drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
             "leverage": sc.get("leverage", 1.0), "band_pct": sc.get("band_pct", 0.0),
             "account": account, "positions": positions, "market": market, "targets": targets,
             "curves": curves, "stats": stats, "swing": swing, "rsi2": rsi2,
