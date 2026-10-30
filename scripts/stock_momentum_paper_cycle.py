@@ -78,7 +78,8 @@ def main():
     for t in held:                                   # a name that vanished from the feed keeps its last known price
         prices.setdefault(t, stale.get(t) or [p["entry_price"] for p in led.get_open_sm_positions() if p["ticker"] == t][0])
     if rebalance:
-        targets = rule.target_weights(closes, members, risk_on, n=n, leverage=lev)
+        targets = rule.target_weights(closes, members, risk_on, n=n, leverage=lev,
+                                      selection=str(sc.get("selection", "momentum")))
         print(f"[{date}] {'risk-on' if risk_on else 'RISK-OFF (T-bills)'}: {len(targets)} targets"
               + ("" if not risk_on else f", top: {', '.join(list(targets)[:6])} ..."))
     else:

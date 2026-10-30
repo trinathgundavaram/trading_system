@@ -810,8 +810,6 @@ const TABS = [
     desc: "Scheduler status, market hours, and the last scan cycle - includes the manual \"Run cycle now\" override." },
   { id: "logs",        label: "Logs",        icon: "logs", group: "System",
     desc: "Live tail of scheduler.py and server.py's logs (output/logs/), merged and shown in CT - trace exactly what a cycle did, or dig into an error." },
-  { id: "news",        label: "News",        icon: "news", group: "Swing engine",
-    desc: "Market mood (Fear & Greed, VIX, macro blackout) plus per-ticker headlines and sentiment, gathered every scan cycle. The same data already feeds the SENTIMENT_MACRO bucket and the dynamic threshold - this just makes it visible." },
 ];
 
 /* ============================== TOOLTIPS / GLOSSARY ============================== */
@@ -1039,7 +1037,7 @@ function loadTab(name) {
     portfolio: (el) => (viewMode === "real" ? renderRealPortfolioTab(el) : renderPortfolioTab(el)),
     control: renderControlTab,
     strategy: renderStrategyTab, monitor: renderMonitorTab,
-    logs: renderLogsTab, news: renderNewsTab,
+    logs: renderLogsTab,
   };
   (renderers[name] || renderOverview)(el);
 }
@@ -4768,23 +4766,9 @@ async function loadLogsBody() {
   if (wasAtBottom) body.scrollTop = body.scrollHeight;  // stick to newest lines unless you've scrolled up to read history
 }
 
-/* ============================== NEWS TAB ============================== */
-// 2026-07-14: surfaces two kinds of data that were already being fetched/
-// computed every scan cycle for scoring but never shown anywhere - per-
-// ticker headlines + keyword sentiment (feeds the SENTIMENT_MACRO bucket's
-// news_multiplier) and market-wide "mood" (Fear & Greed / VIX / macro
-// blackout - feeds rules/dynamic_thresholds.py). See server.py's /api/news
-// and storage/database.py's record_news_items()/get_recent_news().
-let newsNotableOnly = false;  // kept outside renderNewsTab so a cycle_complete
-                                // re-render doesn't reset the filter choice
-
-function sentimentPill(label) {
-  const cls = label === "bullish" ? "pill-green" : label === "bearish" ? "pill-red" : "pill-neutral";
-  return `<span class="pill ${cls}" style="padding:1px 6px;">${label || "neutral"}</span>`;
-}
-
-/* ONE market-mood component, shared by the News tab and the Dashboard's
-   Market Pulse panel (2026-07-26, UI audit).
+/* ============================== MARKET MOOD (shared component) ============================== */
+/* Market-mood component used by the Swing dashboard's Market Pulse panel
+   (the News tab that used to share it was removed 2026-10-30).
 
    These were two separate renderers showing overlapping data, and they had
    already drifted: News showed Fear & Greed, VIX, Regime and Macro Blackout;
@@ -4855,60 +4839,6 @@ function marketMoodPanel(mood, opts) {
   `;
 }
 
-// Back-compat alias: the News tab called this by its old name.
-const newsMoodPanel = marketMoodPanel;
-
-async function renderNewsTab(el) {
-  el.innerHTML = `
-    <div class="panel">
-      <div class="panel-head">${svg('performance',15)}<span class="panel-title">Market Mood</span></div>
-      <div id="news-mood-body">Loading…</div>
-    </div>
-    <div class="panel">
-      <div class="panel-head">${svg('news',15)}<span class="panel-title">News Feed</span><span class="fill"></span>
-        <select id="news-filter" class="input" style="width:auto;padding:4px 8px;font-size:12px;" onchange="newsNotableOnly=(this.value==='notable');loadNewsBody()">
-          <option value="all" ${!newsNotableOnly?"selected":""}>All headlines</option>
-          <option value="notable" ${newsNotableOnly?"selected":""}>Notable only (bullish/bearish)</option>
-        </select>
-        <button class="btn btn-sm" onclick="loadNewsBody()">${svg("refresh",13)}<span>Refresh</span></button>
-      </div>
-      <div class="subtle" style="margin-bottom:8px;">Real yfinance headlines scored for sentiment, gathered per ticker during each scan cycle (last 72h, deduped). Not investment advice - a rough directional read only.</div>
-      <div id="news-body">Loading…</div>
-    </div>
-  `;
-  await loadNewsBody();
-}
-
-async function loadNewsBody() {
-  const moodEl = document.getElementById("news-mood-body");
-  const bodyEl = document.getElementById("news-body");
-  if (!moodEl || !bodyEl) return;
-  let data = { news: [], market_mood: {} };
-  try {
-    const qs = newsNotableOnly ? "?notable_only=true" : "";
-    data = await (await fetch(`/api/news${qs}`)).json();
-  } catch (e) {
-    moodEl.innerHTML = `<div class="subtle">Couldn't load market mood - is the server running?</div>`;
-    bodyEl.innerHTML = `<div class="subtle">Couldn't load news - is the server running?</div>`;
-    return;
-  }
-  moodEl.innerHTML = newsMoodPanel(data.market_mood);
-  const items = data.news || [];
-  if (!items.length) {
-    bodyEl.innerHTML = emptyBlock('news', 'No headlines yet', 'Populated as scheduler.py scans your watchlist - each ticker\'s news is fetched and sentiment-scored once per cycle.');
-    return;
-  }
-  bodyEl.innerHTML = `<div class="table-wrap"><table><thead><tr>
-    <th>Ticker</th><th>Headline</th><th>Sentiment</th><th>Last Seen</th>
-  </tr></thead><tbody>${items.map(n => `
-    <tr>
-      <td><b>${tickerLabel(n.ticker)}</b></td>
-      <td>${(n.headline || "").replace(/</g,'&lt;')}</td>
-      <td>${sentimentPill(n.sentiment_label)}</td>
-      <td class="subtle">${fmtCST(n.last_seen_at)} CT</td>
-    </tr>`).join("")}</tbody></table></div>`;
-}
-
 /* ============================== BOOT ============================== */
 async function boot() {
   renderNav();
@@ -4941,7 +4871,6 @@ async function boot() {
   setInterval(loadTickerNames, 300000);
   setInterval(loadTickerHealth, 300000);
   setInterval(() => { if (currentTab === "logs") loadLogsBody(); }, 10000);
-  setInterval(() => { if (currentTab === "news") loadNewsBody(); }, 60000);
   if (typeof Notification !== "undefined" && Notification.permission === "default") {
     Notification.requestPermission();
   }

@@ -41,12 +41,28 @@ def momentum_scores(closes: pd.DataFrame, members: list) -> pd.Series:
     return r.dropna().sort_values(ascending=False)
 
 
-def target_weights(closes: pd.DataFrame, members: list, risk_on: bool, n: int = 40, leverage: float = 1.0) -> dict:
+def mom_lowvol_scores(closes: pd.DataFrame, members: list) -> pd.Series:
+    """Average of the percentile ranks of 12-1 month momentum and LOW 63-day volatility.
+    research/stock_factors.py (with the SPY rule, 1.0x): ~9.8% CAGR, -9.7% max drawdown, Sharpe 0.93 vs the
+    composite momentum selection's ~12.1% / -19.6% / 0.81 - about half the drawdown for ~2 points of return,
+    which is the better base for leverage. In-sample on a survivorship-biased universe: an option, not a default."""
+    if len(closes) < MIN_BARS:
+        raise ValueError(f"need >= {MIN_BARS} bars, got {len(closes)}")
+    cols = [c for c in members if c in closes.columns]
+    mom = (closes[cols].iloc[-22] / closes[cols].iloc[-253] - 1)
+    vol = closes[cols].pct_change().iloc[-63:].std()
+    df = pd.concat([mom.rank(pct=True), (-vol).rank(pct=True)], axis=1).dropna()
+    return df.mean(axis=1).sort_values(ascending=False)
+
+
+def target_weights(closes: pd.DataFrame, members: list, risk_on: bool, n: int = 40, leverage: float = 1.0,
+                   selection: str = "momentum") -> dict:
     """Weights as fractions of equity. Raises if fewer than n stocks are rankable, so a
-    data gap can never silently turn into 'hold fewer names' or 'go to cash'."""
+    data gap can never silently turn into 'hold fewer names' or 'go to cash'.
+    selection: "momentum" (3/6/12m composite, the default) or "mom_lowvol"."""
     if not risk_on:
         return {CASH: 1.0}
-    scores = momentum_scores(closes, members)
+    scores = mom_lowvol_scores(closes, members) if selection == "mom_lowvol" else momentum_scores(closes, members)
     if len(scores) < n:
         raise ValueError(f"only {len(scores)} rankable stocks (< {n}); check the price download")
     top = scores.head(n)

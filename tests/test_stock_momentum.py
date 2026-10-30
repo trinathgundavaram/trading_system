@@ -42,3 +42,19 @@ def test_only_current_members_are_used():
 def test_ledger_prefix_validated_and_isolated():
     with pytest.raises(ValueError):
         SleeveLedger(object(), "bad prefix; drop")
+
+
+def test_mom_lowvol_prefers_steady_winners_over_wild_ones():
+    import numpy as np, pandas as pd
+    idx = pd.bdate_range("2024-01-01", periods=300)
+    rng = np.random.default_rng(7)
+    d = {}
+    for i in range(30):                                     # all drift up equally; volatility rises with i
+        d[f"S{i}"] = 100 * np.cumprod(1 + 0.0008 + rng.normal(0, 0.002 + 0.0006 * i, 300))
+    d["SHY"] = np.full(300, 100.0)
+    c = pd.DataFrame(d, index=idx)
+    mem = [f"S{i}" for i in range(30)]
+    w = sm.target_weights(c, mem, risk_on=True, n=5, selection="mom_lowvol")
+    low_vol_names = {f"S{i}" for i in range(15)}
+    assert len(w) == 5 and sum(1 for t in w if t in low_vol_names) >= 4
+    assert set(sm.target_weights(c, mem, risk_on=False, selection="mom_lowvol")) == {"SHY"}

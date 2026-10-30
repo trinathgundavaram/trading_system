@@ -114,6 +114,7 @@ stock_momentum_sleeve:
   paper_enabled: true
   paper_starting_cash: 10000
   top_n: 40
+  selection: momentum        # or mom_lowvol: ~half the drawdown for ~2 points less return (research/stock_factors.py)
   leverage: 1.25
   band_pct: 2.0
   cost_bps: 5.0
