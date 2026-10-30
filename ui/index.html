@@ -2355,7 +2355,7 @@ function renderPositionsTable(pos, isPaper) {
       <td>$${p.entry_price?.toFixed(2)}</td>
       <td>${p.shares}</td>
       <td class="num">${p.current_stop_price ? '$'+p.current_stop_price.toFixed(2) : "—"}</td>
-      <td class="num" style="color:${(p.position_health_score||0)>=70?'var(--green)':(p.position_health_score||0)>=40?'var(--yellow)':'var(--red)'}">${p.position_health_score?.toFixed(0)||"—"}</td>
+      <td class="num" style="color:${(p.book_health||0)>=70?'var(--green)':(p.book_health||0)>=55?'var(--yellow)':'var(--red)'}">${p.book_health!=null?p.book_health.toFixed(0):"—"}</td>
       <td><span class="pill pill-neutral">${p.stop_state||"INITIAL_RISK"}</span></td>
     </tr>`).join("")}</tbody></table></div>`;
 }

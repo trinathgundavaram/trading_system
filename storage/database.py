@@ -817,6 +817,18 @@ CREATE TABLE IF NOT EXISTS threshold_regret_runs (
 """
 
 
+def position_book_health(p: dict) -> float:
+    """One position's share of the header Book health score (see get_latest_health_score):
+    profit in R (40%), at/above breakeven (30%), inside intended hold time (15%), live stop (15%).
+    The header badge is the plain average of these, so the table and the badge always agree."""
+    r = float(p.get("current_profit_r") or 0.0)
+    limit = 1.5 if (p.get("trade_mode") or "").upper() == "DAY" else 7.0
+    return (0.40 * min(100.0, max(0.0, 50.0 + r * 50.0))
+            + 0.30 * (100.0 if r >= 0 else 0.0)
+            + 0.15 * (100.0 if float(p.get("days_held") or 0.0) <= limit else 0.0)
+            + 0.15 * (100.0 if p.get("current_stop_price") else 0.0))
+
+
 class Database:
     def __init__(self, path: Path = None):
         # 2026-07-20 (production incident, Trinath caught it from a stray
@@ -3181,7 +3193,10 @@ class Database:
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(q)
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["book_health"] = position_book_health(r) if r.get("simulated") else None
+        return rows
 
     def get_managed_positions(self, simulated: bool = None) -> list:
         """Positions this ENGINE opened and may therefore close (§5, Phase 1).
@@ -4130,18 +4145,7 @@ class Database:
         positions = [p for p in positions if p.get("simulated")] or positions
         if not positions:
             return None
-        n = len(positions)
-        rs = [float(p.get("current_profit_r") or 0.0) for p in positions]
-        avg_r = sum(rs) / n
-        r_pts = min(100.0, max(0.0, 50.0 + avg_r * 50.0))
-        green_pts = 100.0 * sum(1 for r in rs if r >= 0) / n
-
-        def _fresh(p):
-            limit = 1.5 if (p.get("trade_mode") or "").upper() == "DAY" else 7.0
-            return float(p.get("days_held") or 0.0) <= limit
-        fresh_pts = 100.0 * sum(1 for p in positions if _fresh(p)) / n
-        stop_pts = 100.0 * sum(1 for p in positions if p.get("current_stop_price")) / n
-        return 0.40 * r_pts + 0.30 * green_pts + 0.15 * fresh_pts + 0.15 * stop_pts
+        return sum(position_book_health(p) for p in positions) / len(positions)
 
     def get_portfolio_heat(self) -> dict:
         """Approximate portfolio heat = sum of open positions' dollar risk
