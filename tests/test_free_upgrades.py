@@ -145,3 +145,17 @@ def test_book_health_reflects_performance_not_neutral_scores(tmp_path):
     assert good > 75 > 40 > bad
     db.get_all_positions = lambda: []
     assert db.get_latest_health_score() is None
+
+
+def test_reevaluation_tracker_logs_history_and_flags_transitions(db):
+    from datetime import date
+    from engine import reevaluation
+    cfg = {"trading": {"max_positions": 40}, "swing_experiment": {"decision_date": "2026-12-15"}}
+    first = reevaluation.run_all(db, cfg, date(2026, 10, 31))
+    assert {r["id"] for r in first} == {i["id"] for i in reevaluation.ITEMS}
+    snap = {r["id"]: r for r in reevaluation.snapshot(db)}
+    assert snap["swing_forward_test"]["status"] == "waiting" and snap["swing_forward_test"]["checked_at"]
+    # same status again is not a "change" worth a notice
+    assert not any(r["changed"] for r in reevaluation.run_all(db, cfg, date(2026, 10, 31)) if r["status"] == "waiting")
+    with db._conn() as c:
+        assert c.execute("SELECT COUNT(*) FROM reeval_log").fetchone()[0] == 2 * len(reevaluation.ITEMS)

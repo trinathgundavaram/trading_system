@@ -308,4 +308,9 @@ def build(db, cfg: dict, today: date = None) -> dict:
         _out["readiness"] = _ready(_out, cfg)
     except Exception:
         _out["readiness"] = None
+    try:
+        from engine.reevaluation import snapshot
+        _out["reeval"] = snapshot(db)
+    except Exception:
+        _out["reeval"] = []
     return _out

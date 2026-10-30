@@ -1144,6 +1144,10 @@ class Database:
             id SERIAL PRIMARY KEY, created_at TEXT NOT NULL, ticker TEXT NOT NULL, trade_mode TEXT,
             score REAL, verdict TEXT NOT NULL, bear TEXT, bull TEXT
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS reeval_log (
+            id SERIAL PRIMARY KEY, item_id TEXT NOT NULL, checked_at TEXT NOT NULL, status TEXT NOT NULL,
+            headline TEXT, metrics TEXT
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS sm_equity_log (
             as_of_date TEXT PRIMARY KEY,
             total_value REAL NOT NULL,
@@ -3505,6 +3509,19 @@ class Database:
                 """INSERT INTO second_opinions (created_at, ticker, trade_mode, score, verdict, bear, bull)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (datetime.utcnow().isoformat(), ticker, trade_mode, score, verdict, "; ".join(bear), "; ".join(bull)))
+
+    def log_reeval(self, item_id: str, status: str, headline: str, metrics: str = "{}"):
+        with self._conn() as conn:
+            conn.execute("INSERT INTO reeval_log (item_id, checked_at, status, headline, metrics) VALUES (?, ?, ?, ?, ?)",
+                         (item_id, datetime.utcnow().isoformat(), status, headline, metrics))
+
+    def latest_reevals(self):
+        """Most recent check per item."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                "SELECT r.item_id, r.checked_at, r.status, r.headline, r.metrics FROM reeval_log r "
+                "JOIN (SELECT item_id, MAX(id) AS mid FROM reeval_log GROUP BY item_id) m ON r.id = m.mid").fetchall()]
 
     def get_second_opinions(self, limit: int = 5000):
         with self._conn() as conn:

@@ -217,6 +217,18 @@ def run(db, cfg: dict) -> dict:
     except Exception as e:
         logger.warning(f"swing decision check failed: {e}")
     try:
+        from engine import reevaluation
+        rows = reevaluation.run_all(db, cfg)
+        result["reeval"] = {r["id"]: r["status"] for r in rows}
+        flagged = [r for r in rows if r["changed"]]
+        if flagged:
+            from engine.notifications import notify
+            notify(cfg, title="Items ready to re-evaluate",
+                   message="; ".join(f"{r['title']}: {r['headline']}" for r in flagged)[:400],
+                   subtitle="Re-evaluation tracker", severity="summary")
+    except Exception as e:
+        logger.warning(f"re-evaluation tracker failed: {e}")
+    try:
         from engine import baseline
         result["baseline_days"] = baseline.refresh(db, cfg)
     except Exception as e:

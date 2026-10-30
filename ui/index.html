@@ -1388,6 +1388,20 @@ function ovReadiness(r) {
     <div class="ov-note" style="padding:0 16px 14px">Passing only means real money can be <i>discussed</i>. Live execution stays off until you open its gates on the Control tab.</div></details>`;
 }
 
+function ovReeval(items) {
+  if (!items || !items.length) return "";
+  const pill = {waiting: ["pill-neutral", "waiting"], ok: ["pill-green", "ok"], ready: ["pill-blue", "review"], adjust: ["pill-yellow", "adjust?"]};
+  const flagged = items.filter(i => i.status === "ready" || i.status === "adjust").length;
+  const rows = items.map(i => { const [cls, lbl] = pill[i.status] || pill.waiting;
+    return `<div class="item ${i.status === "adjust" ? "warn" : i.status === "ok" ? "good" : ""}" title="${(i.why || "").replace(/"/g, "&quot;")} (setting: ${i.knob})">
+      <span class="pill ${cls}" style="min-width:56px;text-align:center">${lbl}</span>
+      <span><b>${i.title}</b> <span class="subtle">${i.headline}</span></span></div>`; }).join("");
+  return `<details class="panel ctl-adv" ${flagged ? "open" : ""}><summary><b>Re-evaluation tracker</b> — ${items.length} items watched
+      ${flagged ? `<span class="pill pill-yellow" style="margin-left:8px">${flagged} to look at</span>` : `<span class="pill pill-neutral" style="margin-left:8px">collecting data</span>`}</summary>
+    <div class="ov-attn" style="padding:0 16px 16px">${rows}</div>
+    <div class="ov-note" style="padding:0 16px 14px">Checked automatically every morning (06:30 ET) with fresh data; you get one notice when an item becomes ready. Hover a row for what it settles.</div></details>`;
+}
+
 function ovTaxPanel(tax) {
   if (!tax || !Object.keys(tax).length) return "";
   const rows = Object.entries(tax).map(([n, t]) => `<tr><td><b>${n}</b></td><td class="num ${ovCls(t.pre_tax_return)}">${ovPct(t.pre_tax_return, 2)}</td>
@@ -1495,6 +1509,7 @@ async function paintOverview(el, quiet) {
 
     ${ovAttention(d)}
     ${ovTaxPanel(d.tax)}
+    ${ovReeval(d.reeval)}
     ${ovReadiness(d.readiness)}
     ${ovDriftPanel(d.drift)}
     ${ovStockPanel(d.stock)}
