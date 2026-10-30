@@ -71,3 +71,14 @@ def test_health_problems_flags_a_stale_sleeve_mark(tmp_path, monkeypatch):
     monkeypatch.setattr(sl, "SleeveLedger", lambda db, p: type("L", (), {"get_sm_equity_log": lambda self: [{"as_of_date": "2026-10-01"}]})())
     probs = maintenance.health_problems(DB(), {"sector_momentum_sleeve": {"paper_enabled": True}}, today=date(2026, 10, 30))
     assert any("sector momentum sleeve has no daily mark since 2026-10-01" in p for p in probs)
+
+
+def test_resolve_stale_alerts_keeps_severe_and_fresh_ones():
+    from datetime import datetime, timedelta
+    old = (datetime.utcnow() - timedelta(days=5)).isoformat()
+    new = datetime.utcnow().isoformat()
+    rows = [{"id": "a", "severity": "MEDIUM", "triggered_at": old}, {"id": "b", "severity": "HIGH", "triggered_at": old},
+            {"id": "c", "severity": "MEDIUM", "triggered_at": new}]
+    done = []
+    db = type("D", (), {"get_open_alerts": lambda s: rows, "resolve_alert": lambda s, i, r: done.append(i)})()
+    assert maintenance.resolve_stale_alerts(db) == 1 and done == ["a"]

@@ -63,6 +63,24 @@ def prune_files() -> int:
     return _prune_dir(out / "cache", CACHE_MAX_AGE_DAYS) + _prune_dir(out / "pending_prompts", PROMPT_MAX_AGE_DAYS)
 
 
+ALERT_MAX_AGE_DAYS = 2
+
+
+def resolve_stale_alerts(db, max_age_days: int = ALERT_MAX_AGE_DAYS) -> int:
+    """Auto-dismiss MEDIUM-or-lower monitoring alerts older than `max_age_days`. They are per-ticker data hiccups
+    and real-book sync notes that used to pile up until someone clicked Dismiss. HIGH/CRITICAL stay until a human
+    resolves them."""
+    cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).isoformat()
+    n = 0
+    for a in db.get_open_alerts():
+        if str(a.get("severity", "")).upper() in ("HIGH", "CRITICAL"):
+            continue
+        if str(a.get("triggered_at", "")) < cutoff:
+            db.resolve_alert(a["id"], "auto-dismissed: older than %d days" % max_age_days)
+            n += 1
+    return n
+
+
 def _last_business_day(today: date) -> date:
     d = today - timedelta(days=1)
     while d.weekday() >= 5:
@@ -120,7 +138,8 @@ def health_problems(db, cfg: dict, today: date | None = None) -> list[str]:
 
 def run(db, cfg: dict) -> dict:
     """The scheduled job body. Returns what it did (for the log and tests)."""
-    result = {"reference": ensure_reference(cfg), "pruned": prune_files(), "problems": health_problems(db, cfg)}
+    result = {"reference": ensure_reference(cfg), "pruned": prune_files(), "alerts_cleared": resolve_stale_alerts(db),
+              "problems": health_problems(db, cfg)}
     msgs = [m for m in (result["reference"],) if m and "FAILED" in m] + result["problems"]
     if msgs:
         try:

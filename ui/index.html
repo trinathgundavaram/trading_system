@@ -4813,7 +4813,7 @@ async function renderMonitorTab(el) {
       <div id="sources-body">Loading…</div>
     </div>
     <div class="panel" id="alerts-panel">
-      <div class="panel-head">${svg('alert',15)}<span class="panel-title">Data Quality Alerts</span></div>
+      <div class="panel-head">${svg('alert',15)}<span class="panel-title">Open alerts</span><span class="subtle" style="margin-left:8px">auto-dismissed after 2 days</span></div>
       <div id="alerts-body">Loading…</div>
     </div>
   `;
@@ -4869,10 +4869,9 @@ async function renderAlertsPanel() {
   if (!body) return;
   let alerts = [];
   try { alerts = await (await fetch("/api/alerts")).json(); } catch (e) { /* leave empty */ }
-  if (!alerts.length) {
-    body.innerHTML = emptyBlock('check', 'No open alerts', 'Nothing needs attention right now.');
-    return;
-  }
+  const panel = document.getElementById("alerts-panel");
+  if (panel) panel.style.display = alerts.length ? "" : "none";     // no empty "nothing to see" card
+  if (!alerts.length) return;
   body.innerHTML = `<div style="display:grid;gap:8px;">` + alerts.map(a => `
     <div class="card-row" style="border-left-color:${a.severity==='CRITICAL'||a.severity==='HIGH'?'var(--red)':'var(--yellow)'};display:flex;justify-content:space-between;align-items:flex-start;gap:10px;">
       <div>
