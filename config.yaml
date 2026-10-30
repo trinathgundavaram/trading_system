@@ -111,7 +111,11 @@ sector_momentum_sleeve:
   # unlevered top-3 sector version.
   paper_enabled: true
   strategy: blend
-  leverage: 2.0
+  # 2026-10-30 strategy review: 2.0 -> 1.5. research.leverage_study (2007-2026, bootstrap): blend 2.0x = 15.5% CAGR but a
+  # 17.8% chance of a drawdown worse than -35% (median -26.6%); 1.5x = 12.9% CAGR, 2.8% chance, median -19.8%. Sharpe and
+  # Calmar fall at every step up, and the 5th-percentile CAGR is the same (~4.9%), so the extra leverage buys return
+  # only in good outcomes. Takes effect at the next monthly rebalance; the reference curve rebuilds on its own.
+  leverage: 1.5
   financing_bps: 400.0
   band_pct: 2.0        # SPY 200d rule hysteresis: on above SMA*1.02, off below SMA*0.98
   paper_starting_cash: 10000
@@ -323,8 +327,12 @@ risk:
     stop_loss_swing_pct: 7
     stop_loss_day_pct: 3.5
   TURBO:
-    buy_score_threshold_pct: 50
-    buy_score_threshold_day_pct: 55
+    # 2026-10-30 strategy review: 50/55 -> 60/65 (the MODERATE bar). Of 127 closed paper entries, those scoring <= 65
+    # (40 trades) won 30% with profit factor ~0.45 and averaged -0.9%; 65-80 (79 trades) won 55% at PF ~1.3. Small,
+    # in-sample sample, so this is a quality-over-volume choice; entry_quality in the re-evaluation tracker re-checks
+    # it once 40 trades have closed under the new bar.
+    buy_score_threshold_pct: 60
+    buy_score_threshold_day_pct: 65
     rsi_oversold_threshold: 45
     stochastic_threshold: 30
     vix_entry_max: 27

@@ -18,6 +18,13 @@ different strategy, and averaging the two sets together is a measurement error.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 
+## 2026-10-30 - strategy review
+- Swing entry bar (TURBO) 50/55 -> 60/65: entries scoring <= 65 won 30% (PF ~0.45) vs 55% (PF ~1.3) for 65-80, n=127.
+- Sector momentum sleeve leverage 2.0 -> 1.5: 17.8% -> 2.8% bootstrap chance of a drawdown worse than -35%, for 15.5% -> 12.9% CAGR.
+- Reviewed and left alone: stock momentum / low-vol sleeves (1.25x, run side by side), exits and stop machine (tuned earlier today),
+  take-profit, earnings exit, fear-and-greed and VIX gates, frozen learning loop, screener sources.
+- Re-evaluation tracker gained `entry_quality` to re-check the new bar after 40 closed trades.
+
 ## [Unreleased]
 
 ### Removed paid LLM advisor, added a free second opinion (2026-10-30)

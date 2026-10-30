@@ -32,6 +32,9 @@ ITEMS = [
     {"id": "risk_sizing", "title": "Risk-based sizing",
      "why": "Do trades sized since the change pay off (profit factor, average result)?",
      "knob": "position_sizing.risk_per_trade_pct / min_size_pct"},
+    {"id": "entry_quality", "title": "Entry score bar (60 swing / 65 day)",
+     "why": "After raising the bar from 50/55, do trades entered since still lose at the low end of the score range, and does CHOPPY still lose?",
+     "knob": "risk.TURBO.buy_score_threshold_pct"},
     {"id": "sleeves_vs_spy", "title": "Momentum sleeves vs SPY",
      "why": "Do the three paper sleeves beat buy-and-hold SPY after 60 daily marks?",
      "knob": "*_sleeve.paper_enabled"},
@@ -151,6 +154,34 @@ def _risk_sizing(db, cfg, today):
     return ("ok" if pf and pf >= 1.0 else "adjust"), f"{len(rts)} trades, $ profit factor {('%.2f' % pf) if pf else 'n/a'}", m
 
 
+def _entry_quality(db, cfg, today):
+    """Closed paper positions entered since the bar change: profit factor by score band and by regime."""
+    with db._conn() as c:
+        cur = c.execute("SELECT entry_signal_score, entry_regime, entry_price, exit_price FROM positions "
+                        "WHERE status = 'closed' AND simulated = 1 AND exit_price > 0 AND entry_price > 0 AND entry_time >= ?",
+                        (SINCE,))
+        rows = cur.fetchall()
+    m = {"closed_since_change": len(rows)}
+    if len(rows) < 40:
+        return "waiting", f"{len(rows)}/40 trades closed since {SINCE}", m
+
+    def pf(xs):
+        g = sum(x for x in xs if x > 0); l = -sum(x for x in xs if x < 0)
+        return (g / l) if l else None
+    rets = [((x[3] / x[2]) - 1) * 100 for x in rows]
+    low = [r for r, x in zip(rets, rows) if (x[0] or 0) <= 70]
+    chop = [r for r, x in zip(rets, rows) if x[1] == "CHOPPY"]
+    m.update(pf_all=pf(rets), n_low=len(low), pf_low=pf(low), n_choppy=len(chop), pf_choppy=pf(chop))
+    msgs, adjust = [], False
+    if len(low) >= 10 and (pf(low) or 0) < 0.8:
+        msgs.append(f"scores <=70 still lose (PF {pf(low):.2f}, n={len(low)}): raise the bar again"); adjust = True
+    if len(chop) >= 10 and (pf(chop) or 0) < 0.8:
+        msgs.append(f"CHOPPY entries still lose (PF {pf(chop):.2f}, n={len(chop)}): add a CHOPPY surcharge"); adjust = True
+    if not msgs:
+        msgs.append(f"overall PF {pf(rets):.2f} over {len(rets)} trades: the bar is holding up" if pf(rets) else "no losing trades yet")
+    return ("adjust" if adjust else "ok"), "; ".join(msgs), m
+
+
 def _sleeves_vs_spy(db, cfg, today):
     from storage.sleeve_ledger import SleeveLedger
     out, m, waiting = [], {}, False
@@ -172,7 +203,7 @@ def _sleeves_vs_spy(db, cfg, today):
 
 
 CHECKS = {"swing_forward_test": _swing_forward_test, "risk_cap_blocks": _risk_cap_blocks, "rotation": _rotation,
-          "position_cap": _position_cap, "second_opinion": _second_opinion, "risk_sizing": _risk_sizing,
+          "position_cap": _position_cap, "second_opinion": _second_opinion, "risk_sizing": _risk_sizing, "entry_quality": _entry_quality,
           "sleeves_vs_spy": _sleeves_vs_spy}
 
 
