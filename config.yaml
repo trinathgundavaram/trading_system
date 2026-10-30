@@ -50,7 +50,9 @@ trading:
   # success test is forward-looking: >= 30 entry days from 2026-10-30 with profit factor > 1.3 - see
   # scripts/swing_experiment_report.py. Set to 0 to restore the same-day flatten.
   day_hold_sessions: 1
-  max_day_positions: 10
+  # 2026-10-30: 10 -> 15. DAY entries are now held to the next session, so the 10 slots stayed full and a 78% DAY buy
+  # (NEE) was refused; DAY is the better mode so far (PF 1.5 vs 0.6 for SWING, n=127). Total cap stays 40.
+  max_day_positions: 15
 rotation:
   enabled: true
   min_candidate_score: 80.0
@@ -277,7 +279,10 @@ risk:
   # Note this is a per-day cap only - the real spend limiter is still
   # risk.max_daily_loss_pct (2.0%), which now resolves to ~$200/day against
   # $10,000 rather than ~$20, and max_positions (25).
-  max_trades_per_day: 30
+  # 2026-10-30: 30 -> 60. It was hit by ~noon on each of the last three days (22 buys + 10 sells, sells count too), so
+  # BUYs scoring 74-78% (BBIO, NEE) were refused while earlier, weaker ones had used the budget. The entry bar is now
+  # 60/65 (fewer, better signals) and the position caps, the 2% daily-loss stop and rotation are the real limiters.
+  max_trades_per_day: 60
   # $1,000/position against a $10,000 book = 10 full-size positions, so the
   # 25-position max_positions cap stays reachable and diversification is not
   # traded away for size.

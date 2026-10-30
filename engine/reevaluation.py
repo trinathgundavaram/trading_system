@@ -122,12 +122,15 @@ def _rotation(db, cfg, today):
 def _position_cap(db, cfg, today):
     t = cfg.get("trading", {}) or {}
     cap = int(t.get("max_positions", 10))
-    n = len(db.get_all_positions(simulated=True))
-    m = {"open": n, "cap": cap}
+    pos = db.get_all_positions(simulated=True)
+    n = len(pos)
+    day_cap = int(t.get("max_day_positions", cap))
+    day_n = sum(1 for p in pos if str(p.get("trade_mode") or "").upper() == "DAY")
+    m = {"open": n, "cap": cap, "day_open": day_n, "day_cap": day_cap}
     pct = 100 * n / cap if cap else 0
-    if pct >= 95:
-        return "adjust", f"book at {n}/{cap}: raise the cap or rotate more", m
-    return "ok", f"{n}/{cap} positions used ({pct:.0f}%)", m
+    if pct >= 95 or (day_cap and day_n >= day_cap):
+        return "adjust", f"book at {n}/{cap}, DAY {day_n}/{day_cap}: raise the cap or rotate more", m
+    return "ok", f"{n}/{cap} positions used ({pct:.0f}%), DAY {day_n}/{day_cap}", m
 
 
 def _second_opinion(db, cfg, today):
