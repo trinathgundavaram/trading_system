@@ -1027,3 +1027,19 @@ notifications:
   # unset ${VAR} with no fallback, and a webhook is genuinely optional.
   webhook_url: ${NOTIFY_WEBHOOK_URL:-}
   high_conviction_buy_pct: 80
+
+# Decision date for the swing engine's forward test (engine/swing_experiment.py). On this date the daily maintenance
+# job messages you the verdict. Nothing is switched off automatically: the call is yours.
+swing_experiment:
+  decision_date: "2026-12-15"
+
+reports:
+  # Assumed flat rate for the "after tax" estimate on the Overview (short-term gains are taxed as ordinary income).
+  # A planning estimate, not tax advice - set it to your own marginal rate.
+  short_term_tax_rate: 0.30
+
+# Manual acknowledgements for the live-readiness checklist on the Overview. Flip a flag only when it is truly done.
+live_readiness:
+  drawdown_plan_written: false     # you have written down what loss makes you stop, and what you do then
+  always_on_host: false            # the engine runs on a machine that restarts itself after a power cut
+  swing_decision_made: false       # you decided on the swing engine (kept it after a pass, or switched it off)

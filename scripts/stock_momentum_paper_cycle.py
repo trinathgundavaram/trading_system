@@ -108,6 +108,14 @@ def main():
         led.set_sm_state("last_targets", json.dumps({"as_of": date, "weights": targets}))
     else:
         print("not a rebalance day - mark to market only")
+    if month_end or rebalance:            # a few free lookups, only on rebalance days (keeps free API quotas safe)
+        from engine import price_check, rebalance_check
+        label = "Stock low-vol sleeve" if a.prefix == "stl" else "Stock momentum sleeve"
+        feed = ["SPY"] + [t for t in sorted(targets, key=targets.get, reverse=True) if t != "SPY"][:5]
+        price_check.check(prices, feed, cfg, label)
+        if rebalance:
+            rebalance_check.check(led, targets, prices, paper.snapshot(led, prices)["total_value"], cfg, label,
+                                  tolerance=max(0.01, 2 * float(sc.get("min_trade_frac", 0.002))))
     sma = float(spy.iloc[-200:].mean())
     led.set_sm_state("market", json.dumps({"as_of": date, "spy": float(spy.iloc[-1]), "sma200": sma,
                                            "band_hi": sma * (1 + band), "band_lo": sma * (1 - band), "risk_on": bool(risk_on)}))

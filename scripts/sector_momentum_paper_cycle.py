@@ -103,6 +103,9 @@ def main():
             print(f"  {t['side'].upper()} {t['shares']:.4f} {t['ticker']} @ {t['price']:.2f}")
     else:
         print("not a rebalance day - mark to market only")
+    if trades:
+        from engine import rebalance_check
+        rebalance_check.check(db, targets, prices, smp.snapshot(db, prices)["total_value"], cfg, "Sector momentum sleeve")
     import json
     spy_c = closes["SPY"]
     sma = float(spy_c.iloc[-200:].mean())

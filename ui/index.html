@@ -699,6 +699,23 @@
   #subnav button { background: var(--bg-1); border-color: var(--border); }
   #subnav button:hover { background: var(--bg-2); }
   #subnav button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  @media (max-width: 760px) {
+    #content { padding: 16px 14px 56px; }
+    #topbar { padding: 10px 14px; gap: 6px; }
+    #topbar h1 { font-size: 15px; }
+    #regime-badge, #health-badge { display: none; }
+    .ov-hero { grid-template-columns: 1fr 1fr; gap: 10px; }
+    .ov-tile { padding: 12px 14px; }
+    .ov-tile .ov-value { font-size: 22px; }
+    .ov-row { grid-template-columns: 1fr; }
+    .ov-attn .item { align-items: flex-start; font-size: 12.5px; }
+    .panel { padding: 14px; }
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .ov-cmp th, .ov-cmp td { white-space: nowrap; }
+    #subnav { overflow-x: auto; flex-wrap: nowrap; padding-bottom: 10px; }
+    #subnav button { flex: 0 0 auto; }
+    details.ctl-adv > summary { padding: 12px 14px; }
+  }
   #theme-btn { width: 34px; height: 32px; justify-content: center; padding: 0; font-size: 15px; }
 </style>
 
@@ -1179,7 +1196,7 @@ function ovCountUp(node, to, fmt) {
 
 function ovLineChart(c) {
   const W = 760, H = 270, L = 44, R = 14, T = 12, B = 26;
-  const series = [["sleeve", "Sector momentum", OV_COLORS[0]], ["stock", "Stock momentum", OV_COLORS[1]], ["stock_lowvol", "Stock mom + low-vol", OV_COLORS[4]], ["spy", "SPY", OV_COLORS[7]], ["swing", "Swing engine", OV_COLORS[2]]]
+  const series = [["sleeve", "Sector momentum", OV_COLORS[0]], ["stock", "Stock momentum", OV_COLORS[1]], ["stock_lowvol", "Stock mom + low-vol", OV_COLORS[4]], ["spy", "SPY", OV_COLORS[7]], ["baseline", "SPY + 200d rule, same leverage", OV_COLORS[6]], ["swing", "Swing engine", OV_COLORS[2]]]
     .filter(([k]) => (c[k] || []).length > 1);
   if (!c.dates || c.dates.length < 2 || !series.length)
     return `<div class="ov-empty">Collecting data — the first daily mark is logged after today's close (16:15 ET).<br>
@@ -1255,6 +1272,27 @@ function ovStockPanel(sk) {
     </tbody></table></div></div>`;
 }
 
+function ovReadiness(r) {
+  if (!r) return "";
+  return `<details class="panel ctl-adv" ${r.ready ? "open" : ""}><summary><b>Live readiness</b> — ${r.passed}/${r.total} checks
+      <span class="pill ${r.ready ? "pill-green" : "pill-yellow"}" style="margin-left:8px">${r.ready ? "ready to discuss" : "not yet"}</span></summary>
+    <div class="ov-attn" style="padding:0 16px 16px">${r.checks.map(c => `<div class="item ${c.ok ? "good" : "warn"}">${c.ok ? "✓" : "○"}
+      <span><b>${c.name}</b> <span class="subtle">${c.detail}${c.manual && !c.ok ? " (manual)" : ""}</span></span></div>`).join("")}</div>
+    <div class="ov-note" style="padding:0 16px 14px">Passing only means real money can be <i>discussed</i>. Live execution stays off until you open its gates on the Control tab.</div></details>`;
+}
+
+function ovTaxPanel(tax) {
+  if (!tax || !Object.keys(tax).length) return "";
+  const rows = Object.entries(tax).map(([n, t]) => `<tr><td><b>${n}</b></td><td class="num ${ovCls(t.pre_tax_return)}">${ovPct(t.pre_tax_return, 2)}</td>
+    <td class="num">${ovUSD(-t.costs_and_financing)}</td><td class="num">${ovUSD(-t.tax_if_sold_today)}</td>
+    <td class="num ${ovCls(t.after_tax_return_if_sold)}">${ovPct(t.after_tax_return_if_sold, 2)}</td></tr>`).join("");
+  const rate = Object.values(tax)[0].tax_rate;
+  return `<div class="panel"><div class="panel-head">${svg("performance", 15)}<span class="panel-title">What you would keep</span></div>
+    <div class="table-wrap"><table class="ov-cmp" data-no-enhance><thead><tr><th>Strategy</th><th class="num">Return (pre-tax)</th><th class="num">Costs &amp; interest</th>
+    <th class="num">Est. tax if sold today</th><th class="num">After tax</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="ov-note">Planning estimate at a flat ${(rate * 100).toFixed(0)}% short-term rate; losses are not carried forward. Change the rate in config.yaml (reports.short_term_tax_rate).</div></div>`;
+}
+
 function ovAttention(d) {
   const items = [], cfg = (state.config || {});
   const sc = d.scheduler || {}, dr = d.drift || {};
@@ -1265,6 +1303,13 @@ function ovAttention(d) {
   const today = new Date(), todayStr = today.getFullYear() + "-" + String(today.getMonth() + 1).padStart(2, "0") + "-" + String(today.getDate()).padStart(2, "0");
   const days = Math.round((new Date(d.next_rebalance + "T00:00:00") - new Date(todayStr + "T00:00:00")) / 86400000);
   if (days >= 0 && days <= 1) items.push(["warn", `Month-end rebalance ${days === 0 ? "is today" : "is tomorrow"} — the three strategies will trade at the close.`]);
+  const ex = d.experiment;
+  if (ex && ex.decision_date) {
+    const left = ex.days_left, pf = ex.profit_factor == null ? "n/a" : ex.profit_factor.toFixed(2);
+    items.push([left <= 0 && ex.verdict !== "pass" ? "bad" : "warn",
+      `Swing forward test: ${ex.entry_days}/${ex.needs_days} entry days, profit factor ${pf} (needs ${ex.needs_pf}). ` +
+      (left > 0 ? `Decision on ${ex.decision_date} (${left} days).` : `Decision day reached — verdict: ${ex.verdict}.`)]);
+  }
   if (!items.length) items.push(["good", "Nothing needs your attention. The engine runs by itself; this page updates every 30 seconds."]);
   return `<div class="ov-attn">${items.map(([k, t]) => `<div class="item ${k}">${k === "good" ? "✓" : "!"}<span>${t}</span></div>`).join("")}</div>`;
 }
@@ -1339,6 +1384,8 @@ async function paintOverview(el, quiet) {
     </div>
 
     ${ovAttention(d)}
+    ${ovTaxPanel(d.tax)}
+    ${ovReadiness(d.readiness)}
     ${ovDriftPanel(d.drift)}
     ${ovStockPanel(d.stock)}
     ${ovStockPanel(d.stock_lowvol)}

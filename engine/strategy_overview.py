@@ -29,7 +29,7 @@ def next_month_end(today: date) -> str:
     return d.isoformat()
 
 
-def _curves(sleeve_rows, swing_rows, stock_rows=None, lowvol_rows=None):
+def _curves(sleeve_rows, swing_rows, stock_rows=None, lowvol_rows=None, baseline=None):
     if not sleeve_rows:
         return {"dates": [], "sleeve": [], "spy": [], "swing": [], "stock": [], "stock_lowvol": []}
     df = pd.DataFrame(sleeve_rows)
@@ -50,8 +50,12 @@ def _curves(sleeve_rows, swing_rows, stock_rows=None, lowvol_rows=None):
         lv.index = pd.to_datetime(lv["as_of_date"])
         lv = lv["total_value"].sort_index()
         df["stock_lowvol"] = lv.reindex(lv.index.union(df.index)).ffill().reindex(df.index)
+    if baseline:
+        bl = pd.Series(baseline)
+        bl.index = pd.to_datetime(bl.index)
+        df["baseline"] = bl.sort_index().reindex(bl.index.union(df.index)).ffill().reindex(df.index)
     out = {"dates": [d.strftime("%Y-%m-%d") for d in df.index]}
-    for c in ("sleeve", "spy", "swing", "stock", "stock_lowvol"):
+    for c in ("sleeve", "spy", "swing", "stock", "stock_lowvol", "baseline"):
         # A sleeve that started after the others has no value on the earlier dates; back-fill so it is a flat 100
         # until it starts instead of NaN (which poisoned the whole series and logged a warning every poll).
         col = df[c].bfill() if c in df else None
@@ -96,6 +100,25 @@ def _stock_view(db, cfg: dict, section: str = "stock_momentum_sleeve", prefix: s
                         "gross": mv / equity if equity else 0.0},
             "positions": positions, "market": _json(led, "market")}
     return view, led.get_sm_equity_log()
+
+
+def swing_experiment_status(db, cfg: dict, today=None) -> dict | None:
+    """Forward-test verdict plus the decision date from config (swing_experiment.decision_date)."""
+    import sqlite3
+    from datetime import date
+    try:
+        from engine.swing_experiment import summarize
+        with db._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            trades = [dict(r) for r in conn.execute("SELECT * FROM paper_trades ORDER BY id").fetchall()]
+        out = summarize(trades)
+    except Exception:
+        return None
+    dd = ((cfg or {}).get("swing_experiment", {}) or {}).get("decision_date")
+    out["decision_date"] = str(dd) if dd else None
+    if dd:
+        out["days_left"] = (date.fromisoformat(str(dd)) - (today or date.today())).days
+    return out
 
 
 def scheduler_health(db, cfg: dict, now=None) -> dict:
@@ -177,7 +200,12 @@ def build(db, cfg: dict, today: date = None) -> dict:
     swing_rows = db.get_paper_equity_history(limit=100000)
     stock, stock_rows = _stock_view(db, cfg)
     stock_lowvol, lowvol_rows = _stock_view(db, cfg, "stock_lowvol_sleeve", "stl")
-    curves = _curves(sleeve_rows, swing_rows, stock_rows, lowvol_rows)
+    try:
+        from engine.baseline import load as _load_baseline
+        _bl = _load_baseline(db)
+    except Exception:
+        _bl = None
+    curves = _curves(sleeve_rows, swing_rows, stock_rows, lowvol_rows, _bl)
     stats = {"days": len(curves["dates"])}
     for c in ("sleeve", "spy", "swing", "stock", "stock_lowvol"):
         v = curves.get(c) or []
@@ -226,8 +254,30 @@ def build(db, cfg: dict, today: date = None) -> dict:
         sched = scheduler_health(db, cfg)
     except Exception as e:
         sched = {"status": "ok", "error": str(e)}
-    return {"scheduler": sched, "stock": stock, "stock_lowvol": stock_lowvol, "drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
+    tax = None
+    try:
+        from engine.tax_cost import summarize as _tax
+        from storage.sleeve_ledger import SleeveLedger
+        rate = float(((cfg or {}).get("reports", {}) or {}).get("short_term_tax_rate", 0.30))
+        px = json.loads(db.get_sm_state("last_prices") or "{}")
+        tax = {}
+        for name, pre, key in (("Sector momentum", "sm", "sector_momentum_sleeve"), ("Stock momentum", "stk", "stock_momentum_sleeve"),
+                               ("Stock mom + low-vol", "stl", "stock_lowvol_sleeve")):
+            if (cfg.get(key, {}) or {}).get("paper_enabled"):
+                led = SleeveLedger(db, pre)
+                t = _tax(led, json.loads(led.get_sm_state("last_prices") or "{}") or px, rate)
+                if t:
+                    tax[name] = t
+    except Exception:
+        tax = None
+    _out = {"tax": tax, "experiment": swing_experiment_status(db, cfg), "scheduler": sched, "stock": stock, "stock_lowvol": stock_lowvol, "drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
             "leverage": sc.get("leverage", 1.0), "band_pct": sc.get("band_pct", 0.0),
             "account": account, "positions": positions, "market": market, "targets": targets,
             "curves": curves, "stats": stats, "swing": swing, "rsi2": rsi2,
             "next_rebalance": next_month_end(today)}
+    try:
+        from engine.promotion_checklist import evaluate as _ready
+        _out["readiness"] = _ready(_out, cfg)
+    except Exception:
+        _out["readiness"] = None
+    return _out

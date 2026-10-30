@@ -136,11 +136,92 @@ def health_problems(db, cfg: dict, today: date | None = None) -> list[str]:
     return problems
 
 
+def swing_decision_due(db, cfg: dict, today: date | None = None) -> str | None:
+    """On/after swing_experiment.decision_date, once, return the verdict message (the caller sends it)."""
+    from engine.strategy_overview import swing_experiment_status
+    today = today or date.today()
+    ex = swing_experiment_status(db, cfg, today)
+    if not ex or not ex.get("decision_date") or today < date.fromisoformat(ex["decision_date"]):
+        return None
+    if db.get_sm_state("swing_decision_sent") == ex["decision_date"]:
+        return None
+    pf = ex.get("profit_factor")
+    verdict = ex["verdict"]
+    advice = {"pass": "it passed - sizing steps up automatically while it keeps passing",
+              "fail": "it FAILED the bar - consider switching the swing engine off (Control tab)",
+              "collecting": "still collecting: too few entry days to judge - extend the date or switch it off"}[verdict]
+    db.set_sm_state("swing_decision_sent", ex["decision_date"])
+    return (f"Swing forward test decision day: {ex['entry_days']}/{ex['needs_days']} entry days, "
+            f"profit factor {('%.2f' % pf) if pf else 'n/a'} (needs {ex['needs_pf']}); {advice}.")
+
+
+def weekly_digest(db, cfg: dict, today: date | None = None) -> str | None:
+    """One short paragraph on Sundays: how each strategy did this week versus SPY, drift, readiness. None on other days."""
+    today = today or date.today()
+    if today.weekday() != 6:
+        return None
+    if db.get_sm_state("digest_sent") == str(today):
+        return None
+    from engine import strategy_overview as so
+    d = so.build(db, cfg)
+    cur = d.get("curves") or {}
+
+    def wk(key):
+        v = cur.get(key) or []
+        if len(v) < 2:
+            return None
+        base = v[max(0, len(v) - 6)]                 # ~5 trading days back
+        return v[-1] / base - 1
+    parts = []
+    for key, label in (("sleeve", "Sector"), ("stock", "Stock mom"), ("stock_lowvol", "Low-vol"), ("spy", "SPY"), ("baseline", "SPY+rule")):
+        w = wk(key)
+        if w is not None:
+            parts.append(f"{label} {w:+.1%}")
+    r = d.get("readiness") or {}
+    drift = (d.get("drift") or {}).get("status", "n/a")
+    msg = f"Week: {' | '.join(parts) or 'collecting data'}. Drift: {drift}. Live readiness {r.get('passed', '?')}/{r.get('total', '?')}."
+    db.set_sm_state("digest_sent", str(today))
+    return msg
+
+
+def backup_database() -> str | None:
+    """Nightly pg_dump; returns an error string on failure (it is then reported with the other problems)."""
+    try:
+        sys.path.insert(0, str(BASE))
+        from scripts.backup_db import run_backup
+        run_backup()
+        return None
+    except Exception as e:
+        return f"database backup FAILED: {e}"
+
+
 def run(db, cfg: dict) -> dict:
     """The scheduled job body. Returns what it did (for the log and tests)."""
     result = {"reference": ensure_reference(cfg), "pruned": prune_files(), "alerts_cleared": resolve_stale_alerts(db),
               "problems": health_problems(db, cfg)}
-    msgs = [m for m in (result["reference"],) if m and "FAILED" in m] + result["problems"]
+    result["backup"] = backup_database()
+    try:
+        digest = weekly_digest(db, cfg)
+        if digest:
+            from engine.notifications import notify
+            notify(cfg, title="Weekly digest", message=digest, subtitle="Trading Platform", severity="summary")
+            result["digest"] = digest
+    except Exception as e:
+        logger.warning(f"weekly digest failed: {e}")
+    try:
+        msg = swing_decision_due(db, cfg)
+        if msg:
+            from engine.notifications import notify
+            notify(cfg, title="Swing engine: decision day", message=msg, subtitle="Forward test", severity="critical")
+            result["swing_decision"] = msg
+    except Exception as e:
+        logger.warning(f"swing decision check failed: {e}")
+    try:
+        from engine import baseline
+        result["baseline_days"] = baseline.refresh(db, cfg)
+    except Exception as e:
+        result["baseline_days"] = f"skipped: {e}"
+    msgs = [m for m in (result["reference"], result["backup"]) if m and "FAILED" in m] + result["problems"]
     if msgs:
         try:
             from engine.notifications import notify
