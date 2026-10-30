@@ -129,9 +129,12 @@ def find_rotation_victim(db, cfg: dict, candidate_ticker: str,
         # chose to enter - never eligible as a rotation victim.
         if str(pos.get("trade_mode") or "").upper() in ("SYNC", "SEED"):
             continue
-        health = pos.get("position_health_score")
-        if health is None:
-            continue  # Loop B hasn't judged it yet - too young to sacrifice
+        # Book health (profit in R, breakeven, hold time, stop) - the same score the UI shows. The old
+        # per-position score sat near 50 for every position that had not moved, so it could not pick a victim.
+        if pos.get("current_profit_r") is None:
+            continue  # Loop B hasn't marked it yet - too young to sacrifice
+        from storage.database import position_book_health
+        health = position_book_health(pos)
         days = _days_held(pos)
         if days < min_days:
             continue

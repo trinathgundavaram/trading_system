@@ -53,6 +53,8 @@ def _open(db, ticker, health=None, days_held=None, price=100.0):
     updates = {}
     if health is not None:
         updates["position_health_score"] = health
+        # rotation ranks by book health, which is driven by profit in R: map the old health knob onto R.
+        updates["current_profit_r"] = (health - 60) / 40.0
     if days_held is not None:
         updates["days_held"] = days_held
     if updates:
@@ -78,7 +80,7 @@ def test_candidate_below_bar(db):
 
 def test_healthy_holdings_never_sacrificed(db):
     _open(db, "AAA", health=80, days_held=10)
-    _open(db, "BBB", health=70, days_held=10)
+    _open(db, "BBB", health=90, days_held=10)
     assert rotation.find_rotation_victim(db, CFG, "NEW", 95, simulated=True) is None
 
 
