@@ -25,7 +25,7 @@ from scripts.sector_momentum_paper_cycle import is_month_end, needs_rebalance
 from storage.database import Database
 from storage.sleeve_ledger import SleeveLedger
 
-SECTION = "stock_momentum_sleeve"
+DEFAULT_SECTION, DEFAULT_PREFIX = "stock_momentum_sleeve", "stk"
 
 
 def fetch_closes(tickers: list, period: str = "400d") -> pd.DataFrame:
@@ -48,13 +48,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force-rebalance", action="store_true")
+    ap.add_argument("--section", default=DEFAULT_SECTION, help="config.yaml block holding this sleeve's settings")
+    ap.add_argument("--prefix", default=DEFAULT_PREFIX, help="ledger table prefix (own tables per sleeve)")
     a = ap.parse_args()
+    SECTION = a.section
     cfg = load_config_dict()
     sc = cfg.get(SECTION, {})
     if not sc.get("paper_enabled", False):
         print(f"{SECTION}.paper_enabled is false in config.yaml - not running.")
         return
-    led = SleeveLedger(Database(), "stk")
+    led = SleeveLedger(Database(), a.prefix)
     paper.ensure_seeded(led, cfg, SECTION)
     held = [p["ticker"] for p in led.get_open_sm_positions()]
     n, lev = int(sc.get("top_n", 40)), float(sc.get("leverage", 1.0))

@@ -120,6 +120,21 @@ stock_momentum_sleeve:
   cost_bps: 5.0
   financing_bps: 400.0
   min_trade_frac: 0.002   # ignore rebalance trims/adds smaller than 0.2% of equity (a 40-name book needs a small floor)
+stock_lowvol_sleeve:
+  # PAPER only. Same machinery as stock_momentum_sleeve but selects the 40 S&P 500 stocks with the best average
+  # rank of 12-1 momentum and LOW 63-day volatility (rules/stock_momentum.py::mom_lowvol_scores). Research
+  # (research/stock_factors.py, SPY rule, 1.0x): ~9.8% CAGR, ~-9.7% max drawdown, Sharpe 0.93 vs the momentum
+  # selection's ~12.1% / -19.6% / 0.81. Run side by side with the momentum sleeve (same leverage and rule) to get a
+  # forward comparison instead of trusting one in-sample backtest. Own ledger (stl_*).
+  paper_enabled: true
+  paper_starting_cash: 10000
+  top_n: 40
+  selection: mom_lowvol
+  leverage: 1.25
+  band_pct: 2.0
+  cost_bps: 5.0
+  financing_bps: 400.0
+  min_trade_frac: 0.002
 tradingagents_advisor:
   # TauricResearch/TradingAgents as an ADVISORY rating logger (never trades).
   # Needs a local install of the repo and ANTHROPIC_API_KEY in the environment.

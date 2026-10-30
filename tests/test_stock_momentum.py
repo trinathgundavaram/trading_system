@@ -58,3 +58,13 @@ def test_mom_lowvol_prefers_steady_winners_over_wild_ones():
     low_vol_names = {f"S{i}" for i in range(15)}
     assert len(w) == 5 and sum(1 for t in w if t in low_vol_names) >= 4
     assert set(sm.target_weights(c, mem, risk_on=False, selection="mom_lowvol")) == {"SHY"}
+
+
+def test_second_sleeve_uses_its_own_config_block_and_ledger_prefix():
+    from config_loader import load_config_dict
+    c = load_config_dict()
+    assert c["stock_lowvol_sleeve"]["selection"] == "mom_lowvol" and c["stock_momentum_sleeve"]["selection"] == "momentum"
+    import inspect
+    from scripts import stock_momentum_paper_cycle as cyc
+    src = inspect.getsource(cyc.main)
+    assert "a.prefix" in src and "a.section" in src                      # nothing hard-wired to the first sleeve's tables

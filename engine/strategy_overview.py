@@ -29,9 +29,9 @@ def next_month_end(today: date) -> str:
     return d.isoformat()
 
 
-def _curves(sleeve_rows, swing_rows, stock_rows=None):
+def _curves(sleeve_rows, swing_rows, stock_rows=None, lowvol_rows=None):
     if not sleeve_rows:
-        return {"dates": [], "sleeve": [], "spy": [], "swing": [], "stock": []}
+        return {"dates": [], "sleeve": [], "spy": [], "swing": [], "stock": [], "stock_lowvol": []}
     df = pd.DataFrame(sleeve_rows)
     df.index = pd.to_datetime(df.pop("as_of_date"))
     df = df.sort_index().rename(columns={"total_value": "sleeve", "spy_close": "spy"})
@@ -45,8 +45,13 @@ def _curves(sleeve_rows, swing_rows, stock_rows=None):
         st.index = pd.to_datetime(st["as_of_date"])
         st = st["total_value"].sort_index()
         df["stock"] = st.reindex(st.index.union(df.index)).ffill().reindex(df.index)
+    if lowvol_rows:
+        lv = pd.DataFrame(lowvol_rows)
+        lv.index = pd.to_datetime(lv["as_of_date"])
+        lv = lv["total_value"].sort_index()
+        df["stock_lowvol"] = lv.reindex(lv.index.union(df.index)).ffill().reindex(df.index)
     out = {"dates": [d.strftime("%Y-%m-%d") for d in df.index]}
-    for c in ("sleeve", "spy", "swing", "stock"):
+    for c in ("sleeve", "spy", "swing", "stock", "stock_lowvol"):
         out[c] = [round(float(v), 3) for v in (df[c] / df[c].iloc[0] * 100)] if c in df else []
     return out
 
@@ -58,13 +63,13 @@ def _drawdown(series):
     return float((s / s.cummax() - 1).min())
 
 
-def _stock_view(db, cfg: dict):
-    """Account + holdings + stats inputs for the stock-momentum sleeve (ledger `stk`)."""
-    sc = cfg.get("stock_momentum_sleeve", {})
+def _stock_view(db, cfg: dict, section: str = "stock_momentum_sleeve", prefix: str = "stk"):
+    """Account + holdings + stats inputs for a stock sleeve (own ledger `prefix`)."""
+    sc = cfg.get(section, {})
     if not sc.get("paper_enabled"):
         return None, []
     from storage.sleeve_ledger import SleeveLedger
-    led = SleeveLedger(db, "stk")
+    led = SleeveLedger(db, prefix)
     acct = led.get_sm_account()
     if not acct:
         return {"enabled": True, "account": None, "positions": [], "market": None}, []
@@ -82,6 +87,7 @@ def _stock_view(db, cfg: dict):
         p["weight"] = p["value"] / equity if equity else 0.0
     positions.sort(key=lambda x: -x["value"])
     view = {"enabled": True, "top_n": sc.get("top_n", 40), "leverage": sc.get("leverage", 1.0),
+            "selection": sc.get("selection", "momentum"),
             "account": {"starting_cash": acct["starting_cash"], "cash": acct["cash"], "equity": equity,
                         "realized_pnl": acct["realized_pnl"], "return_pct": equity / acct["starting_cash"] - 1,
                         "gross": mv / equity if equity else 0.0},
@@ -167,9 +173,10 @@ def build(db, cfg: dict, today: date = None) -> dict:
     sleeve_rows = db.get_sm_equity_log()
     swing_rows = db.get_paper_equity_history(limit=100000)
     stock, stock_rows = _stock_view(db, cfg)
-    curves = _curves(sleeve_rows, swing_rows, stock_rows)
+    stock_lowvol, lowvol_rows = _stock_view(db, cfg, "stock_lowvol_sleeve", "stl")
+    curves = _curves(sleeve_rows, swing_rows, stock_rows, lowvol_rows)
     stats = {"days": len(curves["dates"])}
-    for c in ("sleeve", "spy", "swing", "stock"):
+    for c in ("sleeve", "spy", "swing", "stock", "stock_lowvol"):
         v = curves.get(c) or []
         stats[c + "_total"] = (v[-1] / v[0] - 1) if len(v) > 1 else None
         stats[c + "_dd"] = _drawdown(v) if len(v) > 1 else None
@@ -194,6 +201,10 @@ def build(db, cfg: dict, today: date = None) -> dict:
          "enabled": bool(cfg.get("stock_momentum_sleeve", {}).get("paper_enabled")),
          "detail": "top-40 stocks by momentum; month-end rebalance, T-bills when SPY is risk-off",
          "last": ((stock or {}).get("market") or {}).get("as_of")},
+        {"name": "Stock momentum + low-vol (S&P 500)", "when": "Mon-Fri 16:25 ET",
+         "enabled": bool(cfg.get("stock_lowvol_sleeve", {}).get("paper_enabled")),
+         "detail": "same rules as the stock sleeve, picks by momentum rank + low volatility rank",
+         "last": ((stock_lowvol or {}).get("market") or {}).get("as_of")},
         {"name": "Swing engine scan", "when": f"every {scan} min, 9:00-16:30 ET", "enabled": True,
          "detail": "scores the watchlist and screener candidates (paper / WATCH)", "last": None},
         {"name": "RSI(2) SPY sleeve", "when": "Mon-Fri 16:10 ET",
@@ -212,7 +223,7 @@ def build(db, cfg: dict, today: date = None) -> dict:
         sched = scheduler_health(db, cfg)
     except Exception as e:
         sched = {"status": "ok", "error": str(e)}
-    return {"scheduler": sched, "stock": stock, "drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
+    return {"scheduler": sched, "stock": stock, "stock_lowvol": stock_lowvol, "drift": drift, "jobs": jobs, "enabled": bool(sc.get("paper_enabled")), "strategy": sc.get("strategy", "sector"),
             "leverage": sc.get("leverage", 1.0), "band_pct": sc.get("band_pct", 0.0),
             "account": account, "positions": positions, "market": market, "targets": targets,
             "curves": curves, "stats": stats, "swing": swing, "rsi2": rsi2,

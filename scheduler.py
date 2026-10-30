@@ -2169,6 +2169,23 @@ def run_stock_momentum_cycle():
         logger.error(f"Stock momentum cycle failed: {e}")
 
 
+def run_stock_lowvol_cycle():
+    """Daily PAPER run of the momentum + low-volatility stock sleeve (own ledger `stl`); the same script as the
+    momentum stock sleeve, pointed at its own config block and tables. Child process, gated by paper_enabled."""
+    import subprocess
+    try:
+        if not load_config().get("stock_lowvol_sleeve", {}).get("paper_enabled", False):
+            logger.info("Stock low-vol sleeve: paper_enabled is false - skipping")
+            return
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "stock_momentum_paper_cycle.py")
+        r = subprocess.run([sys.executable, script, "--section", "stock_lowvol_sleeve", "--prefix", "stl"],
+                           capture_output=True, text=True, timeout=1200)
+        log = logger.info if r.returncode == 0 else logger.error
+        log(f"Stock low-vol cycle exit={r.returncode}: {(r.stdout or '').strip()[-500:]} {(r.stderr or '').strip()[-500:]}")
+    except Exception as e:
+        logger.error(f"Stock low-vol cycle failed: {e}")
+
+
 def run_tradingagents_cycle():
     """Daily TradingAgents ADVISORY run (scripts/tradingagents_paper_cycle.py):
     logs ratings only, never trades. Gated by tradingagents_advisor.enabled."""
@@ -2297,6 +2314,10 @@ def start():
     scheduler.add_job(
         run_stock_momentum_cycle, "cron", day_of_week="mon-fri", hour=16, minute=20,
         id="stock_momentum_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        run_stock_lowvol_cycle, "cron", day_of_week="mon-fri", hour=16, minute=25,
+        id="stock_lowvol_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(
         run_tradingagents_cycle, "cron", day_of_week="mon-fri", hour=16, minute=30,
