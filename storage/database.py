@@ -4117,18 +4117,31 @@ class Database:
         return self.latest_signal(ticker)
 
     def get_latest_health_score(self):
-        """Average position_health_score across open positions, or None if
-        there are no open positions or none have been scored yet. NOTE: this
-        is NOT the full 11-metric Strategy Health Score from the original
-        spec (win rate trend, drift detection, etc.) - that system was never
-        built. This is a much smaller thing: the average of
-        engine/position_health.py's per-position score, which IS built
-        (Phase 3). server.py's UI header badge reads this."""
+        """Book health (0-100) across open positions, or None with no positions.
+
+        The per-position score (engine/position_health.py) sits near 50 for any
+        position that has not moved yet, so its average says little. This blends
+        what actually shows whether the book is behaving: average profit in R
+        (40%), share of positions at or above breakeven (30%), share still inside
+        their intended hold time (15%) and share with a live stop (15%). The
+        per-position score still drives exits; this is only the header badge."""
         positions = self.get_all_positions()
-        scores = [p["position_health_score"] for p in positions if p.get("position_health_score") is not None]
-        if not scores:
+        # Synced real holdings carry no engine data (no stop, no R); score the engine's own book.
+        positions = [p for p in positions if p.get("simulated")] or positions
+        if not positions:
             return None
-        return sum(scores) / len(scores)
+        n = len(positions)
+        rs = [float(p.get("current_profit_r") or 0.0) for p in positions]
+        avg_r = sum(rs) / n
+        r_pts = min(100.0, max(0.0, 50.0 + avg_r * 50.0))
+        green_pts = 100.0 * sum(1 for r in rs if r >= 0) / n
+
+        def _fresh(p):
+            limit = 1.5 if (p.get("trade_mode") or "").upper() == "DAY" else 7.0
+            return float(p.get("days_held") or 0.0) <= limit
+        fresh_pts = 100.0 * sum(1 for p in positions if _fresh(p)) / n
+        stop_pts = 100.0 * sum(1 for p in positions if p.get("current_stop_price")) / n
+        return 0.40 * r_pts + 0.30 * green_pts + 0.15 * fresh_pts + 0.15 * stop_pts
 
     def get_portfolio_heat(self) -> dict:
         """Approximate portfolio heat = sum of open positions' dollar risk

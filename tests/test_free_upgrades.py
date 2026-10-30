@@ -132,3 +132,16 @@ def test_swing_scorecard_groups_and_verdict():
     assert any(g["name"] == "Exit engine (urgent)" for g in out["by_exit"])
     assert any(g["name"] == "3-6 days" and g["n"] == 1 for g in out["by_hold"])
     assert out["verdict"]["label"] == "Unproven"
+
+
+def test_book_health_reflects_performance_not_neutral_scores(tmp_path):
+    from storage.database import Database
+    db = Database(str(tmp_path / "h.db"))
+    pos = lambda r, d: {"simulated": 1, "current_profit_r": r, "days_held": d, "current_stop_price": 1.0, "trade_mode": "SWING"}
+    db.get_all_positions = lambda: [pos(1.0, 1), pos(0.5, 2)]
+    good = db.get_latest_health_score()
+    db.get_all_positions = lambda: [pos(-1.0, 12), pos(-0.5, 9)]
+    bad = db.get_latest_health_score()
+    assert good > 75 > 40 > bad
+    db.get_all_positions = lambda: []
+    assert db.get_latest_health_score() is None

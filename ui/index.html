@@ -1020,7 +1020,7 @@ const TABS = [
 // underline (.hint) as the visual cue that there's more info on hover.
 const TIPS = {
   regime: "Market regime blend from engine/regime_engine.py, recalculated once per scan cycle from SPY trend/breadth/VIX. Format: DOMINANT · bull%/bear%/choppy% - the three numbers are how much of the blend is bull-like/bear-like/choppy-like; the dominant label is whichever is highest, and they're expected to sum to ~100%. Feeds rules/dynamic_thresholds.py - a stressed or transitioning regime raises the buy-score bar.",
-  health: "Average position_health_score (0-100) across all open positions, from engine/position_health.py - combines trend/momentum/volume health with MAE/MFE and time decay. Expected: 70+ healthy, 55-70 caution, below 55 weak. Shows — with no open positions.",
+  health: "Book health (0-100): average profit in R (40%), share of positions at or above breakeven (30%), share still inside their intended hold time (15%), share with a live stop (15%). 70+ healthy, 55-70 caution, below 55 weak. To raise it: let the engine exit stale/losing positions (it does), keep stops on, avoid over-filling the book.",
   mode: "Trading mode from config.yaml's trading.mode: SWING (multi-day holds, 6-bucket scoring) or DAY (intraday) or HYBRID (per-ticker: resolves to DAY when the stricter day-trade bar and intraday momentum both clear, otherwise SWING).",
   // Corrected 2026-07-26 (UI audit). The last sentence used to read "This app
   // itself never places an order" - true before engine/live_trader.py, false
@@ -1028,7 +1028,7 @@ const TIPS = {
   watch: "WATCH = paper trading: every signal is executed as a simulated fill with full purse/P&L tracking. EXECUTE = real-money mode. Which process actually places the order then depends on the Live Execution master switch (Control tab): OFF = the scheduler writes a trade prompt and Claude Desktop places the orders; ON = this app places real fractional market orders itself via engine/live_trader.py. Auto-Trade must also be ON in either case - with it OFF, EXECUTE mode is analysis-only.",
   fg_score: "CNN Fear & Greed index (0-100). Expected: below 30 = Extreme Fear (often watched as a contrarian buy zone), 30-60 = Neutral, above 60 = Greed (caution).",
   vix: "CBOE Volatility Index - the market's expected 30-day volatility. Expected: below 20 calm, 20-27 elevated, above 27 high stress (raises the buy-score threshold - see the Strategy tab's dynamic threshold formula).",
-  strategy_health: "Average position_health_score (0-100) across open positions - same figure as the Health badge in the top bar.",
+  strategy_health: "Book health (0-100) - same figure as the Health badge in the top bar.",
   cycles_today: "Number of scan cycles scheduler.py has run today (scheduled + any manual \"Run cycle now\" runs).",
   signals_today: "Number of BUY/HOLD/SELL signals logged today across your whole watchlist.",
   trades_today: "Number of confirmed real fills logged via confirm_fill.py today.",
