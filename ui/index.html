@@ -1577,7 +1577,8 @@ function connect() {
 async function handleLiveEvent(eventType, payload) {
   if (eventType === "buy_signal") {
     toast(`BUY candidate: ${tickerLabel(payload.ticker)} — score ${payload.pct_score.toFixed(0)}%`, "success");
-    maybeDesktopNotify(`BUY candidate: ${tickerLabelText(payload.ticker)}`, `Score ${payload.pct_score.toFixed(0)}% | ${payload.regime || ""} regime`);
+    // Buy-candidate popups removed 2026-10-30: the engine is automated and these fired every cycle.
+    if (false) maybeDesktopNotify(`BUY candidate: ${tickerLabelText(payload.ticker)}`, `Score ${payload.pct_score.toFixed(0)}% | ${payload.regime || ""} regime`);
   } else if (eventType === "urgent_exit") {
     toast(`URGENT EXIT: ${tickerLabel(payload.ticker)} — ${payload.label}`, "alert");
     maybeDesktopNotify(`URGENT EXIT: ${tickerLabelText(payload.ticker)}`, payload.reason);
@@ -5077,9 +5078,8 @@ async function boot() {
   setInterval(loadTickerNames, 300000);
   setInterval(loadTickerHealth, 300000);
   setInterval(() => { if (currentTab === "logs") loadLogsBody(); }, 10000);
-  if (typeof Notification !== "undefined" && Notification.permission === "default") {
-    Notification.requestPermission();
-  }
+  // (No notification-permission prompt: only urgent exits use browser notifications, and the macOS
+  // desktop transport already covers them.)
 }
 boot();
 </script>

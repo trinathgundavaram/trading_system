@@ -3,6 +3,8 @@ trading:
   # Phase 0 step 0.1 (2026-07-24): all three live-execution gates closed.
   # Do not reopen these until the §32 re-arm gate passes - see CHANGELOG.md.
   auto_trade: false
+  # Off: trade_prompt.md / analysis_packet.md are only for the manual paste-into-Claude-Desktop workflow.
+  write_trade_prompt: false
   trade_size_usd: 100
   # 2026-10-30: % -of-purse sizing exists (engine/position_sizing.py::_get_equity: cash + positions) and was
   # switched on for a few hours, then switched OFF again: the swing engine's closed-pattern record is
@@ -1006,6 +1008,8 @@ backtest:
 notifications:
   enabled: true
   desktop_enabled: true
+  # Routine BUY-candidate popups (one per cycle on an automated engine). Urgent exits and halts always notify.
+  buy_signals: false
   transports: [desktop, webhook, log]
   # Any endpoint that accepts a POST: https://ntfy.sh/your-topic, a Slack or
   # Discord incoming webhook, Pushover. This is the transport that reaches you

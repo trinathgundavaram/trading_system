@@ -98,6 +98,10 @@ def _notify_via_outbox(cfg: dict, *, severity: str, title: str, body: str,
     # here moved the gate too, and putting it after the write would mean every
     # buy signal pops once a host agent is attached - the gate would silently
     # apply only to the fallback path, which is the opposite of the intent.
+    # Routine buy-candidate chatter is off by default (an automated engine pops one every cycle);
+    # urgent exits, kill-switch halts and other non-"info" events still go out.
+    if severity == "info" and not (cfg.get("notifications", {}) or {}).get("buy_signals", False):
+        return
     if threshold_pct is not None:
         threshold = (cfg.get("notifications", {}) or {}).get("high_conviction_buy_pct", 80)
         if threshold_pct < threshold:
@@ -1637,7 +1641,9 @@ def _run_cycle_tail(mkt, cfg: dict, trading_mode: str, regime, packets: list,
         target=_run_backtest_loop_background, daemon=True, name="backtest-loop-bg"
     ).start()
 
-    if packets or position_actions:
+    # trade_prompt.md / analysis_packet.md exist for the manual "paste into Claude Desktop" workflow. The
+    # automated engine does not need them, so they are off unless trading.write_trade_prompt is true.
+    if (packets or position_actions) and cfg.get("trading", {}).get("write_trade_prompt", False):
         prompt = build_trade_prompt(packets, cfg, position_actions=position_actions)
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         with open(os.path.join(OUTPUT_DIR, "trade_prompt.md"), "w") as f:
