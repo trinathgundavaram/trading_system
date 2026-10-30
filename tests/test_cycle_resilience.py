@@ -157,3 +157,25 @@ def test_supervisor_still_enforces_the_hard_limit_without_sleep(monkeypatch):
 def test_supervisor_returns_exited_when_the_child_finishes(monkeypatch):
     cs = _clock(monkeypatch, lambda: 5, lambda: 5)
     assert cs._wait_for_child(_FakeProc(finishes_after=3), 900, poll=0) == "exited"
+
+
+def test_greed_ceiling_pauses_entries_but_kill_switch_is_distinguishable():
+    from types import SimpleNamespace
+    from engine.market_context import evaluate_market_gate
+    cfg = {"market_filters": {"fear_greed": {"no_buy_below": 20, "no_buy_above": 60}, "vix": {"no_trade_above": 28}},
+           "risk": {"kill_switch_triggered": False}}
+    mk = lambda fg, vix=17.0: SimpleNamespace(fear_greed_score=fg, vix_level=vix, blackout_active=False, blackout_reason="")
+    assert evaluate_market_gate(mk(45), cfg) == (True, "OK")
+    ok, reason = evaluate_market_gate(mk(72), cfg)
+    assert not ok and "F&G too high" in reason and "Kill switch" not in reason     # entries pause, cycle continues
+    cfg["risk"]["kill_switch_triggered"] = True
+    ok, reason = evaluate_market_gate(mk(45), cfg)
+    assert not ok and "Kill switch" in reason                                       # this one still ends the cycle
+
+
+def test_scheduler_pauses_entries_for_market_blocks_and_only_the_kill_switch_returns():
+    import os
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scheduler.py")).read()
+    gate = src.split("can_trade, reason = evaluate_market_gate(mkt, cfg)")[1][:1800]
+    assert '"Kill switch" in reason' in gate and "NEW ENTRIES PAUSED" in gate
+    assert "BUY suppressed" in src and "_ENTRIES_PAUSED" in src

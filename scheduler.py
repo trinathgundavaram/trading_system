@@ -402,6 +402,7 @@ def _run_cycle_impl(force: bool = False):
     watch_mode = paper_trader.is_watch_mode(cfg)
     risk_check = RiskEngine(db, cfg, simulated=watch_mode).check()
     entries_paused = False
+    globals()["_ENTRIES_PAUSED"] = False
     if not risk_check["can_trade"] and _is_trade_count_cap(risk_check["reason"]):
         # 2026-10-28: the daily trade-COUNT cap used to end the whole cycle here, so once the
         # 30th paper trade of the day happened (by ~12:00) no sell rule ran again until the
@@ -410,6 +411,7 @@ def _run_cycle_impl(force: bool = False):
         # entries paused: no screener, scan list = held positions only; per-trade enforcement
         # in paper_trader.execute_buy still refuses any new buy.
         entries_paused = True
+        globals()["_ENTRIES_PAUSED"] = True
         logger.warning(f"Risk limit: {risk_check['reason']} - NEW ENTRIES PAUSED, still managing open positions")
         db.log_cycle(cycle_count, 0, blocked=True, reason=f"entries paused: {risk_check['reason']}",
                      triggered_by=triggered_by)
@@ -428,12 +430,21 @@ def _run_cycle_impl(force: bool = False):
     db.set_cycle_stage("market_context")
     mkt = MarketContext().fetch()
     can_trade, reason = evaluate_market_gate(mkt, cfg)
-    if not can_trade:
+    if not can_trade and "Kill switch" in reason:
         logger.warning(f"Market gate BLOCKED: {reason}")
         db.log_cycle(cycle_count, 0, blocked=True, reason=reason, triggered_by=triggered_by)
         return
-
-    logger.info(f"Market gate OPEN - F&G={mkt.fear_greed_score}, VIX={mkt.vix_level:.1f}")
+    if not can_trade:
+        # 2026-10-30: a market-condition block (F&G too high/low, VIX too high, macro blackout) used to
+        # end the whole cycle - so exactly when the market was most volatile, open positions stopped
+        # being evaluated by the sell rules. Entries pause; exit management continues. Only the
+        # kill switch still stops everything.
+        entries_paused = True
+        globals()["_ENTRIES_PAUSED"] = True
+        logger.warning(f"Market gate: {reason} - NEW ENTRIES PAUSED, still managing open positions")
+        db.log_cycle(cycle_count, 0, blocked=True, reason=f"entries paused: {reason}", triggered_by=triggered_by)
+    else:
+        logger.info(f"Market gate OPEN - F&G={mkt.fear_greed_score}, VIX={mkt.vix_level:.1f}")
 
     regime, market_dict = _calc_regime_and_market_dict(mkt, cfg)
 
@@ -442,10 +453,14 @@ def _run_cycle_impl(force: bool = False):
     # 0-100 scored gate + crisis/breadth hard veto from rules/market_filters.py) ---
     mkt_gate = evaluate_market_score(market_dict, cfg)
     if not mkt_gate.can_trade:
-        logger.warning(f"Market score gate BLOCKED: {mkt_gate.reason}")
-        db.log_cycle(cycle_count, 0, blocked=True, reason=mkt_gate.reason, triggered_by=triggered_by)
-        return
-    logger.info(f"Market score gate OPEN - {mkt_gate.reason}")
+        # Same principle as the gate above: a bad market stops NEW entries, not the management of
+        # positions that are already open.
+        entries_paused = True
+        globals()["_ENTRIES_PAUSED"] = True
+        logger.warning(f"Market score gate: {mkt_gate.reason} - NEW ENTRIES PAUSED, still managing open positions")
+        db.log_cycle(cycle_count, 0, blocked=True, reason=f"entries paused: {mkt_gate.reason}", triggered_by=triggered_by)
+    else:
+        logger.info(f"Market score gate OPEN - {mkt_gate.reason}")
 
     trading_mode = cfg["trading"].get("mode", "SWING").lower()
 
@@ -692,6 +707,9 @@ def _run_cycle_impl(force: bool = False):
     db.set_cycle_stage("finalizing")
     _run_cycle_tail(mkt, cfg, trading_mode, regime, packets, ticker_data_cache,
                      triggered_by, start, cycle_count)
+
+
+_ENTRIES_PAUSED = False      # set once per cycle; each cycle is its own process, so a module flag is safe
 
 
 def _is_trade_count_cap(reason: str) -> bool:
@@ -1064,6 +1082,9 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                             db=db, ticker=ticker)
 
                 buy_result = swing_buy_rules.from_score_result(score_result)
+                if _ENTRIES_PAUSED and buy_result.should_buy:
+                    logger.info(f"{ticker}: BUY suppressed - new entries are paused this cycle")
+                    buy_result.should_buy = False        # exit rules for held tickers still run below
 
                 if buy_result.should_buy:
                     # Resolved trade_mode (2026-07-22, full DAY/SWING/HYBRID

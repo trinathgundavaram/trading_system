@@ -1892,11 +1892,30 @@ async def strategies_overview():
     data = strategy_overview.build(db, load_config_dict())
     try:
         from analytics.performance import profit_factor, sharpe_ratio
-        outcomes = [p["outcome_pct"] for p in db.get_patterns(mode=None, closed_only=True)
-                    if p.get("outcome_pct") is not None]
+        pats = [p for p in db.get_patterns(mode=None, closed_only=True) if p.get("outcome_pct") is not None]
+        outcomes = [p["outcome_pct"] for p in pats]
+        # Signals fired on the same day are one market episode, not independent trials: the swing record
+        # was 174 patterns but only ~10 distinct entry days, with three days supplying most of the loss.
+        by_day = {}
+        for p in pats:
+            by_day.setdefault(str(p.get("recorded_at") or "")[:10], []).append(p["outcome_pct"])
+        day_means = [sum(v) / len(v) for v in by_day.values()]
+        paper = None
+        try:
+            with db._conn() as conn:
+                row = conn.execute("SELECT COUNT(*), COALESCE(SUM(pnl),0), "
+                                   "COALESCE(SUM(CASE WHEN pnl>0 THEN pnl END),0), "
+                                   "COALESCE(-SUM(CASE WHEN pnl<0 THEN pnl END),0) "
+                                   "FROM paper_trades WHERE side='sell' AND pnl IS NOT NULL").fetchone()
+            paper = {"exits": row[0], "pnl": float(row[1]), "profit_factor": (row[2] / row[3]) if row[3] else None}
+        except Exception:
+            pass
         data["track_record"] = {"n_closed_patterns": len(outcomes),
                                 "profit_factor": profit_factor(outcomes) if outcomes else 0.0,
-                                "sharpe_ratio": sharpe_ratio(outcomes) if outcomes else 0.0}
+                                "sharpe_ratio": sharpe_ratio(outcomes) if outcomes else 0.0,
+                                "entry_days": len(by_day),
+                                "avg_per_entry_day": (sum(day_means) / len(day_means)) if day_means else None,
+                                "paper": paper}
     except Exception:
         data["track_record"] = None
     _overview_cache.update(t=now, data=data)

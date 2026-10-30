@@ -4,13 +4,14 @@ trading:
   # Do not reopen these until the §32 re-arm gate passes - see CHANGELOG.md.
   auto_trade: false
   trade_size_usd: 100
-  # 2026-10-30: sizing is now a % of the paper purse (cash + positions). It was effectively off
-  # (use_dynamic_sizing unset): every trade came out at the fixed $100 x ~20% = ~$20 on a $10,000
-  # purse, so months of swing paper trading moved the account by cents and could not be compared
-  # with anything. 5% base x the score-tier / EV / volatility multipliers => roughly $100-$500 a
-  # position; max_position_size_usd ($1,000) and the portfolio-heat cap still bound it.
-  use_dynamic_sizing: true
-  position_size_pct_of_portfolio: 5.0
+  # 2026-10-30: % -of-purse sizing exists (engine/position_sizing.py::_get_equity: cash + positions) and was
+  # switched on for a few hours, then switched OFF again: the swing engine's closed-pattern record is
+  # profit factor 0.61 over only ~10 independent entry days and realized paper trades are net negative
+  # (117 exits, PF 0.77), so scaling its size up would just scale an unproven edge. Trades stay small
+  # (fixed $100 base x score tier, ~$20-100) until the evidence says otherwise. Turn it on deliberately:
+  # 5% base x tier / EV / volatility multipliers => roughly $100-$500 a position.
+  use_dynamic_sizing: false
+  position_size_pct_of_portfolio: 5.0     # only used if use_dynamic_sizing is turned on
   max_positions: 25
   scan_interval_minutes: 15
   day_trade_scan_interval_minutes: 15
@@ -459,7 +460,11 @@ market_filters:
   fear_greed:
     enabled: true
     no_buy_below: 20
-    no_buy_above: 85
+    # 2026-10-30: was 85. Closed swing patterns entered when Fear & Greed was above 55 averaged -4.8% (40% wins,
+    # 83 patterns) against +1.7% (57% wins) when it was 25-55; the sign held in both halves of the history
+    # (Spearman -0.22 / -0.21). Caveat: only ~10 independent entry days, dominated by one August episode,
+    # so this is a risk-reduction choice, not a proven edge. Above this level NEW entries pause; exits keep running.
+    no_buy_above: 60
     no_sell_below: 15
   vix:
     enabled: true

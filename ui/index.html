@@ -2003,9 +2003,10 @@ async function renderDashboard(el) {
           <div class="ov-value">${heat.current_heat_pct}<span style="font-size:15px;color:var(--text-2)"> / ${heat.max_heat_pct}%</span></div>
           <div class="ov-bar" style="margin-top:8px"><span style="width:${heatPct}%;background:${heatPct > 90 ? "var(--red)" : heatPct > 60 ? "var(--yellow)" : "var(--indigo)"}"></span></div>
           <div class="ov-sub">${positions.length} open of ${state.config?.trading?.max_positions ?? "—"} max</div></div>
-        <div class="ov-tile"><div class="ov-label">Track record (closed patterns)</div>
-          <div class="ov-value">${perf && perf.n_closed_patterns != null ? perf.n_closed_patterns : "—"}</div>
-          <div class="ov-sub">profit factor ${fmtRatio(perf && perf.profit_factor)} · Sharpe ${fmtRatio(perf && perf.sharpe_ratio)}</div></div>
+        <div class="ov-tile ${perf && perf.profit_factor < 1 ? "warn" : ""}"><div class="ov-label">Signal record (closed patterns)</div>
+          <div class="ov-value">${perf && perf.n_closed_patterns != null ? perf.n_closed_patterns : "—"}<span style="font-size:14px;color:var(--text-2)"> signals · ${perf && perf.entry_days != null ? perf.entry_days : "—"} entry days</span></div>
+          <div class="ov-sub">profit factor ${fmtRatio(perf && perf.profit_factor)} · avg ${perf && perf.avg_per_entry_day != null ? perf.avg_per_entry_day.toFixed(1) + "%" : "—"} per entry day${perf && perf.paper ? ` · paper exits ${perf.paper.exits}, P/L ${fmtUSD(perf.paper.pnl)}` : ""}</div>
+          ${perf && perf.entry_days != null && perf.entry_days < 30 ? `<div class="ov-sub" style="color:var(--yellow)">Signals on the same day are one market episode. ${perf.entry_days} entry days is too few to judge the edge.</div>` : ""}</div>
       </div>
 
       <div class="ov-row">
