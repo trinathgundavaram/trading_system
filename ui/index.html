@@ -615,6 +615,93 @@
               margin-right: 6px; animation: ovpulse 2s infinite; }
   @keyframes ovpulse { 0% { box-shadow: 0 0 0 0 rgba(18,167,94,.5); } 70% { box-shadow: 0 0 0 7px rgba(18,167,94,0); } 100% { box-shadow: 0 0 0 0 rgba(18,167,94,0); } }
 </style>
+<style id="theme-2026-10-30">
+  /* Theme refresh 2026-10-30: cool slate surfaces, violet accent, navy sidebar, dark mode (follows the OS, toggle in the top bar).
+     Only tokens and component polish live here; the earlier block above is kept as the fallback. */
+  :root {
+    --bg-0:#f4f6fb; --bg-1:#ffffff; --bg-2:#eef1f8; --bg-3:#e3e8f3; --bg-hover:#d8dfee;
+    --border:#dde3f0; --border-soft:#e8ecf5;
+    --text-0:#0f172a; --text-1:#46526b; --text-2:#7b879f;
+    --green:#047857; --green-bright:#10b981; --green-dim:#e6f7f0; --green-border:#a7e3cb;
+    --red:#b91c1c; --red-bright:#ef4444; --red-dim:#fdecec; --red-border:#f6b9b9;
+    --blue:#1d4ed8; --blue-dim:#e8effd; --blue-border:#b7cbf6;
+    --yellow:#a15c07; --yellow-dim:#fdf3e1; --yellow-border:#ecd09b;
+    --purple:#6d28d9; --purple-dim:#f0eafd; --purple-border:#d4c2f7;
+    --indigo:#5b5bf0; --indigo-dim:#ececfe; --indigo-border:#c5c5fa;
+    --accent:#5b5bf0; --accent-hover:#4747d6; --accent-dim:#ececfe; --accent-border:#c5c5fa; --accent-on-dim:#3b3bb8;
+    --topbar-bg:rgba(244,246,251,0.82);
+    --radius:14px; --radius-sm:9px;
+    --shadow:0 2px 4px rgba(15,23,42,.05),0 12px 32px rgba(15,23,42,.08);
+    --shadow-sm:0 1px 2px rgba(15,23,42,.05),0 4px 14px rgba(15,23,42,.04);
+    --side-bg:linear-gradient(180deg,#111936 0%,#0c1226 100%);
+  }
+  :root[data-theme="dark"] {
+    --bg-0:#0a0e1a; --bg-1:#121a2c; --bg-2:#19233a; --bg-3:#22304d; --bg-hover:#2b3b5c;
+    --border:#26334f; --border-soft:#1e2943;
+    --text-0:#e8ecf7; --text-1:#a8b3cc; --text-2:#6f7d9c;
+    --green:#34d399; --green-bright:#34d399; --green-dim:rgba(52,211,153,.12); --green-border:rgba(52,211,153,.35);
+    --red:#f87171; --red-bright:#f87171; --red-dim:rgba(248,113,113,.12); --red-border:rgba(248,113,113,.38);
+    --blue:#7fa8ff; --blue-dim:rgba(127,168,255,.12); --blue-border:rgba(127,168,255,.35);
+    --yellow:#fbbf24; --yellow-dim:rgba(251,191,36,.12); --yellow-border:rgba(251,191,36,.35);
+    --purple:#b79cff; --purple-dim:rgba(183,156,255,.12); --purple-border:rgba(183,156,255,.35);
+    --indigo:#8b8bff; --indigo-dim:rgba(139,139,255,.14); --indigo-border:rgba(139,139,255,.4);
+    --accent:#7c7cf8; --accent-hover:#9393fa; --accent-dim:rgba(124,124,248,.16); --accent-border:rgba(124,124,248,.4); --accent-on-dim:#c4c4ff;
+    --on-accent:#ffffff; --topbar-bg:rgba(10,14,26,.82); --overlay:rgba(0,0,0,.6);
+    --shadow:0 2px 4px rgba(0,0,0,.3),0 12px 32px rgba(0,0,0,.35); --shadow-sm:0 1px 2px rgba(0,0,0,.3);
+    --side-bg:linear-gradient(180deg,#0e1530 0%,#080c1a 100%);
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg-0:#0a0e1a; --bg-1:#121a2c; --bg-2:#19233a; --bg-3:#22304d; --bg-hover:#2b3b5c;
+      --border:#26334f; --border-soft:#1e2943;
+      --text-0:#e8ecf7; --text-1:#a8b3cc; --text-2:#6f7d9c;
+      --green:#34d399; --green-bright:#34d399; --green-dim:rgba(52,211,153,.12); --green-border:rgba(52,211,153,.35);
+      --red:#f87171; --red-bright:#f87171; --red-dim:rgba(248,113,113,.12); --red-border:rgba(248,113,113,.38);
+      --blue:#7fa8ff; --blue-dim:rgba(127,168,255,.12); --blue-border:rgba(127,168,255,.35);
+      --yellow:#fbbf24; --yellow-dim:rgba(251,191,36,.12); --yellow-border:rgba(251,191,36,.35);
+      --purple:#b79cff; --purple-dim:rgba(183,156,255,.12); --purple-border:rgba(183,156,255,.35);
+      --indigo:#8b8bff; --indigo-dim:rgba(139,139,255,.14); --indigo-border:rgba(139,139,255,.4);
+      --accent:#7c7cf8; --accent-hover:#9393fa; --accent-dim:rgba(124,124,248,.16); --accent-border:rgba(124,124,248,.4); --accent-on-dim:#c4c4ff;
+      --on-accent:#ffffff; --topbar-bg:rgba(10,14,26,.82); --overlay:rgba(0,0,0,.6);
+      --shadow:0 2px 4px rgba(0,0,0,.3),0 12px 32px rgba(0,0,0,.35); --shadow-sm:0 1px 2px rgba(0,0,0,.3);
+      --side-bg:linear-gradient(180deg,#0e1530 0%,#080c1a 100%);
+      color-scheme: dark;
+    }
+  }
+  body { font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-feature-settings: "tnum" 1, "cv11" 1; }
+  #sidebar { background: var(--side-bg); border-right: none; width: 224px; }
+  #sidebar .brand .name { color: #f1f4ff; }
+  #sidebar .brand .sub { color: #8d9bc4; }
+  #sidebar .brand .mark { background: linear-gradient(135deg,#7c7cf8,#4f46e5); box-shadow: 0 4px 14px rgba(99,102,241,.5); border-radius: 9px; }
+  #sidebar .navitem { color: #aab5d6; padding: 10px 12px; font-size: 13px; }
+  #sidebar .navitem:hover { background: rgba(255,255,255,.07); color: #fff; }
+  #sidebar .navitem.active { background: linear-gradient(90deg,rgba(124,124,248,.32),rgba(124,124,248,.10)); color: #fff;
+                             box-shadow: inset 3px 0 0 #8b8bff; }
+  #sidebar .conn { background: rgba(255,255,255,.06); color: #aab5d6; }
+  .panel { border-color: var(--border); box-shadow: var(--shadow-sm); transition: box-shadow .2s, transform .2s; }
+  .panel:hover { box-shadow: var(--shadow); }
+  .panel-title { letter-spacing: .9px; }
+  #topbar { padding: 12px 28px; border-bottom-color: var(--border-soft); }
+  #topbar h1 { font-size: 17px; font-weight: 700; }
+  #content { padding: 24px 28px 64px; max-width: 1400px; }
+  .btn { background: var(--bg-1); border-color: var(--border); }
+  .btn:hover { background: var(--bg-2); }
+  .btn-primary { background: linear-gradient(180deg,var(--accent),var(--accent-hover)); }
+  th { background: var(--bg-2); }
+  tbody tr:hover td { background: var(--bg-2); }
+  input, select, textarea { background: var(--bg-1); color: var(--text-0); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .ov-tile { border-radius: var(--radius); background: var(--bg-1); }
+  .ov-tile .ov-value { letter-spacing: -.8px; }
+  .ov-tile.up { background: linear-gradient(180deg,var(--green-dim),var(--bg-1) 70%); }
+  .ov-tile.down { background: linear-gradient(180deg,var(--red-dim),var(--bg-1) 70%); }
+  .ov-tile.accent { background: linear-gradient(180deg,var(--accent-dim),var(--bg-1) 70%); }
+  #subnav button { background: var(--bg-1); border-color: var(--border); }
+  #subnav button:hover { background: var(--bg-2); }
+  #subnav button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #theme-btn { width: 34px; height: 32px; justify-content: center; padding: 0; font-size: 15px; }
+</style>
+
 </head>
 <body>
 
@@ -3879,6 +3966,19 @@ function renderControlTab(el) {
   loadExecutionPosture();  // fills in the read_ok / breaker / execution_path rows
 }
 
+function initThemeToggle() {
+  let saved = null; try { saved = localStorage.getItem("tp_theme"); } catch (e) {}
+  if (saved) document.documentElement.dataset.theme = saved;
+  if (document.getElementById("theme-btn")) return;
+  const b = document.createElement("button");
+  b.id = "theme-btn"; b.className = "btn btn-sm"; b.title = "Switch light / dark";
+  const dark = () => document.documentElement.dataset.theme === "dark" || (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches);
+  const paint = () => { b.textContent = dark() ? "☀" : "☾"; };
+  b.onclick = () => { const t = dark() ? "light" : "dark"; document.documentElement.dataset.theme = t; try { localStorage.setItem("tp_theme", t); } catch (e) {} paint(); };
+  paint();
+  const r = document.getElementById("refresh-btn"); r.parentNode.insertBefore(b, r);
+}
+
 function setSleeve(name, key, value) { saveConfig({ sleeves: { [name]: { [key]: value } } }, false); }
 function setSwing(key, value) { saveConfig({ swing: { [key]: value } }, false); }
 
@@ -4146,9 +4246,24 @@ async function renderStrategyTab(el) {
 function renderStrategyBody(s) {
   const riskCfg = (s.risk_levels || {})[s.current_risk_level] || {};
 
-  return `
+  const C = state.config || {}, sm = C.sector_momentum_sleeve || {}, st = C.stock_momentum_sleeve || {}, lv = C.stock_lowvol_sleeve || {};
+  const onp = c => c.paper_enabled ? '<span class="pill pill-green">on</span>' : '<span class="pill pill-neutral">off</span>';
+  const strategies = `
     <div class="panel">
-      <div class="panel-head">${svg('strategy',15)}<span class="panel-title">Buy Rules — 6-Bucket Scoring</span></div>
+      <div class="panel-head">${svg('strategy',15)}<span class="panel-title">Core strategies (paper) — the rules they follow</span></div>
+      <div class="table-wrap"><table data-no-enhance><thead><tr><th>Strategy</th><th>Status</th><th>Universe &amp; selection</th><th>Market rule</th><th>Leverage</th><th>Rebalance</th></tr></thead><tbody>
+        <tr><td><b>Sector momentum</b></td><td>${onp(sm)}</td><td>Sector ETFs blended with broad-market momentum (sector leaders by momentum, ${sm.top_n ?? 3} picks in sector-only mode)</td>
+          <td>SPY 200-day average, ${sm.band_pct ?? 0}% hysteresis band: below it, hold T-bills (SHY)</td><td>${sm.leverage ?? 1}×, 4% financing on borrowed cash</td><td>Last trading day of the month</td></tr>
+        <tr><td><b>Stock momentum</b></td><td>${onp(st)}</td><td>Top ${st.top_n ?? 40} current S&amp;P 500 members by a 3/6/12-month momentum composite (${st.selection ?? "momentum"}), equal-weighted</td>
+          <td>Same SPY 200-day rule</td><td>${st.leverage ?? 1}×</td><td>Month-end; trades under ${((st.min_trade_frac ?? 0.01) * 100).toFixed(1)}% of equity skipped</td></tr>
+        <tr><td><b>Stock mom + low-vol</b></td><td>${onp(lv)}</td><td>Top ${lv.top_n ?? 40} by momentum rank = average rank of 12-1 month momentum and low 63-day volatility (${lv.selection ?? "mom_lowvol"})</td>
+          <td>Same SPY 200-day rule</td><td>${lv.leverage ?? 1}×</td><td>Month-end</td></tr>
+      </tbody></table></div>
+      <div class="field-desc">These are fixed rules, tested on history with a frozen train/test split — they do not self-adjust. Each has its own simulated ledger and cannot place real orders. The rules below apply only to the shorter-term swing engine. Change the settings on the Control tab.</div>
+    </div>`;
+  return strategies + `
+    <div class="panel">
+      <div class="panel-head">${svg('strategy',15)}<span class="panel-title">Swing engine — Buy Rules, 6-Bucket Scoring</span></div>
       ${/* s.buy_rules.engine is a ~2,700-character single paragraph of
             engineering changelog (subgroup caps, effective vs raw max_points,
             weight recalibration dates). Rendered full-width it was a ~250-
@@ -4936,6 +5051,7 @@ async function boot() {
   // The first render used to happen before any state had arrived over the websocket, so opening the
   // Control tab directly showed defaults (risk cards as dashes, screener OFF, mode SWING) that looked
   // like real settings. Load the state first.
+  initThemeToggle();
   try { Object.assign(state, await (await fetch("/api/state")).json()); } catch (e) { /* websocket will fill it */ }
   connect();
 
