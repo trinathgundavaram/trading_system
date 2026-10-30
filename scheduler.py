@@ -1385,6 +1385,10 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                 except Exception as e:
                     logger.error(f"{ticker}: {'paper' if watch_mode else 'live'} buy failed: {e}",
                                  exc_info=True)
+        elif position:
+            # Already holding it: exits are handled above/in Loop B, and it is not a buy candidate, so it is neither
+            # a "HOLD" decision nor a rejected signal (3,400+ score-0 rows had piled up in rejected_signals this way).
+            pass
         else:
             logger.info(f"{ticker}: HOLD - score {buy_result.pct_score:.0f}%")
             # §18: record the counterfactual. portfolio_risk_log had 244 rows
@@ -1436,24 +1440,27 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
         # re-deriving anything live. score_result is None for vetoed/
         # already-open tickers - threshold/ev/execution-quality were never
         # computed for those, so those fields correctly stay None too.
-        db.log_signal(
-            ticker, td, buy_result, sell_result, score_result=score_result,
-            threshold_result=getattr(score_result, "threshold_result", None),
-            ev_result=getattr(score_result, "ev_result", None),
-            execution_quality=getattr(score_result, "execution_quality", None),
-            position_size=position_size,
-            portfolio_risk=portfolio_risk_result,
-            regime=regime,
-            asset_class=getattr(score_result, "asset_class", None),
-            probabilistic_decision=getattr(score_result, "probabilistic_decision", None),
-            # 2026-07-22 (EV mode-keying follow-up): effective_mode is only
-            # ever set above when buy_result.should_buy was True this cycle
-            # (locals().get avoids a NameError on the HOLD/veto/already-open
-            # branches where it was never computed) - falls back to the raw
-            # configured trading_mode so every row still carries SOME mode
-            # label, just not a post-classification one for non-BUY rows.
-            trade_mode=(locals().get("effective_mode") or trading_mode.upper()),
-        )
+        # A held ticker is not re-scored as an entry, so it produces no signal row - unless its exit rules fired,
+        # which is a real event worth recording.
+        if not position or (sell_result and sell_result.should_sell):
+            db.log_signal(
+              ticker, td, buy_result, sell_result, score_result=score_result,
+              threshold_result=getattr(score_result, "threshold_result", None),
+              ev_result=getattr(score_result, "ev_result", None),
+              execution_quality=getattr(score_result, "execution_quality", None),
+              position_size=position_size,
+              portfolio_risk=portfolio_risk_result,
+              regime=regime,
+              asset_class=getattr(score_result, "asset_class", None),
+              probabilistic_decision=getattr(score_result, "probabilistic_decision", None),
+              # 2026-07-22 (EV mode-keying follow-up): effective_mode is only
+              # ever set above when buy_result.should_buy was True this cycle
+              # (locals().get avoids a NameError on the HOLD/veto/already-open
+              # branches where it was never computed) - falls back to the raw
+              # configured trading_mode so every row still carries SOME mode
+              # label, just not a post-classification one for non-BUY rows.
+              trade_mode=(locals().get("effective_mode") or trading_mode.upper()),
+            )
 
         # Screener learning follow-up: feed the REAL scoring outcome back to
         # engine/screener.py's candidate-quality tracking - only for tickers
@@ -1462,7 +1469,7 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
         # buy_pct only recorded when scoring actually ran (score_result is
         # not None) - a vetoed candidate's pct_score is always 0, which
         # would incorrectly drag down the average otherwise.
-        if from_screener:
+        if from_screener and not position:
             try:
                 # Outage hygiene (2026-07-15c, external review): a score
                 # produced under bucket-availability redistribution (EXTERNAL
