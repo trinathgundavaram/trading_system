@@ -532,6 +532,16 @@
   body[data-scope="strategies"] #mode-badge, body[data-scope="strategies"] #watch-badge,
   body[data-scope="strategies"] #book-toggle, body[data-scope="strategies"] #copy-btn,
   body[data-scope="strategies"] #open-btn { display: none !important; }
+  #book-toggle, #copy-btn, #open-btn, #mode-badge, #watch-badge { display: none !important; }
+  #subnav { display: flex; gap: 4px; padding: 0 0 14px; flex-wrap: wrap; }
+  #subnav button { border: 1px solid var(--border-soft); background: var(--bg-1); color: var(--text-1); border-radius: 999px;
+                   padding: 6px 14px; font-size: 13px; cursor: pointer; }
+  #subnav button.active { background: var(--indigo); border-color: var(--indigo); color: #fff; }
+  .ov-attn { display: flex; flex-direction: column; gap: 8px; }
+  .ov-attn .item { display: flex; gap: 10px; align-items: center; padding: 10px 14px; border-radius: var(--radius);
+                   border: 1px solid var(--border-soft); background: var(--bg-1); font-size: 13px; }
+  .ov-attn .item.bad { border-color: var(--red-bright); } .ov-attn .item.warn { border-color: var(--yellow); }
+  .ov-attn .item.good { border-color: var(--green-bright); }
 
   .ov { display: flex; flex-direction: column; gap: 16px; animation: ovfade .35s ease both; }
   @keyframes ovfade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -717,7 +727,7 @@ const AUTH_TOKEN_KEY = "trading_platform_auth_token";
 // that mixes the two books (Dashboard, Positions, Portfolio) so they always
 // show exactly one book's numbers at a time instead of blending both.
 const VIEW_MODE_KEY = "trading_platform_view_mode";
-let viewMode = localStorage.getItem(VIEW_MODE_KEY) === "real" ? "real" : "paper";
+let viewMode = "paper";   // the engine never trades the real book; the Real view was removed from the UI
 
 function renderBookToggle() {
   const el = document.getElementById("book-toggle");
@@ -977,30 +987,28 @@ function onHashChange() {
 }
 
 /* ============================== NAV / SHELL ============================== */
-const NAV_GROUP_ORDER = ["Strategies", "Swing engine", "System"];
-function _groupOf(tabId) { return (TABS.find(t => t.id === tabId) || {}).group || "Strategies"; }
-function _navCollapsed(g) {
-  if (g !== "Swing engine") return false;
-  if (_groupOf(currentTab) === g) return false;
-  try { return localStorage.getItem("nav_collapsed_" + g) !== "0"; } catch (e) { return true; }
-}
-function toggleNavGroup(g) {
-  try { localStorage.setItem("nav_collapsed_" + g, _navCollapsed(g) ? "0" : "1"); } catch (e) {}
-  renderNav();
-}
+/* Four sidebar entries; the views inside a family are a sub-nav strip above the content. This is an automated
+   engine, so most views are for diagnosis, not daily use - they stay reachable, one click down. */
+const FAMILIES = [
+  { id: "overview", label: "Overview", icon: "dashboard", views: [["overview", "Overview"]] },
+  { id: "swing", label: "Swing engine", icon: "signals", views: [["dashboard", "Snapshot"], ["positions", "Positions"], ["portfolio", "Trades"], ["signals", "Signals"], ["strategy", "Rules"]] },
+  { id: "control", label: "Control", icon: "control", views: [["control", "Control"]] },
+  { id: "system", label: "System", icon: "monitor", views: [["monitor", "Health"], ["logs", "Logs"]] },
+];
+function _familyOf(tabId) { return FAMILIES.find(f => f.views.some(v => v[0] === tabId)) || FAMILIES[0]; }
+function _groupOf(tabId) { return _familyOf(tabId).id === "overview" ? "Strategies" : "Swing engine"; }
 function renderNav() {
-  document.getElementById("nav").innerHTML = NAV_GROUP_ORDER.map(g => {
-    const items = TABS.filter(t => (t.group || "Strategies") === g);
-    if (!items.length) return "";
-    const collapsible = g === "Swing engine", closed = _navCollapsed(g);
-    return `<div class="navsection ${collapsible ? "toggle" : ""} ${closed ? "collapsed" : ""}"
-                 ${collapsible ? `onclick="toggleNavGroup('${g}')"` : ""}>${g}${collapsible ? svg("chevron", 12).replace("<svg ", "<svg class=\"chev\" ") : ""}</div>
-      <div class="navitems ${closed ? "collapsed" : ""}">` + items.map(t => `
-      <a class="navitem ${t.id===currentTab?'active':''}" href="#${t.id}"
-         onclick="showTab('${t.id}'); return false;" title="${(t.desc||'').replace(/"/g,'&quot;')}">
-        ${svg(t.icon)}<span>${t.label}</span>
-      </a>`).join("") + `</div>`;
-  }).join("");
+  const cur = _familyOf(currentTab);
+  document.getElementById("nav").innerHTML = `<div class="navitems">` + FAMILIES.map(f => `
+      <a class="navitem ${f.id === cur.id ? "active" : ""}" href="#${f.views[0][0]}"
+         onclick="showTab('${f.views[0][0]}'); return false;">${svg(f.icon)}<span>${f.label}</span></a>`).join("") + `</div>`;
+}
+function renderSubnav() {
+  const f = _familyOf(currentTab);
+  let bar = document.getElementById("subnav");
+  if (!bar) { bar = document.createElement("div"); bar.id = "subnav"; const c = document.getElementById("content"); c.parentNode.insertBefore(bar, c); }
+  bar.style.display = f.views.length > 1 ? "" : "none";
+  bar.innerHTML = f.views.map(([id, label]) => `<button class="${id === currentTab ? "active" : ""}" onclick="showTab('${id}')">${label}</button>`).join("");
 }
 
 function showTab(name, opts) {
@@ -1009,6 +1017,7 @@ function showTab(name, opts) {
   document.body.dataset.scope = _groupOf(name) === "Strategies" ? "strategies" : "swing";
   if (!(opts && opts.fromHash)) syncHash();
   renderNav();
+  renderSubnav();
   document.getElementById("page-title").textContent = pageTitle(name);
   loadTab(name);
 }
@@ -1159,6 +1168,20 @@ function ovStockPanel(sk) {
     </tbody></table></div></div>`;
 }
 
+function ovAttention(d) {
+  const items = [], cfg = (state.config || {});
+  const sc = d.scheduler || {}, dr = d.drift || {};
+  if (cfg.risk?.kill_switch_triggered) items.push(["bad", "Kill switch is ON — the swing engine will not open new positions. Reset it on the Control tab."]);
+  if (sc.status === "stale") items.push(["bad", "No recent scheduler cycle — the Mac may have been asleep. The watchdog recovers on wake; check System → Health if it persists."]);
+  if (dr.status === "alert") items.push(["bad", "A paper sleeve is drifting from its backtest range (Alert) — review before trusting its results."]);
+  else if (dr.status === "watch") items.push(["warn", "A paper sleeve is on Watch against its backtest range."]);
+  const today = new Date(), todayStr = today.getFullYear() + "-" + String(today.getMonth() + 1).padStart(2, "0") + "-" + String(today.getDate()).padStart(2, "0");
+  const days = Math.round((new Date(d.next_rebalance + "T00:00:00") - new Date(todayStr + "T00:00:00")) / 86400000);
+  if (days >= 0 && days <= 1) items.push(["warn", `Month-end rebalance ${days === 0 ? "is today" : "is tomorrow"} — the three strategies will trade at the close.`]);
+  if (!items.length) items.push(["good", "Nothing needs your attention. The engine runs by itself; this page updates every 30 seconds."]);
+  return `<div class="ov-attn">${items.map(([k, t]) => `<div class="item ${k}">${k === "good" ? "✓" : "!"}<span>${t}</span></div>`).join("")}</div>`;
+}
+
 function ovSchedPill(sc) {
   if (!sc) return "";
   const m = { running: ["pill-blue", "Cycle running"], ok: ["pill-green", "Scheduler OK"], stale: ["pill-red", "No recent cycle"] }[sc.status] || ["pill-neutral", sc.status];
@@ -1228,6 +1251,7 @@ async function paintOverview(el, quiet) {
         <div class="ov-sub">next rebalance ${d.next_rebalance} · ${days} day${days === 1 ? "" : "s"}</div></div>
     </div>
 
+    ${ovAttention(d)}
     ${ovDriftPanel(d.drift)}
     ${ovStockPanel(d.stock)}
     ${ovStockPanel(d.stock_lowvol)}
