@@ -1128,21 +1128,14 @@ class Database:
             key TEXT PRIMARY KEY,
             value TEXT
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS second_opinions (
+            id SERIAL PRIMARY KEY, created_at TEXT NOT NULL, ticker TEXT NOT NULL, trade_mode TEXT,
+            score REAL, verdict TEXT NOT NULL, bear TEXT, bull TEXT
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS sm_equity_log (
             as_of_date TEXT PRIMARY KEY,
             total_value REAL NOT NULL,
             spy_close REAL NOT NULL
-        )""")
-        # TradingAgents advisory log (2026-10-18): decisions only, never orders.
-        conn.execute("""CREATE TABLE IF NOT EXISTS ta_decisions (
-            id SERIAL PRIMARY KEY,
-            as_of_date TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            rating TEXT,
-            raw TEXT,
-            price REAL,
-            created_at TEXT,
-            UNIQUE (as_of_date, ticker)
         )""")
 
     def _ensure_open_position_uniqueness(self):
@@ -3491,18 +3484,19 @@ class Database:
             return [dict(r) for r in conn.execute(
                 "SELECT as_of_date, total_value, spy_close FROM sm_equity_log ORDER BY as_of_date").fetchall()]
 
-    def log_ta_decision(self, as_of_date: str, ticker: str, rating: str, raw: str, price: float):
+    def log_second_opinion(self, ticker: str, trade_mode: str, score: float, verdict: str, bear: list, bull: list):
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO ta_decisions (as_of_date, ticker, rating, raw, price, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (as_of_date, ticker) DO NOTHING""",
-                (as_of_date, ticker, rating, raw, price, datetime.utcnow().isoformat()))
+                """INSERT INTO second_opinions (created_at, ticker, trade_mode, score, verdict, bear, bull)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (datetime.utcnow().isoformat(), ticker, trade_mode, score, verdict, "; ".join(bear), "; ".join(bull)))
 
-    def get_ta_decisions(self):
+    def get_second_opinions(self, limit: int = 5000):
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             return [dict(r) for r in conn.execute(
-                "SELECT as_of_date, ticker, rating, price FROM ta_decisions ORDER BY as_of_date, ticker").fetchall()]
+                "SELECT created_at, ticker, trade_mode, score, verdict, bear, bull FROM second_opinions "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
 
     def reset_rsi2_account(self):
         """Mirrors reset_paper_account()'s shape, scoped to this sleeve only -

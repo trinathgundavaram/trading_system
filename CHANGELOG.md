@@ -20,6 +20,11 @@ different strategy, and averaging the two sets together is a measurement error.
 
 ## [Unreleased]
 
+### Removed paid LLM advisor, added a free second opinion (2026-10-30)
+- Removed the TradingAgents advisor (code, scripts, config, schedule row, UI toggle, tests): it needed paid LLM calls.
+- Added `engine/second_opinion.py`: a deterministic devil's-advocate checklist on every swing BUY, advisory only, logged and later compared with real paper outcomes.
+
+
 ### Automation upgrades (2026-10-30)
 - Missed daily marks are backfilled automatically (`engine/mark_backfill.py`, `scripts/backfill_marks.py`); Oct 22-27 filled for both sleeves.
 - Phone alerts: ntfy webhook (`NOTIFY_WEBHOOK_URL` in `.env`), `notifications.broadcast` sends to phone AND desktop; month-end rebalance summaries.

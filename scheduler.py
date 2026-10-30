@@ -1203,6 +1203,17 @@ def _evaluate_ticker(ticker: str, mkt, market_dict: dict, regime, cfg: dict, tra
                 "ticker": ticker, "pct_score": buy_result.pct_score,
                 "regime": regime.dominant_regime, "cycle": cycle_count,
             })
+            # Free "second opinion" (engine/second_opinion.py): a devil's-advocate checklist, advisory only. Logged so
+            # its verdicts can be compared with real paper outcomes before it ever earns a veto.
+            try:
+                from engine.second_opinion import evaluate as _second_opinion
+                _so = _second_opinion(ticker_dict or {})
+                db.log_second_opinion(ticker, str(locals().get("effective_mode") or ""), float(buy_result.pct_score),
+                                      _so["verdict"], _so["bear"], _so["bull"])
+                if _so["bear"]:
+                    logger.info(f"{ticker}: second opinion {_so['verdict']} - {'; '.join(_so['bear'][:3])}")
+            except Exception as e:
+                logger.debug(f"{ticker}: second opinion skipped: {e}")
             # §47.3 (Phase 3). The engine states WHAT happened and how urgent
             # it is. It does not know or care how the human finds out - that
             # is scripts/tp_agent.py's job, and it is the only part of the
@@ -2201,22 +2212,6 @@ def run_stock_lowvol_cycle():
         logger.error(f"Stock low-vol cycle failed: {e}")
 
 
-def run_tradingagents_cycle():
-    """Daily TradingAgents ADVISORY run (scripts/tradingagents_paper_cycle.py):
-    logs ratings only, never trades. Gated by tradingagents_advisor.enabled."""
-    import subprocess
-    try:
-        if not load_config().get("tradingagents_advisor", {}).get("enabled", False):
-            logger.info("TradingAgents advisor: enabled is false - skipping")
-            return
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "tradingagents_paper_cycle.py")
-        r = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=1800)
-        log = logger.info if r.returncode == 0 else logger.error
-        log(f"TradingAgents cycle exit={r.returncode}: {(r.stdout or '').strip()[-500:]} {(r.stderr or '').strip()[-500:]}")
-    except Exception as e:
-        logger.error(f"TradingAgents cycle failed: {e}")
-
-
 def _scheduler_watchdog(scheduler, interval: float = 20.0, jump_threshold: float = 45.0):
     """Wake the scheduler after a laptop sleep or any stall.
 
@@ -2337,10 +2332,6 @@ def start():
     scheduler.add_job(
         run_daily_maintenance, "cron", hour=6, minute=30,
         id="daily_maintenance", max_instances=1, coalesce=True, misfire_grace_time=7200,
-    )
-    scheduler.add_job(
-        run_tradingagents_cycle, "cron", day_of_week="mon-fri", hour=16, minute=30,
-        id="tradingagents_cycle", max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
 
     def _record_next_run(event=None):

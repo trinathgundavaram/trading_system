@@ -93,3 +93,27 @@ def test_risk_based_sizing_ties_size_to_the_stop_and_caps_it(monkeypatch):
     # calm stock: 1.5% stop floor -> $1333 uncapped, held to 5% of purse = $500
     r = ps.calculate(br, sr, {"price": 100.0, "atr": 0.5}, None, cfg, db=db)
     assert r.suggested_dollar_amount == 500.0
+
+
+def test_second_opinion_flags_chasing_and_stays_quiet_on_clean_setups():
+    from engine import second_opinion as so
+    chase = {"price": 120, "sma_20": 100, "sma_50": 95, "sma_200": 130, "rsi": 80, "change_pct": 8, "volume_ratio": 0.6,
+             "days_to_earnings": 2, "macd_hist": -0.1}
+    r = so.evaluate(chase)
+    assert r["verdict"] == "DISAGREE" and len(r["bear"]) >= 5
+    clean = {"price": 100, "sma_20": 98, "sma_50": 95, "sma_200": 85, "rsi": 55, "change_pct": 1, "volume_ratio": 1.5,
+             "days_to_earnings": 30, "macd_hist": 0.2, "obv_rising": True}
+    r = so.evaluate(clean)
+    assert r["verdict"] == "AGREE" and r["bear"] == [] and len(r["bull"]) >= 4
+    assert so.evaluate({})["verdict"] == "AGREE"          # no data, no flags
+
+
+def test_second_opinion_outcomes_match_by_entry_time():
+    from engine import second_opinion as so
+    ops = [{"ticker": "A", "created_at": "2026-11-02T14:00:00", "verdict": "CAUTION"},
+           {"ticker": "B", "created_at": "2026-11-02T14:00:00", "verdict": "AGREE"}]
+    rts = [{"ticker": "A", "entry": "2026-11-02T14:05:00", "pnl_pct": -2.0},
+           {"ticker": "B", "entry": "2026-11-02T14:05:00", "pnl_pct": 3.0},
+           {"ticker": "C", "entry": "2026-11-02T14:05:00", "pnl_pct": 9.0}]
+    out = so.outcome_stats(ops, rts)
+    assert out["CAUTION"]["avg_pct"] == -2.0 and out["AGREE"]["win_pct"] == 100.0 and sum(v["n"] for v in out.values()) == 2

@@ -9,7 +9,6 @@ history, so one cannot spend, close or distort another.
 | **Swing engine** (original 7-bucket scoring, ~5-min scan) | `paper_account`, `positions` (simulated=1), `paper_trades`, `paper_equity_history` | every 5 min, Mon-Fri 9:00-16:30 ET | `trading.*` (live gates closed; WATCH/paper) |
 | **Sector momentum** (blend, 2.0x, SPY 200d rule + 2% band) | `sm_account`, `sm_positions`, `sm_state`, `sm_equity_log` | daily 16:15 ET; rebalances at month-end | `sector_momentum_sleeve.paper_enabled` |
 | **RSI(2) SPY sleeve** | `rsi2_account`, `rsi2_positions` | daily 16:10 ET | `rsi2_sleeve.paper_enabled` |
-| TradingAgents (advisory only, no orders) | `ta_decisions` | daily 16:30 ET | `tradingagents_advisor.enabled` |
 
 ## Comparing them
 

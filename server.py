@@ -988,8 +988,7 @@ async def update_config(update: dict, _: bool = Depends(require_token)):
         allowed = {"sector_momentum_sleeve": ("paper_enabled", "leverage", "band_pct"),
                    "stock_momentum_sleeve": ("paper_enabled", "leverage", "band_pct", "selection"),
                    "stock_lowvol_sleeve": ("paper_enabled", "leverage", "band_pct"),
-                   "rsi2_sleeve": ("paper_enabled",),
-                   "tradingagents_advisor": ("enabled",)}
+                   "rsi2_sleeve": ("paper_enabled",)}
         for name, patch in update["sleeves"].items():
             if name not in allowed or not isinstance(patch, dict) or name not in cfg:
                 continue

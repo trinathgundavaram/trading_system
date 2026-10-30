@@ -114,6 +114,12 @@ def swing_experiment_status(db, cfg: dict, today=None) -> dict | None:
         out = summarize(trades)
     except Exception:
         return None
+    try:
+        from engine.second_opinion import outcome_stats
+        from engine.swing_experiment import round_trips
+        out["second_opinion"] = outcome_stats(db.get_second_opinions(), round_trips(trades))
+    except Exception:
+        out["second_opinion"] = {}
     dd = ((cfg or {}).get("swing_experiment", {}) or {}).get("decision_date")
     out["decision_date"] = str(dd) if dd else None
     if dd:
@@ -241,9 +247,6 @@ def build(db, cfg: dict, today: date = None) -> dict:
         {"name": "RSI(2) SPY sleeve", "when": "Mon-Fri 16:10 ET",
          "enabled": bool(cfg.get("rsi2_sleeve", {}).get("paper_enabled")),
          "detail": "SPY mean-reversion entries and exits", "last": None},
-        {"name": "TradingAgents advisor", "when": "Mon-Fri 16:30 ET",
-         "enabled": bool(cfg.get("tradingagents_advisor", {}).get("enabled")),
-         "detail": "logs LLM ratings only; never trades", "last": None},
     ]
     try:
         from engine import sleeve_drift
