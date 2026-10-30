@@ -27,6 +27,10 @@ different strategy, and averaging the two sets together is a measurement error.
   to be the sum of OPEN positions, which is near zero for a small book; it is now cash + positions
   (`engine/position_sizing.py::_get_equity`). Trades before this date were sized by a different function.
 - A trade-count cap no longer ends the whole scan cycle: new entries pause, exits keep running.
+- **Swing experiment (2026-10-30, paper):** DAY positions are held to the NEXT session's close (`trading.day_hold_sessions: 1`),
+  trailing stop 3% -> 6%, TURBO day stop cap 4% -> 7%, Fear & Greed entry ceiling 85 -> 60, and market-condition blocks pause
+  entries instead of ending the cycle. Derived in-sample from ~8 entry days; judged forward by `engine/swing_experiment.py`
+  (pass = >= 30 entry days and profit factor > 1.3). Position sizing stays small (`use_dynamic_sizing: false`).
 - New entry veto `EARNINGS_IMMINENT` (earnings within the `earnings_approaching` exit window).
 - Scheduler/supervisor resilience (sleep-aware cycle supervisor, watchdog, persistent cache), the sector- and
   stock-momentum paper sleeves, drift monitor, and the Overview UI. The Learning and Journal tabs were removed

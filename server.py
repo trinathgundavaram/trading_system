@@ -1910,7 +1910,16 @@ async def strategies_overview():
             paper = {"exits": row[0], "pnl": float(row[1]), "profit_factor": (row[2] / row[3]) if row[3] else None}
         except Exception:
             pass
-        data["track_record"] = {"n_closed_patterns": len(outcomes),
+        experiment = None
+        try:
+            import sqlite3 as _sq
+            from engine.swing_experiment import summarize as _exp
+            with db._conn() as conn:
+                conn.row_factory = _sq.Row
+                experiment = _exp([dict(r) for r in conn.execute("SELECT * FROM paper_trades ORDER BY id").fetchall()])
+        except Exception:
+            pass
+        data["track_record"] = {"experiment": experiment, "n_closed_patterns": len(outcomes),
                                 "profit_factor": profit_factor(outcomes) if outcomes else 0.0,
                                 "sharpe_ratio": sharpe_ratio(outcomes) if outcomes else 0.0,
                                 "entry_days": len(by_day),

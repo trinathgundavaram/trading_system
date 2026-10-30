@@ -179,3 +179,38 @@ def test_scheduler_pauses_entries_for_market_blocks_and_only_the_kill_switch_ret
     gate = src.split("can_trade, reason = evaluate_market_gate(mkt, cfg)")[1][:1800]
     assert '"Kill switch" in reason' in gate and "NEW ENTRIES PAUSED" in gate
     assert "BUY suppressed" in src and "_ENTRIES_PAUSED" in src
+
+
+def test_day_hold_sessions_carries_overnight_then_flattens_next_session(monkeypatch):
+    from datetime import datetime
+    import pytz
+    from engine import position_management as pm
+    et = pytz.timezone("US/Eastern")
+    pos = {"trade_mode": "DAY", "entry_time": "2026-10-28T17:00:00"}          # Wed 13:00 ET, stored as naive UTC
+    cfg = {"trading": {"day_eod_flatten_enabled": True, "day_eod_flatten_time_et": "15:55", "day_hold_sessions": 1}}
+
+    class FakeDT(datetime):
+        _now = None
+        @classmethod
+        def now(cls, tz=None): return cls._now
+    monkeypatch.setattr(pm, "datetime", FakeDT)
+    def at(y, mo, d, h, mi):
+        FakeDT._now = et.localize(datetime(y, mo, d, h, mi)); return pm._check_eod_flatten(pos, cfg)
+    assert at(2026, 10, 28, 15, 56) is None                    # entry day, past the cutoff: carried overnight
+    assert at(2026, 10, 29, 10, 0) is None                     # next session, before the cutoff: still held
+    assert at(2026, 10, 29, 15, 56) is not None                # next session after the cutoff: flatten
+    assert at(2026, 10, 30, 9, 45) is not None                 # missed the window: flatten at first chance
+    cfg["trading"]["day_hold_sessions"] = 0
+    assert at(2026, 10, 28, 15, 56) is not None                # original behaviour preserved
+    assert at(2026, 10, 28, 12, 0) is None
+
+
+def test_swing_experiment_pairs_trades_and_only_counts_new_entries():
+    from engine.swing_experiment import summarize
+    T = lambda side, tk, px, ts, mode="DAY": {"side": side, "ticker": tk, "price": px, "created_at": ts, "trade_mode": mode, "pnl": 0.0}
+    trades = [T("buy", "OLD", 10, "2026-10-28T15:00:00"), T("sell", "OLD", 9, "2026-10-28T19:00:00"),
+              T("buy", "AAA", 100, "2026-10-30T15:00:00"), T("sell", "AAA", 103, "2026-10-31T19:00:00"),
+              T("buy", "BBB", 50, "2026-10-31T15:00:00"), T("sell", "BBB", 49, "2026-11-02T19:00:00")]
+    s = summarize(trades)
+    assert s["round_trips"] == 2 and s["entry_days"] == 2 and s["verdict"] == "collecting"
+    assert abs(s["profit_factor"] - 3.0 / 2.0) < 1e-9

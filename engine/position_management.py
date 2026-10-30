@@ -196,6 +196,21 @@ def _check_time_stop(pos: dict, cfg: dict):
     return None
 
 
+def _sessions_since_entry(entry_time, now_et):
+    """Weekday sessions between the position's entry date (ET) and today (0 = opened today).
+    entry_time is stored as naive UTC ISO text. None if it cannot be parsed. Holidays are not
+    modelled (a holiday counts as a session), which can only make a position leave a day early."""
+    if not entry_time:
+        return None
+    try:
+        import numpy as np
+        e = datetime.fromisoformat(str(entry_time))
+        e_et = (e.replace(tzinfo=pytz.utc) if e.tzinfo is None else e).astimezone(ET)
+        return int(np.busday_count(e_et.date(), now_et.date()))
+    except Exception:
+        return None
+
+
 def _check_eod_flatten(pos: dict, cfg: dict):
     """DAY-classified positions get force-closed before the regular session
     ends (2026-07-22, full DAY/SWING/HYBRID separation) - see config.yaml's
@@ -222,6 +237,20 @@ def _check_eod_flatten(pos: dict, cfg: dict):
     except (ValueError, AttributeError):
         cutoff_h, cutoff_m = 15, 55
     now_et = datetime.now(ET)
+    # 2026-10-30 (day_hold_sessions): replaying the engine's real entries against daily prices showed the
+    # DAY-mode "pop" lasts through the NEXT session's close (hold-to-next-close averaged +3.0% over 54
+    # entries, positive on all 8 entry days) and fades from day 3, while the same-day flatten plus tight
+    # stops realized ~0%. With day_hold_sessions = N a DAY position is flattened at the cutoff on its Nth
+    # session AFTER entry (N=0 keeps the original same-day flatten); if that window was missed it is
+    # flattened at the first opportunity. In-sample, ~8 entry days: a paper experiment, not a proven edge.
+    hold = int(trading_cfg.get("day_hold_sessions", 0) or 0)
+    held = _sessions_since_entry(pos.get("entry_time"), now_et)
+    if held is not None and hold > 0:
+        if held < hold:
+            return None                                   # still inside its allotted horizon: carry overnight
+        if held > hold:                                   # stale (missed the closing window): exit now
+            return {"cutoff_et": cutoff_str, "checked_at_et": now_et.strftime("%H:%M"),
+                    "message": f"DAY position held {held} sessions (> day_hold_sessions={hold}) - flattening."}
     if (now_et.hour, now_et.minute) < (cutoff_h, cutoff_m):
         return None
     return {
