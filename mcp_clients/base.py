@@ -262,7 +262,7 @@ class StdioMCPClient:
                             # error message).
                             table = _parse_markdown_table(text)
                             if table is not None:
-                                logger.info(
+                                logger.debug(      # expected/normal for yfinance: DEBUG, not an INFO line per call
                                     f"MCP response for {tool_name} was a markdown "
                                     f"table, not JSON - parsed {len(table)} rows "
                                     f"of real data instead of discarding it."

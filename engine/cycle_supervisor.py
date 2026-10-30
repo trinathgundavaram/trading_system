@@ -217,6 +217,36 @@ def kill_current_cycle(reason: str = "user_cancel") -> bool:
     return True
 
 
+SLEEP_DRIFT_SECONDS = 60.0     # wall-clock minus monotonic jump that means "the machine slept"
+
+
+def _wait_for_child(proc, timeout_seconds: float, poll: float = 5.0) -> str:
+    """Wait for the cycle child. Returns 'exited', 'timeout' or 'slept'.
+
+    2026-10-30: proc.wait(timeout=...) counts MONOTONIC time, which does not advance while a Mac
+    sleeps. On a machine that sleeps in 5-60 minute stretches through the trading day, a cycle
+    that needed 3 minutes of awake time occupied its job slot for 2.6 hours (9,280s) and another
+    for 83 minutes - the 15-minute hard limit never fired, and every scheduled slot meanwhile was
+    skipped ("maximum number of running instances reached"). A cycle that straddled a sleep is
+    also stale (its data and sockets predate the sleep), so it is better abandoned and re-run
+    fresh than waited on. Poll in short slices and compare the wall clock with the monotonic one."""
+    last_wall, last_mono = time.time(), time.monotonic()
+    deadline = last_mono + timeout_seconds
+    while True:
+        try:
+            proc.wait(timeout=poll)
+            return "exited"
+        except subprocess.TimeoutExpired:
+            pass
+        wall, mono = time.time(), time.monotonic()
+        drift = (wall - last_wall) - (mono - last_mono)
+        last_wall, last_mono = wall, mono
+        if drift > SLEEP_DRIFT_SECONDS:
+            return "slept"
+        if mono >= deadline:
+            return "timeout"
+
+
 def _pid_is_cycle(pid) -> bool:
     """True only if `pid` is alive AND is one of our scheduler.py processes
     (guards against a recycled pid belonging to something unrelated)."""
@@ -267,6 +297,12 @@ def reap_if_stale(db, hard_limit_seconds: float, orphan_grace_seconds: float = 1
     return True
 
 
+class _CycleAbandoned(Exception):
+    def __init__(self, outcome: str):
+        super().__init__(outcome)
+        self.outcome = outcome
+
+
 def run_supervised(force: bool, timeout_seconds: float) -> None:
     """Spawns `python3 scheduler.py --run-once [--force]` as the cycle's own
     child process, records its pid in cycle_status, and blocks until the
@@ -309,11 +345,29 @@ def run_supervised(force: bool, timeout_seconds: float) -> None:
         db.set_cycle_pid(proc.pid)
         logger.info(f"cycle_supervisor: spawned cycle child pid={proc.pid} "
                     f"(triggered_by={triggered_by}, hard ceiling {timeout_seconds / 60:.1f} min)")
-        proc.wait(timeout=timeout_seconds)
+        outcome = _wait_for_child(proc, timeout_seconds)
+        if outcome != "exited":
+            raise _CycleAbandoned(outcome)
         if proc.returncode:
             logger.warning(f"cycle_supervisor: cycle child pid={proc.pid} exited with non-zero "
                             f"code {proc.returncode} (ran to completion within the time limit "
                             f"regardless - see output/logs/scheduler.log for the actual error)")
+    except _CycleAbandoned as ab:
+        why = ("the machine went to sleep while it was running (its data is stale and its network "
+               "connections are likely dead) - abandoning it so the next slot starts fresh"
+               if ab.outcome == "slept" else
+               f"exceeded the {timeout_seconds / 60:.1f} min hard limit")
+        logger.error(f"cycle_supervisor: cycle child pid={proc.pid} {why}; force-killing the whole cycle "
+                     f"(process group, every MCP subprocess it spawned included) and clearing state.")
+        _kill_process_tree(proc.pid, reason=why)
+        try:
+            proc.wait(timeout=REAP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.error(f"cycle_supervisor: pid={proc.pid} did not reap even after SIGKILL "
+                         f"(possible zombie) - resetting cycle state anyway.")
+        db.mark_cycle_killed(expected_pid=proc.pid,
+                             reason="machine_slept" if ab.outcome == "slept" else "timeout_15min")
+        return
     except subprocess.TimeoutExpired:
         logger.error(f"cycle_supervisor: cycle child pid={proc.pid} exceeded the "
                      f"{timeout_seconds / 60:.1f} min hard limit - force-killing the whole cycle "

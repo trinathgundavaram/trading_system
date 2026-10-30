@@ -115,3 +115,45 @@ def test_entry_veto_matches_the_earnings_exit_rule():
     assert r.veto_code != "EARNINGS_IMMINENT"
     off = {"sell_rules": {"rules": {"earnings_approaching": {"enabled": False, "days_before": 2}}}}
     assert hard_vetoes.check("X", dict(base, days_to_earnings=0), {}, off).veto_code != "EARNINGS_IMMINENT"
+
+
+class _FakeProc:
+    def __init__(self, finishes_after=None):
+        self.calls, self.finishes_after = 0, finishes_after
+
+    def wait(self, timeout=None):
+        import subprocess
+        self.calls += 1
+        if self.finishes_after is not None and self.calls >= self.finishes_after:
+            return 0
+        raise subprocess.TimeoutExpired("x", timeout)
+
+
+def _clock(monkeypatch, wall_step, mono_step):
+    from engine import cycle_supervisor as cs
+    state = {"w": 1000.0, "m": 50.0}
+
+    def tw():
+        state["w"] += wall_step(); return state["w"]
+
+    def tm():
+        state["m"] += mono_step(); return state["m"]
+    monkeypatch.setattr(cs.time, "time", tw)
+    monkeypatch.setattr(cs.time, "monotonic", tm)
+    return cs
+
+
+def test_supervisor_abandons_a_cycle_that_straddled_a_machine_sleep(monkeypatch):
+    steps = iter([5, 5, 5, 3600, 5])                         # the wall clock leaps an hour while monotonic does not
+    cs = _clock(monkeypatch, lambda: next(steps, 5), lambda: 5)
+    assert cs._wait_for_child(_FakeProc(), 900, poll=0) == "slept"
+
+
+def test_supervisor_still_enforces_the_hard_limit_without_sleep(monkeypatch):
+    cs = _clock(monkeypatch, lambda: 5, lambda: 5)
+    assert cs._wait_for_child(_FakeProc(), 60, poll=0) == "timeout"
+
+
+def test_supervisor_returns_exited_when_the_child_finishes(monkeypatch):
+    cs = _clock(monkeypatch, lambda: 5, lambda: 5)
+    assert cs._wait_for_child(_FakeProc(finishes_after=3), 900, poll=0) == "exited"

@@ -120,6 +120,12 @@ def setup_logging(process_name: str, level: int = logging.INFO):
     # nothing else.
     logging.getLogger("mcp.client.stdio").addFilter(_KnownBenignMCPStdioNoise())
 
+    # 2026-10-30: HTTP client / MCP transport chatter was ~25% + ~12% of every log line (one
+    # INFO line per request), which pushed the 5MB x 3 rotation down to roughly a day of history and
+    # buried the lines that matter. Warnings and errors from these loggers are still kept.
+    for noisy in ("httpx", "httpcore", "mcp.client.streamable_http", "mcp.client.sse"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 def tail_log_lines(process_name: str, max_lines: int = 300) -> list[str]:
     """Last `max_lines` lines from this process's current log file (does NOT
