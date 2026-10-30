@@ -19,7 +19,10 @@ trading:
   auto_promote_sizing: true
   promoted_position_pct: 2.0
   position_size_pct_of_portfolio: 5.0     # only used if use_dynamic_sizing is turned on
-  max_positions: 25
+  # 2026-10-30: 25 -> 40 (day legs 5 -> 10). The book hit 25/25 holding only ~$580 (the old ~$20 positions), so new
+  # setups were skipped with 94% of the purse idle. With risk-based sizing the real limits are per-trade risk and the
+  # portfolio heat cap (risk.max_portfolio_risk_pct), not the position count.
+  max_positions: 40
   scan_interval_minutes: 15
   day_trade_scan_interval_minutes: 15
   market_open_buffer_minutes: 30
@@ -47,7 +50,7 @@ trading:
   # success test is forward-looking: >= 30 entry days from 2026-10-30 with profit factor > 1.3 - see
   # scripts/swing_experiment_report.py. Set to 0 to restore the same-day flatten.
   day_hold_sessions: 1
-  max_day_positions: 5
+  max_day_positions: 10
 rotation:
   enabled: true
   min_candidate_score: 80.0
